@@ -64,14 +64,20 @@ agent:
   kl_threshold: 0.0
   rewards_shaper_scale: 0.1
   time_limit_bootstrap: False
+
   # logging and checkpoint
   experiment:
     directory: "cartpole_direct"
     experiment_name: ""
     write_interval: auto
     checkpoint_interval: auto
-
-
+    
+    wandb: True,             # whether to use Weights & Biases
+    wandb_kwargs:
+      project: "KTHxUlg"       # Can be changed to whatever project you want
+      entity: "hansenjulienpro-univesity-of-liege"   # your wandb username or team name
+      
+      
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:

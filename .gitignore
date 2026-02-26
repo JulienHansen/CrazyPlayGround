@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Isaac Lab / Isaac Sim
+*.kit
+*.log
+_isaac_sim/
+
+# Training outputs
+logs/
+outputs/
+runs/
+
+# Weights & Biases
+wandb/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# IDE
+.vscode/settings.json
+.vscode/.python.env
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

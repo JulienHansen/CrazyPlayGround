@@ -1,135 +1,193 @@
-# Template for Isaac Lab Projects
+---
+<div align="center">
+  <img src="https://github.com/JulienHansen/CrazyPlayGround/blob/main/docs/assets/banner.png"
+       alt="Pearl's banner"
+       width="1200"
+       height="800" />
+</div>
+
+---
+
+# CrazyPlayGround - Collection of CrazyFlie Environments 
+
+A collection of Crazyflie 2.1 reinforcement learning environments built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab), using a cascaded PID inner-loop controller from [DroneModule](https://github.com/JulienHansen/DroneModule).
+
+---
 
 ## Overview
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+CrazyPlayGround provides Isaac Lab environments for training RL agents on a simulated Crazyflie 2.1. Instead of letting the RL agent directly command motor thrusts, a **cascaded firmware-style PID controller** (position → velocity → attitude → rate) runs at 500 Hz as the inner loop. The RL agent operates at a higher level (100 Hz), commanding position deltas, velocity references, or attitude setpoints depending on the environment.
 
-**Key Features:**
+### Control architecture
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+```
+RL agent (100 Hz)
+  └─ sets target (pos delta / vel ref / attitude)
+       └─ _apply_action() × 5  (500 Hz, each physics step)
+            └─ Cascade PID  →  thrust [N] + moment [N·m]
+                 └─ applied to Crazyflie rigid body via Isaac Lab
+```
 
-**Keywords:** extension, template, isaaclab
+| Loop | Rate | Input → Output |
+|---|---|---|
+| Position | 100 Hz | position error [m] → velocity setpoint [m/s] |
+| Velocity | 100 Hz | velocity error [m/s] → roll/pitch command [rad] + thrust Δ |
+| Attitude | 500 Hz | attitude error [rad] → body-rate setpoint [rad/s] |
+| Rate | 500 Hz | rate error [rad/s] → moment [N·m] |
+
+### Simulation parameters
+
+| Parameter | Value |
+|---|---|
+| Physics timestep (`dt`) | 1/500 s = 2 ms |
+| Decimation | 5 |
+| Policy rate | 100 Hz |
+| Gyro LPF cutoff | 20 Hz |
+
+---
+
+## Environments
+
+### Single-drone hovering
+
+Three variants differing only in the abstraction level of the RL action space:
+
+| Task ID | Action | Action space |
+|---|---|---|
+| `Pos-Hovering` | Position delta `[dx, dy, dz]` (m), clamped to ±0.1 | 3 |
+| `Vel-Hovering` | Velocity reference `[Vx, Vy, Vz]` (m/s), scaled by `max_velocity=1.0` | 3 |
+| `Att-Hovering` | `[roll, pitch, yaw_rate, thrust_normalized]` | 4 |
+
+All three share the same **observation space** (dim=6):
+
+```
+[lin_vel_b (3), desired_pos_b (3)]
+```
+- `lin_vel_b`: linear velocity in body frame [m/s]
+- `desired_pos_b`: goal position expressed in body frame [m]
+
+And the same **reward**:
+
+```
+r = - lin_vel_scale × ||ω_lin||²
+  - ang_vel_scale × ||ω_ang||²
+  + distance_scale × (1 - tanh(||pos - goal|| / 0.8))
+```
+
+Episode terminates when the drone goes below 0.1 m or above 2.0 m.
+
+### Multi-agent (MARL)
+
+| Task ID | Description |
+|---|---|
+| `Template-Crazyplayground-Marl-Direct-v0` | Multi-agent collaborative task |
+
+---
+
+## Dependencies
+
+- [Isaac Lab](https://isaac-sim.github.io/IsaacLab) (Isaac Sim 4.5+)
+- [DroneModule](https://github.com/JulienHansen/DroneModule) — cascade PID controller and Crazyflie YAML config
+
+---
 
 ## Installation
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
+**1. Install Isaac Lab** following the [official guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
-
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/CrazyPlayGround
-
-- Verify that the extension is correctly installed by:
-
-    - Listing the available tasks:
-
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
-
-    - Running a task:
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-
-    - Running a task with dummy agents:
-
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
-
-        - Zero-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
-
-### Set up IDE (Optional)
-
-To setup the IDE, please follow these instructions:
-
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
-
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
-
-### Setup as Omniverse Extension (Optional)
-
-We provide an example UI extension that will load upon enabling your extension defined in `source/CrazyPlayGround/CrazyPlayGround/ui_extension_example.py`.
-
-To enable your extension, follow these steps:
-
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
-
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
-
-## Code formatting
-
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
+**2. Install DroneModule** (editable):
 
 ```bash
-pip install pre-commit
+pip install -e /path/to/DroneModule
 ```
 
-Then you can run pre-commit with:
+**3. Install CrazyPlayGround** (editable):
 
 ```bash
-pre-commit run --all-files
+pip install -e source/CrazyPlayGround
 ```
 
-## Troubleshooting
+**4. Verify** — list available environments:
 
-### Pylance Missing Indexing of Extensions
-
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
-
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/CrazyPlayGround"
-    ]
-}
+```bash
+python scripts/list_envs.py
 ```
 
-### Pylance Crash
+Expected output includes `Vel-Hovering`, `Pos-Hovering`, `Att-Hovering`, and `Template-Crazyplayground-Marl-Direct-v0`.
 
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
+---
 
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
+## Usage
+
+### Train
+
+```bash
+# SKRL (PPO)
+python scripts/skrl/train.py --task=Vel-Hovering --num_envs=4096
+
+# RSL-RL
+python scripts/rsl_rl/train.py --task=Pos-Hovering --num_envs=4096
+
+# Stable Baselines 3
+python scripts/sb3/train.py --task=Att-Hovering --num_envs=512
+```
+
+### Play / evaluate
+
+```bash
+python scripts/skrl/play.py --task=Vel-Hovering --num_envs=16
+```
+
+### Debug with dummy agents
+
+```bash
+# Zero-action agent (checks physics stability)
+python scripts/zero_agent.py --task=Vel-Hovering
+
+# Random-action agent (checks environment bounds)
+python scripts/random_agent.py --task=Vel-Hovering
+```
+
+---
+
+## Project structure
+
+```
+CrazyPlayGround/
+├── source/CrazyPlayGround/CrazyPlayGround/
+│   └── tasks/direct/
+│       ├── hovering/               # Single-drone envs
+│       │   ├── pos_hovering.py     # Position-delta control
+│       │   ├── vel_hovering.py     # Velocity-reference control
+│       │   ├── att_hovering.py     # Attitude control
+│       │   └── agents/             # RL agent configs (skrl, sb3, rsl_rl…)
+│       └── crazyplayground_marl/   # Multi-agent env
+├── scripts/
+│   ├── skrl/                       # SKRL train & play scripts
+│   ├── rsl_rl/
+│   ├── sb3/
+│   ├── rl_games/
+│   ├── list_envs.py
+│   ├── zero_agent.py
+│   └── random_agent.py
+└── DroneModule/configs/crazyflie.yaml   # PID gains & physics params
+```
+
+---
+
+## Configuration
+
+PID gains and simulation parameters are centralized in `DroneModule/configs/crazyflie.yaml` under the `crazyflie_pid` section. Key parameters:
+
+```yaml
+crazyflie_pid:
+  sim_rate_hz:            500.0   # Must match physics dt
+  pid_posvel_loop_rate_hz: 100.0
+  pid_loop_rate_hz:        500.0
+  gyro_lpf_cutoff_hz:       20.0  # Gyro low-pass filter cutoff
+
+  pos_kp:  [2.0, 2.0, 2.0]
+  vel_kp:  [25.0, 25.0, 25.0]    # x/y in deg/(m/s), internally ×DEG2RAD
+  att_kp:  [6.0, 6.0, 6.0]
+  rate_kp: [250.0, 250.0, 120.0]
 ```
