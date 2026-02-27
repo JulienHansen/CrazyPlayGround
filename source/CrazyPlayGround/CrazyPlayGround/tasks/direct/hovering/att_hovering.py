@@ -193,7 +193,9 @@ class QuadcopterEnv(DirectRLEnv):
         self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
         self._yaw_rate_ref = (self._actions[:, 2] * self.cfg.max_yaw_rate).unsqueeze(-1)
 
-        thrust_normalized = (self._actions[:, 3] + 1.0) / 2.0
+        # Thrust: action[3] in [0, 1] — 0 = min thrust (falls), 1 = max thrust.
+        # Centre (0.556 ≈ 1/1.8) corresponds to hover, matching teleop_env.py convention.
+        thrust_normalized = self._actions[:, 3].clamp(0.0, 1.0)
         thrust_ref_n = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
         self._thrust_pwm = (thrust_ref_n / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
 

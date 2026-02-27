@@ -71,8 +71,6 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import math
-
 import gymnasium as gym
 import torch
 
@@ -182,45 +180,129 @@ def print_controls(input_type: str) -> None:
     print("=" * 60 + "\n")
 
 
-def _update_follow_camera(env, offset: tuple = (-2.0, 0.0, 0.8)) -> None:
-    """Move the Isaac Sim viewport camera to follow the drone.
+# ── Follow-camera state ───────────────────────────────────────────────────────
+# /OmniverseKit_Persp is a read-only built-in prim; we create our own camera.
+_FOLLOW_CAM_PATH  = "/World/FollowCamera"
+_follow_cam_ready: bool  = False
+_smooth_eye       = None   # np.ndarray | None  — smoothed camera position
+_smooth_target    = None   # np.ndarray | None  — smoothed look-at point
 
-    The camera sits at `offset` metres behind/above the drone in its body frame,
-    but only the yaw is tracked — roll and pitch are ignored so the view stays
-    stable during aggressive manoeuvres.
+# Smoothing factor (per simulation step at ~100 Hz).
+# Lower = more lag (smoother), higher = snappier.
+# 0.12 gives ~80 ms time-constant — similar to Liftoff's follow cam.
+_CAM_ALPHA = 0.12
+
+
+def _ensure_follow_camera() -> bool:
+    """Create /World/FollowCamera once and switch the active viewport to it."""
+    global _follow_cam_ready
+    if _follow_cam_ready:
+        return True
+    try:
+        import omni.usd
+        import omni.kit.viewport.utility
+        from pxr import UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        if not stage.GetPrimAtPath(_FOLLOW_CAM_PATH).IsValid():
+            cam = UsdGeom.Camera.Define(stage, _FOLLOW_CAM_PATH)
+            cam.CreateFocalLengthAttr(18.147)        # ~70° horizontal FOV
+            cam.CreateHorizontalApertureAttr(24.0)
+
+        vp = omni.kit.viewport.utility.get_active_viewport()
+        if vp is None:
+            return False
+        vp.set_active_camera(_FOLLOW_CAM_PATH)
+        _follow_cam_ready = True
+        return True
+    except Exception:
+        return False
+
+
+def _update_follow_camera(env, offset: tuple = (-3.0, 0.0, 0.8)) -> None:
+    """Liftoff-style smooth follow camera.
+
+    - Horizon stays level (world Z-up, no camera roll or pitch tilt).
+    - Camera position smoothly lags behind the drone (exponential filter).
+    - Only yaw is tracked for the camera's orbital position; the drone's
+      tilt is visible in the frame because the *drone body* tilts, not the cam.
+    - Wide FOV and close distance give a good sense of speed, like Liftoff.
 
     Args:
-        env:    The unwrapped teleoperation environment.
-        offset: (back, right, up) in the drone's body frame [m].
-                Negative X = behind the drone.
+        env:    Unwrapped teleoperation environment.
+        offset: (back, right, up) in the drone's yaw frame [m].
     """
+    global _smooth_eye, _smooth_target
+
+    if not _ensure_follow_camera():
+        return
+
     try:
-        from isaacsim.core.utils.viewports import set_camera_view
+        import omni.usd
+        from pxr import Gf, UsdGeom
     except ImportError:
         return
 
-    # Drone state (first env only)
-    pos = env._robot.data.root_pos_w[0].cpu()          # [3]
-    quat = env._robot.data.root_quat_w[0].cpu()        # [w, x, y, z]
-
-    qw, qx, qy, qz = quat[0].item(), quat[1].item(), quat[2].item(), quat[3].item()
-
-    # Extract yaw angle only for a smooth follow camera
-    yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    ox, oy, oz = offset  # body-frame offset: back, right, up
-
-    # Rotate horizontal offset by yaw, keep vertical as-is
-    eye_x = pos[0].item() + cy * ox - sy * oy
-    eye_y = pos[1].item() + sy * ox + cy * oy
-    eye_z = pos[2].item() + oz
-
     import numpy as np
-    set_camera_view(
-        eye=np.array([eye_x, eye_y, eye_z]),
-        target=pos.numpy(),
+
+    pos  = env._robot.data.root_pos_w[0].cpu().numpy().astype(float)
+    quat = env._robot.data.root_quat_w[0].cpu().numpy().astype(float)  # [w,x,y,z]
+    qw, qx, qy, qz = quat
+
+    # Extract yaw only — camera orbits horizontally around the drone
+    yaw = np.arctan2(2.0*(qw*qz + qx*qy), 1.0 - 2.0*(qy*qy + qz*qz))
+    cy, sy = float(np.cos(yaw)), float(np.sin(yaw))
+
+    # Desired camera eye: offset rotated by yaw only (horizon stays level)
+    ox, oy, oz = offset
+    desired_eye = np.array([
+        pos[0] + cy*ox - sy*oy,
+        pos[1] + sy*ox + cy*oy,
+        pos[2] + oz,
+    ])
+    desired_target = pos.copy()
+
+    # Exponential smoothing — gives the "camera lags behind" Liftoff feel
+    if _smooth_eye is None:
+        _smooth_eye    = desired_eye.copy()
+        _smooth_target = desired_target.copy()
+    else:
+        _smooth_eye    = _CAM_ALPHA * desired_eye    + (1.0 - _CAM_ALPHA) * _smooth_eye
+        _smooth_target = _CAM_ALPHA * desired_target + (1.0 - _CAM_ALPHA) * _smooth_target
+
+    # Build orthonormal camera frame with world Z-up (no roll, no pitch in view)
+    forward = _smooth_target - _smooth_eye
+    fwd_len = np.linalg.norm(forward)
+    if fwd_len < 1e-6:
+        return
+    forward /= fwd_len
+
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(forward, world_up)
+    right_len = np.linalg.norm(right)
+    if right_len < 1e-6:
+        return
+    right /= right_len
+
+    up   = np.cross(right, forward)
+    up  /= np.linalg.norm(up) + 1e-9
+    back = -forward
+
+    # USD 4×4 row-vector transform
+    gf_mat = Gf.Matrix4d(
+        right[0], right[1], right[2], 0.0,
+        up[0],    up[1],    up[2],    0.0,
+        back[0],  back[1],  back[2],  0.0,
+        _smooth_eye[0], _smooth_eye[1], _smooth_eye[2], 1.0,
     )
+
+    try:
+        stage  = omni.usd.get_context().get_stage()
+        prim   = stage.GetPrimAtPath(_FOLLOW_CAM_PATH)
+        if prim.IsValid():
+            UsdGeom.Xformable(prim).MakeMatrixXform().Set(gf_mat)
+    except Exception:
+        pass
 
 
 def main():
@@ -247,6 +329,17 @@ def main():
         env.close()
         return
 
+    # When the primary handler is a gamepad, also init a secondary keyboard
+    # handler so that R (reset) and Escape (quit) always work from the keyboard
+    # regardless of which device is driving the drone.
+    kb_hotkeys: KeyboardHandler | None = None
+    if not isinstance(handler, KeyboardHandler):
+        kb_hotkeys = KeyboardHandler(env.unwrapped.device)
+        if not kb_hotkeys.initialize():
+            kb_hotkeys = None
+        else:
+            print("[Teleop] Secondary keyboard hotkeys active (R=reset, Esc=quit)")
+
     # Set initial control mode
     handler.current_mode = args_cli.mode
     env.unwrapped.set_control_mode(args_cli.mode)
@@ -264,8 +357,16 @@ def main():
     try:
         while simulation_app.is_running():
             with torch.inference_mode():
-                # Get input state
+                # Get input state from primary handler
                 input_state = handler.update()
+
+                # Merge hotkeys from secondary keyboard handler (if active)
+                if kb_hotkeys is not None:
+                    kb_state = kb_hotkeys.update()
+                    if kb_state.reset_requested:
+                        input_state.reset_requested = True
+                    if kb_state.quit_requested:
+                        input_state.quit_requested = True
 
                 # Check for quit
                 if input_state.quit_requested:
@@ -277,6 +378,9 @@ def main():
                     print("[INFO] Reset requested")
                     env.reset()
                     handler.reset()
+                    # Clear camera smoothing so it snaps to the new position
+                    global _smooth_eye, _smooth_target
+                    _smooth_eye = _smooth_target = None
                     continue
 
                 # Check for mode switch
@@ -297,17 +401,13 @@ def main():
                 # Update third-person follow camera
                 _update_follow_camera(env.unwrapped)
 
-                # Auto-reset if terminated (safety limit reached)
-                if terminated.any():
-                    print("[INFO] Safety limit reached, auto-resetting")
-                    env.reset()
-                    handler.reset()
-
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
 
     finally:
         # Cleanup
+        if kb_hotkeys is not None:
+            kb_hotkeys.cleanup()
         handler.cleanup()
         env.close()
         print("[INFO] Teleoperation ended")

@@ -345,13 +345,9 @@ class TeleoperationEnv(DirectRLEnv):
         return torch.zeros(self.num_envs, device=self.device)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Check safety limits (altitude only, no timeout for teleop)."""
-        died = torch.logical_or(
-            self._robot.data.root_pos_w[:, 2] < self.cfg.min_altitude,
-            self._robot.data.root_pos_w[:, 2] > self.cfg.max_altitude,
-        )
-        time_out = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        return died, time_out
+        """Never auto-terminate — only a manual reset (R button) can reset the env."""
+        false = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        return false, false
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:

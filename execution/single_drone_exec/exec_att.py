@@ -165,11 +165,14 @@ class CrazyflieController:
     def control_loop(self):
         """Main control loop: send attitude commands"""
         INTERVAL = 0.01  # control frequency (s) - 100 Hz
-        MAX_ANGLE = 30.0
-        MAX_YAW_RATE = 90.0
-        HOVER_THRUST = 47000
-        MIN_THRUST_SCALE = 0.5
-        MAX_THRUST_SCALE = 1.8
+        MAX_ANGLE = 30.0          # degrees  — must match att_hovering.py max_roll_pitch
+        MAX_YAW_RATE = 90.0       # deg/s    — must match att_hovering.py max_yaw_rate
+        # Hover PWM: mass(0.027kg)×g / (max_thrust(0.638N)/PWM_max(65535)) ≈ 27 200
+        # Using firmware estimate from crazyflie.yaml thrust_base = 30 000.
+        # Calibrate empirically if the drone doesn't hold altitude at action[3]=0.
+        HOVER_THRUST = 30000
+        MIN_THRUST_SCALE = 0.5    # fraction of hover — must match att_hovering.py
+        MAX_THRUST_SCALE = 1.8    # fraction of hover — must match att_hovering.py
 
         logger.info("Waiting for position data...")
         while not self.position_received and self.running:
@@ -223,9 +226,11 @@ class CrazyflieController:
             roll  = action[0].item() * MAX_ANGLE
             pitch = action[1].item() * MAX_ANGLE
             yaw   = action[2].item() * MAX_YAW_RATE
-            thrust_norm = (action[3].item() + 1.0) / 2.0
+            # Thrust: action[3] in [0,1] — matches att_hovering.py and teleop_env.py convention.
+            # 0 = min thrust, 1 = max thrust, ~0.556 = hover.
+            thrust_norm = float(max(0.0, min(1.0, action[3].item())))
             thrust = int(HOVER_THRUST * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
-            thrust = max(20000, min(65000, thrust))
+            thrust = max(10000, min(60000, thrust))
 
             logger.info(f"Cmd: roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust} | pos={self.current_pos}")
             self.cf.commander.send_setpoint(roll, pitch, yaw, thrust)
