@@ -18,14 +18,18 @@ from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.basicConfig(format="{asctime} [{levelname}] {message}", 
-                        style="{", 
-                        datefmt="%Y-%m-%d %H:%M:%S", 
+logging.basicConfig(format="{asctime} [{levelname}] {message}",
+                        style="{",
+                        datefmt="%Y-%m-%d %H:%M:%S",
                         level=logging.INFO)
 logger = logging.getLogger("CrazyflieRL")
 target_pos = torch.empty(3, dtype=torch.float32, device=device)
 target_pos[:2].uniform_(-1.5, 1.5)
 target_pos[2].uniform_(0.7, 1.5)
+
+# ── Safety thresholds ────────────────────────────────────────────────────────
+POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
+POS_VARIANCE_THRESHOLD = 0.5   # kalman position variance [m²] above which tracking is unreliable
 
 # ============================================================
 #                      MODEL DEFINITION
@@ -84,6 +88,10 @@ class CrazyflieController:
         self.previous_pos = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
+        self.running = True
+        self.position_received = False
+        self._last_pos_time: float = 0.0
+        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
         self.lock = threading.Lock()
         self._setup_callbacks()
 
@@ -111,8 +119,8 @@ class CrazyflieController:
         pass
 
     def _connection_lost(self, uri: str, msg: str):
-        #logger.warning(f"Connection to {uri} lost: {msg}")
-        pass
+        logger.warning(f"Connection to {uri} lost: {msg} — triggering safe landing")
+        self.running = False
 
     # ---------- Logging setup ----------
 
@@ -137,16 +145,25 @@ class CrazyflieController:
         log_quat.data_received_cb.add_callback(self._log_data_quat_callback)
         log_quat.start()
 
+        log_var = LogConfig(name="quality", period_in_ms=200)
+        log_var.add_variable("kalman.varPX", "float")
+        log_var.add_variable("kalman.varPY", "float")
+        log_var.add_variable("kalman.varPZ", "float")
+        self.cf.log.add_config(log_var)
+        log_var.data_received_cb.add_callback(self._log_variance_callback)
+        log_var.start()
 
     def _log_pos_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
         """Update current position from the Crazyflie logs"""
         with self.lock:
-            self.previous_pos = self.current_pos
+            self.previous_pos = self.current_pos.clone()
             self.current_pos = torch.tensor([
                 data["stateEstimate.x"],
                 data["stateEstimate.y"],
                 data["stateEstimate.z"]
             ], dtype=torch.float32, device=device)
+            self._last_pos_time = time.time()
+            self.position_received = True
 
     def _log_data_quat_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
         """Update current quaternion from the Crazyflie logs"""
@@ -158,6 +175,27 @@ class CrazyflieController:
                 data['stateEstimate.qz'],
             ], dtype=torch.float32, device=device)
 
+    def _log_variance_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
+        """Track Kalman filter position variance to detect lighthouse tracking loss."""
+        with self.lock:
+            self._pos_variance = torch.tensor([
+                data["kalman.varPX"],
+                data["kalman.varPY"],
+                data["kalman.varPZ"],
+            ], dtype=torch.float32, device=device)
+
+    def _emergency_land(self):
+        """Trigger a safe landing regardless of the current commander mode."""
+        logger.warning("EMERGENCY LANDING triggered")
+        self.running = False
+        try:
+            self.cf.high_level_commander.land(0.0, 2.0)
+        except Exception as e:
+            logger.error(f"Emergency land command failed: {e}")
+            try:
+                self.cf.commander.send_stop_setpoint()
+            except Exception:
+                pass
 
     # ---------- Control loop ----------
 
@@ -167,10 +205,31 @@ class CrazyflieController:
         INTERVAL = 0.05  # control frequency (s)
 
         #logger.info("Starting control loop")
-        
+
+        logger.info("Waiting for first position estimate...")
+        while not self.position_received and self.running:
+            time.sleep(0.05)
+        if not self.running:
+            return
+        logger.info(f"Position received: {self.current_pos}")
+
         logger.info(f"Init target pos={target_pos}")
-        while self.cf.is_connected():
+        while self.cf.is_connected() and self.running:
             start_time = time.time()
+
+            # ── Safety watchdog ──────────────────────────────────────────────
+            if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
+                logger.error(
+                    f"Position data stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
+                )
+                self._emergency_land()
+                break
+            with self.lock:
+                var = self._pos_variance.clone()
+            if var.max().item() > POS_VARIANCE_THRESHOLD:
+                logger.error(f"Position variance too high {var.tolist()} — emergency landing")
+                self._emergency_land()
+                break
 
             obs = retrieve_and_create_observation(self.previous_pos, self.current_pos, self.current_quat, INTERVAL)
             if obs is None:
@@ -207,6 +266,7 @@ class CrazyflieController:
 
     def stop(self):
         """Disconnect safely"""
+        self.running = False
         self.cf.high_level_commander.land(0, 3)
         time.sleep(3.5)
         self.cf.close_link()
@@ -220,7 +280,7 @@ class CrazyflieController:
 def retrieve_and_create_observation(previous_pos, current_pos, current_quat, time_elapsed) -> Optional[torch.Tensor]:
     """
     Retrieve sensor data (IMU + Lighthouse + target info)
-    and return observation tensor.    
+    and return observation tensor.
     """
     global target_pos
     dist_to_target = torch.dist(current_pos, target_pos)
@@ -244,7 +304,7 @@ def retrieve_and_create_observation(previous_pos, current_pos, current_quat, tim
 
     return obs
 
-        
+
 def quat_apply(quat, vec):
     # store shape
     shape = vec.shape
@@ -317,8 +377,6 @@ def main():
     finally:
         controller.stop()
         logger.info("Shutting down")
-        from cflib.utils.power_switch import PowerSwitch
-        PowerSwitch(args.uri).stm_power_cycle()
 
 
 if __name__ == "__main__":

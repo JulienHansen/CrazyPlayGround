@@ -18,62 +18,43 @@ from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.basicConfig(format="{asctime} [{levelname}] {message}", 
-                        style="{", 
-                        datefmt="%Y-%m-%d %H:%M:%S", 
+logging.basicConfig(format="{asctime} [{levelname}] {message}",
+                        style="{",
+                        datefmt="%Y-%m-%d %H:%M:%S",
                         level=logging.INFO)
 logger = logging.getLogger("CrazyflieRL")
 target_pos = torch.empty(3, dtype=torch.float32, device=device)
 target_pos[:2].uniform_(-1.5, 1.5)
 target_pos[2].uniform_(0.7, 1.5)
 
-# ============================================================
-#                      MODEL DEFINITION
-# ============================================================
+# ── Safety thresholds ────────────────────────────────────────────────────────
+POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
+POS_VARIANCE_THRESHOLD = 0.5   # kalman position variance [m²] above which tracking is unreliable
 
+# [Policy class identical to exec_vel.py — same architecture with act_space=4]
 
 class Policy(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device,
                  clip_actions=False, clip_log_std=True,
                  min_log_std=-20.0, max_log_std=2.0,
                  initial_log_std=0.0):
-
         Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std,
-                               min_log_std, max_log_std)
-
-        # === Must match checkpoint architecture ===
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
         self.net_container = nn.Sequential(
-            nn.Linear(self.num_observations, 32),
-            nn.ELU(),
-            nn.Linear(32, 32),
-            nn.ELU()
+            nn.Linear(self.num_observations, 32), nn.ELU(),
+            nn.Linear(32, 32), nn.ELU()
         )
-
-        # Policy head
         self.policy_layer = nn.Linear(32, self.num_actions)
-
-        # Value head (SKRL requires it even for policy model)
         self.value_layer = nn.Linear(32, 1)
-
-        # Shared log std
-        self.log_std_parameter = nn.Parameter(
-            torch.ones(self.num_actions) * initial_log_std
-        )
+        self.log_std_parameter = nn.Parameter(torch.ones(self.num_actions) * initial_log_std)
 
     def compute(self, inputs, role):
         x = self.net_container(inputs["states"])
-
         if role == "policy":
             mean = self.policy_layer(x)
-        else:  # value function
+        else:
             mean = self.value_layer(x)
-
         return mean, self.log_std_parameter, {}
-
-# ============================================================
-#                    CRAZYFLIE CONTROLLER
-# ============================================================
 
 class CrazyflieController:
     """Main Crazyflie controller for running trained RL agents"""
@@ -86,10 +67,10 @@ class CrazyflieController:
         self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
         self.position_received = False
         self.running = True
+        self._last_pos_time: float = 0.0
+        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
         self.lock = threading.Lock()
         self._setup_callbacks()
-
-    # ---------- Crazyflie callbacks ----------
 
     def _setup_callbacks(self):
         self.cf.connected.add_callback(self._connected)
@@ -103,23 +84,17 @@ class CrazyflieController:
         threading.Thread(target=self.control_loop, daemon=True).start()
 
     def _disconnected(self, uri: str):
-        #logger.info(f"Disconnected from {uri}")
         pass
 
     def _connection_failed(self, uri: str, msg: str):
-        #logger.error(f"Connection to {uri} failed: {msg}")
         pass
 
     def _connection_lost(self, uri: str, msg: str):
-        #logger.warning(f"Connection to {uri} lost: {msg}")
-        pass
-
-    # ---------- Logging setup ----------
+        logger.warning(f"Connection to {uri} lost: {msg} — triggering safe landing")
+        self.running = False
 
     def _start_logging(self):
-        """Configure and start position logging"""
         LOG_FREQUENCY_IN_MS = 50
-
         log_pos = LogConfig(name="pos", period_in_ms=LOG_FREQUENCY_IN_MS)
         log_pos.add_variable("stateEstimate.x", "float")
         log_pos.add_variable("stateEstimate.y", "float")
@@ -137,9 +112,15 @@ class CrazyflieController:
         log_quat.data_received_cb.add_callback(self._log_data_quat_callback)
         log_quat.start()
 
+        log_var = LogConfig(name="quality", period_in_ms=200)
+        log_var.add_variable("kalman.varPX", "float")
+        log_var.add_variable("kalman.varPY", "float")
+        log_var.add_variable("kalman.varPZ", "float")
+        self.cf.log.add_config(log_var)
+        log_var.data_received_cb.add_callback(self._log_variance_callback)
+        log_var.start()
 
     def _log_pos_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        """Update current position from the Crazyflie logs"""
         with self.lock:
             self.previous_pos = self.current_pos.clone()
             self.current_pos = torch.tensor([
@@ -147,10 +128,10 @@ class CrazyflieController:
                 data["stateEstimate.y"],
                 data["stateEstimate.z"]
             ], dtype=torch.float32, device=device)
+            self._last_pos_time = time.time()
             self.position_received = True
 
     def _log_data_quat_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        """Update current quaternion from the Crazyflie logs"""
         with self.lock:
             self.current_quat = torch.tensor([
                 data['stateEstimate.qw'],
@@ -159,36 +140,50 @@ class CrazyflieController:
                 data['stateEstimate.qz'],
             ], dtype=torch.float32, device=device)
 
+    def _log_variance_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
+        """Track Kalman filter position variance to detect lighthouse tracking loss."""
+        with self.lock:
+            self._pos_variance = torch.tensor([
+                data["kalman.varPX"],
+                data["kalman.varPY"],
+                data["kalman.varPZ"],
+            ], dtype=torch.float32, device=device)
 
-    # ---------- Control loop ----------
+    def _emergency_land(self):
+        """Trigger a safe landing regardless of the current commander mode."""
+        logger.warning("EMERGENCY LANDING triggered")
+        self.running = False
+        try:
+            self.cf.high_level_commander.land(0.0, 2.0)
+        except Exception as e:
+            logger.error(f"Emergency land command failed: {e}")
+            try:
+                self.cf.commander.send_stop_setpoint()
+            except Exception:
+                pass
 
     def control_loop(self):
         """Main control loop: send attitude commands"""
         INTERVAL = 0.01  # control frequency (s) - 100 Hz
-
-        MAX_ANGLE = 30.0  # degrees (same as simulation)
-        MAX_YAW_RATE = 90.0  # deg/s (same as simulation)
-        # Thrust mapping (same as simulation)
-        HOVER_THRUST = 47000  # Ajuster selon ton drone
+        MAX_ANGLE = 30.0
+        MAX_YAW_RATE = 90.0
+        HOVER_THRUST = 47000
         MIN_THRUST_SCALE = 0.5
         MAX_THRUST_SCALE = 1.8
 
-        # Attendre que la position soit reçue avant de commencer
         logger.info("Waiting for position data...")
         while not self.position_received and self.running:
             time.sleep(0.1)
         logger.info(f"Position received: {self.current_pos}")
 
-        # Unlock motors en envoyant un setpoint avec thrust=0
         logger.info("Unlocking motors with thrust=0...")
         for _ in range(10):
             self.cf.commander.send_setpoint(0, 0, 0, 0)
             time.sleep(0.01)
         logger.info("Motors unlocked")
 
-        # Takeoff manuel avec thrust constant (légèrement au-dessus du hover)
-        TAKEOFF_THRUST = int(HOVER_THRUST * 1.2)  # 20% au-dessus du hover
-        TAKEOFF_DURATION = 2.0  # secondes
+        TAKEOFF_THRUST = int(HOVER_THRUST * 1.2)
+        TAKEOFF_DURATION = 2.0
         logger.info(f"Manual takeoff with thrust={TAKEOFF_THRUST} for {TAKEOFF_DURATION}s...")
         takeoff_start = time.time()
         while time.time() - takeoff_start < TAKEOFF_DURATION and self.running:
@@ -201,6 +196,20 @@ class CrazyflieController:
         while self.cf.is_connected() and self.running:
             start_time = time.time()
 
+            # ── Safety watchdog ──────────────────────────────────────────────
+            if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
+                logger.error(
+                    f"Position data stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
+                )
+                self._emergency_land()
+                break
+            with self.lock:
+                var = self._pos_variance.clone()
+            if var.max().item() > POS_VARIANCE_THRESHOLD:
+                logger.error(f"Position variance too high {var.tolist()} — emergency landing")
+                self._emergency_land()
+                break
+
             obs = retrieve_and_create_observation(self.previous_pos, self.current_pos, self.current_quat, INTERVAL)
             if obs is None:
                 logger.warning("No observation received, hovering...")
@@ -208,31 +217,18 @@ class CrazyflieController:
                 continue
 
             with torch.no_grad():
-                # TEST: Commandes neutres pour vérifier la stabilité
                 action = torch.zeros(4, device=device)
-                # action_dict = self.agent.act(obs, 1, 0)
-                # action = action_dict[0]
                 logger.debug(f"Action={action}")
 
-            # action: [roll_ref, pitch_ref, yaw_rate_ref, thrust_norm]  — must match att_hovering.py
             roll  = action[0].item() * MAX_ANGLE
             pitch = action[1].item() * MAX_ANGLE
             yaw   = action[2].item() * MAX_YAW_RATE
-
-            # Thrust mapping identique à la simulation
-            thrust_norm = (action[3].item() + 1.0) / 2.0  # map [-1,1] to [0,1]
+            thrust_norm = (action[3].item() + 1.0) / 2.0
             thrust = int(HOVER_THRUST * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
             thrust = max(20000, min(65000, thrust))
 
             logger.info(f"Cmd: roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust} | pos={self.current_pos}")
-
-            # Send attitude setpoint
-            self.cf.commander.send_setpoint(
-                    roll,
-                    pitch,
-                    yaw,
-                    thrust,
-            )
+            self.cf.commander.send_setpoint(roll, pitch, yaw, thrust)
 
             elapsed = time.time() - start_time
             time.sleep(max(0, INTERVAL - elapsed))
@@ -240,112 +236,71 @@ class CrazyflieController:
         self.cf.commander.send_stop_setpoint()
         logger.info("Control loop stopped")
 
-    # ---------- Connection management ----------
-
     def start(self):
-        """Connect to Crazyflie"""
         cflib.crtp.init_drivers(enable_debug_driver=False)
         self.cf.open_link(self.uri)
 
     def stop(self):
-        """Disconnect safely"""
         logger.info("Stopping controller...")
         self.running = False
-        time.sleep(0.2)  # Attendre que le control loop s'arrête
+        time.sleep(0.2)
         logger.info("Landing...")
-        self.cf.commander.send_stop_setpoint()
-        time.sleep(0.5)
+        self.cf.high_level_commander.land(0.0, 2.0)
+        time.sleep(2.5)
         self.cf.close_link()
         logger.info("Link closed")
 
 
-# ============================================================
-#                    OBSERVATION CREATION
-# ============================================================
-
 def retrieve_and_create_observation(previous_pos, current_pos, current_quat, time_elapsed) -> Optional[torch.Tensor]:
-    """
-    Retrieve sensor data (IMU + Lighthouse + target info)
-    and return observation tensor.    
-    """
     global target_pos
     dist_to_target = torch.dist(current_pos, target_pos)
-    logger.debug(f"Distance to target={dist_to_target}")
     if dist_to_target < 0.2:
         target_pos = torch.empty(3, dtype=torch.float32, device=device)
         target_pos[:2].uniform_(-1.5, 1.5)
         target_pos[2].uniform_(0.7, 1.5)
-
         logger.info(f"/!\ New target={target_pos}")
-
     linear_vel_world = (current_pos - previous_pos) / time_elapsed
     linear_vel = quat_apply(quat_inv(current_quat), linear_vel_world)
-
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
-
     obs = torch.cat([linear_vel, desired_pos_b], dim=-1)
-    logger.debug(f"previous_pos={previous_pos}, current_pos={current_pos}, current_quat={current_quat}, \
-                  time_elapsed={time_elapsed}, target_pos={target_pos}, linear_vel={linear_vel}, desired_pos_b={desired_pos_b}")
-    logger.debug(f"Obs={obs}")
-
     return obs
 
-        
 def quat_apply(quat, vec):
-    # store shape
     shape = vec.shape
-    # reshape to (N, 3) for multiplication
     quat = quat.reshape(-1, 4)
     vec = vec.reshape(-1, 3)
-    # extract components from quaternions
     xyz = quat[:, 1:]
     t = xyz.cross(vec, dim=-1) * 2
     return (vec + quat[:, 0:1] * t + xyz.cross(t, dim=-1)).view(shape)
-
 
 def quat_conjugate(q):
     shape = q.shape
     q = q.reshape(-1, 4)
     return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1).view(shape)
 
-
 def quat_inv(q, eps=1e-9):
     return quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
 
-# ============================================================
-#                    MODEL LOADING / MAIN
-# ============================================================
-
 def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
-    """Load PPO agent and policy"""
     obs_space = 6
     act_space = 4
-
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models = {"policy": policy}
-
     cfg = PPO_DEFAULT_CONFIG.copy()
     agent = PPO(models=models, memory=None, cfg=cfg,
                 observation_space=obs_space, action_space=act_space, device=device)
-
-    assert checkpoint_path and os.path.exists(checkpoint_path), "No valid checkpoint provided. Please give a path for weights."
-
+    assert checkpoint_path and os.path.exists(checkpoint_path), "No valid checkpoint provided."
     agent.load(checkpoint_path)
     print(f"Loaded checkpoint from {checkpoint_path}")
-
     return agent
-
 
 def main():
     parser = argparse.ArgumentParser(description="Run a trained SKRL PPO agent on a Crazyflie drone.")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to the model checkpoint")
-    parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E1", help="URI of the Crazyflie")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E1")
     args = parser.parse_args()
-
     agent = load_agent(args.checkpoint, device)
-
     controller = CrazyflieController(uri=args.uri, agent=agent)
-
     try:
         controller.start()
         while not controller.cf.is_connected():
@@ -353,19 +308,13 @@ def main():
         logger.info("Cf is connected !")
         while True:
             time.sleep(1)
-
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-
     finally:
         controller.stop()
         logger.info("Shutting down")
-        from cflib.utils.power_switch import PowerSwitch
-        PowerSwitch(args.uri).stm_power_cycle()
-
 
 if __name__ == "__main__":
     main()
