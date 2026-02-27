@@ -3,7 +3,33 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Gamepad input handler using pygame."""
+"""Gamepad input handler using pygame — FPV Mode 2 layout.
+
+Axis layout (AETR — standard for FPV radio controllers on Linux):
+    ax0  Aileron  (right stick X) →  Roll            (spring, -=left,  +=right)
+    ax1  Elevator (right stick Y) →  Pitch           (spring, -=fwd,   +=back)
+    ax2  Throttle (left  stick Y) →  Thrust / Vz     (non-spring, -=bottom, +=top)
+    ax3  Rudder   (left  stick X) →  Yaw rate        (spring, -=left,  +=right)
+
+Velocity / Position mode:
+    Left  stick Y  : Vz  (up/down)
+    Left  stick X  : Yaw rate
+    Right stick Y  : Vx  (forward/backward)
+    Right stick X  : Vy  (left/right)
+
+Attitude mode:
+    Left  stick Y  : Thrust  (non-spring: bottom=min, centre=hover, top=max)
+    Left  stick X  : Yaw rate
+    Right stick Y  : Pitch
+    Right stick X  : Roll
+
+Button mappings (Xbox style):
+    A (0)     : Switch to velocity mode
+    B (1)     : Switch to attitude mode
+    Y (3)     : Switch to position mode
+    Start (7) : Reset
+    Back  (6) : Quit
+"""
 
 from __future__ import annotations
 
@@ -13,125 +39,111 @@ from .base_handler import BaseInputHandler, ControlMode, InputState
 
 
 class GamepadHandler(BaseInputHandler):
-    """Gamepad input handler using pygame.
 
-    Stick mappings:
+    DEADZONE = 0.10
 
-    Velocity mode:
-        Left stick Y  : Vx (forward/backward)
-        Left stick X  : Vy (left/right)
-        Right stick Y : Vz (up/down)
-        Right stick X : Yaw rate
+    # Hover fraction (must match KeyboardHandler.HOVER_THRUST)
+    _HOVER = 1.0 / 1.8
+    # Thrust excursion above/below hover when stick is at full deflection
+    _THRUST_DELTA = 0.35
 
-    Attitude mode:
-        Left stick X  : Roll
-        Left stick Y  : Pitch
-        Right stick X : Yaw rate
-        RT - LT       : Thrust
-
-    Button mappings:
-        A (0)     : Switch to velocity mode
-        B (1)     : Switch to attitude mode
-        Y (3)     : Switch to position mode
-        Start (7) : Reset
-        Back (6)  : Quit
-    """
-
-    # Deadzone for analog sticks
-    DEADZONE = 0.15
-
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, debug: bool = False):
         super().__init__(device)
         self._pygame = None
         self._joystick = None
         self._initialized = False
+        self._debug = debug
+        self._debug_counter = 0
+        self._axis_rest: list[float] = []   # per-axis rest offsets
+
+    # ── Initialization ────────────────────────────────────────────────────────
 
     def initialize(self) -> bool:
-        """Initialize pygame and gamepad."""
+        """Initialize pygame and pick the first real gamepad (>= 4 axes)."""
         try:
             import pygame
 
             self._pygame = pygame
-
-            # Initialize pygame joystick module
             pygame.init()
             pygame.joystick.init()
 
-            # Check for connected joysticks
-            if pygame.joystick.get_count() == 0:
+            count = pygame.joystick.get_count()
+            if count == 0:
                 print("[GamepadHandler] No gamepad connected")
                 return False
 
-            # Use first joystick
-            self._joystick = pygame.joystick.Joystick(0)
-            self._joystick.init()
+            print(f"[GamepadHandler] Scanning {count} device(s):")
+            for i in range(count):
+                joy = pygame.joystick.Joystick(i)
+                joy.init()
+                axes = joy.get_numaxes()
+                print(f"  [{i}] {joy.get_name()}  axes={axes}  buttons={joy.get_numbuttons()}")
+                if axes >= 4:
+                    self._joystick = joy
+                    break
+                joy.quit()
 
-            print(f"[GamepadHandler] Initialized: {self._joystick.get_name()}")
-            print(f"  Axes: {self._joystick.get_numaxes()}")
-            print(f"  Buttons: {self._joystick.get_numbuttons()}")
-            print(f"  Hats: {self._joystick.get_numhats()}")
+            if self._joystick is None:
+                print("[GamepadHandler] No suitable gamepad found (need >= 4 axes)")
+                return False
+
+            print(f"[GamepadHandler] Using: {self._joystick.get_name()}")
+
+            # ── Auto-calibration ─────────────────────────────────────────────
+            # Pump several frames so axis values have time to settle, then
+            # record the rest position of every axis.  Spring-return sticks
+            # (yaw, roll, pitch) should be centred; the throttle (non-spring)
+            # can be anywhere — its rest value is used only to decide whether
+            # to apply calibration (skipped when |rest| >= 0.7).
+            print("[GamepadHandler] Calibrating — centre all SPRING sticks (roll/pitch/yaw) …")
+            for _ in range(30):
+                pygame.event.pump()
+            n = self._joystick.get_numaxes()
+            self._axis_rest = [self._joystick.get_axis(i) for i in range(n)]
+            print(f"[GamepadHandler] Rest offsets: "
+                  f"{' '.join(f'ax{i}={v:+.2f}' for i, v in enumerate(self._axis_rest))}")
 
             self._initialized = True
             return True
 
         except ImportError:
-            print("[GamepadHandler] pygame not installed. Install with: pip install pygame")
+            print("[GamepadHandler] pygame not installed.  pip install pygame")
             return False
         except Exception as e:
             print(f"[GamepadHandler] Initialization failed: {e}")
             return False
 
+    # ── Axis helpers ──────────────────────────────────────────────────────────
+
     def _apply_deadzone(self, value: float) -> float:
-        """Apply deadzone to analog input."""
         if abs(value) < self.DEADZONE:
             return 0.0
-        # Remap value to full range after deadzone
         sign = 1.0 if value > 0 else -1.0
         return sign * (abs(value) - self.DEADZONE) / (1.0 - self.DEADZONE)
 
     def _get_axis(self, axis_id: int) -> float:
-        """Get axis value with deadzone applied."""
+        """Return calibrated + deadzone-filtered axis value in [-1, 1].
+
+        Spring-return axes (rest ≈ 0) get a rest-offset subtracted so they
+        centre precisely at 0.  Non-spring axes (throttle, rest ≈ ±1) are
+        passed through as-is so their full [-1, +1] travel is preserved.
+        """
         if self._joystick is None or axis_id >= self._joystick.get_numaxes():
             return 0.0
-        return self._apply_deadzone(self._joystick.get_axis(axis_id))
+        raw = self._joystick.get_axis(axis_id)
+        # Only subtract the rest offset for spring-return sticks (rest near 0).
+        # Skip calibration for throttle-style axes whose rest is near ±1
+        # (subtracting would shift the range and clip one direction of travel).
+        if axis_id < len(self._axis_rest) and abs(self._axis_rest[axis_id]) < 0.7:
+            raw -= self._axis_rest[axis_id]
+        return self._apply_deadzone(raw)
 
     def _get_button(self, button_id: int) -> bool:
-        """Get button state."""
         if self._joystick is None or button_id >= self._joystick.get_numbuttons():
             return False
-        return self._joystick.get_button(button_id)
+        return bool(self._joystick.get_button(button_id))
 
-    def _get_trigger_value(self) -> float:
-        """Get combined trigger value (RT - LT).
-
-        Common axis mappings:
-        - Xbox: LT = axis 4, RT = axis 5 (0 to 1 range on some, -1 to 1 on others)
-        - PS4: L2 = axis 4, R2 = axis 5
-
-        Returns value in range [-1, 1] where positive is RT, negative is LT.
-        """
-        if self._joystick is None:
-            return 0.0
-
-        num_axes = self._joystick.get_numaxes()
-
-        # Try standard trigger axes (4 and 5)
-        if num_axes >= 6:
-            lt = self._joystick.get_axis(4)  # Left trigger
-            rt = self._joystick.get_axis(5)  # Right trigger
-
-            # Some controllers report triggers as -1 to 1 (need to remap to 0 to 1)
-            # Others report as 0 to 1 directly
-            # Handle both cases by checking the idle state
-            # If idle value is around -1, remap; if around 0, use as-is
-            if lt < -0.5:  # Likely -1 to 1 range
-                lt = (lt + 1.0) / 2.0
-            if rt < -0.5:
-                rt = (rt + 1.0) / 2.0
-
-            return rt - lt
-
-        return 0.0
+    # ── Update ────────────────────────────────────────────────────────────────
 
     def update(self) -> InputState:
         """Poll gamepad and return current input state."""
@@ -140,61 +152,59 @@ class GamepadHandler(BaseInputHandler):
         if not self._initialized or self._joystick is None:
             return state
 
-        # Process pygame events to update joystick state
         self._pygame.event.pump()
 
-        # Standard axis mapping:
-        # Axis 0: Left stick X
-        # Axis 1: Left stick Y (inverted: push up = negative)
-        # Axis 2: Right stick X
-        # Axis 3: Right stick Y (inverted)
-        # Axis 4: Left trigger
-        # Axis 5: Right trigger
+        # ── Debug print ───────────────────────────────────────────────────────
+        if self._debug:
+            self._debug_counter += 1
+            if self._debug_counter >= 60:
+                self._debug_counter = 0
+                n = self._joystick.get_numaxes()
+                raw = [f"ax{i}={self._joystick.get_axis(i):+.2f}" for i in range(n)]
+                cal = [f"ax{i}={self._get_axis(i):+.2f}" for i in range(n)]
+                print(f"[Gamepad RAW] {' | '.join(raw)}")
+                print(f"[Gamepad CAL] {' | '.join(cal)}")
 
-        left_x = self._get_axis(0)
-        left_y = -self._get_axis(1)  # Invert Y axis
-        right_x = self._get_axis(2)
-        right_y = -self._get_axis(3)  # Invert Y axis
+        # AETR axes (calibrated + deadzone applied)
+        roll_input   =  self._get_axis(0)   # ax0 Aileron  right X:  -=left,  +=right
+        pitch_input  = -self._get_axis(1)   # ax1 Elevator right Y:  up=-raw → positive=fwd
+        thrust_input =  self._get_axis(2)   # ax2 Throttle left  Y:  -=bottom, +=top
+        yaw_input    =  self._get_axis(3)   # ax3 Rudder   left  X:  -=left,  +=right
 
         if self._current_mode == "velocity":
-            # Velocity mode
-            state.vx = left_y   # Left stick Y = forward/backward
-            state.vy = -left_x  # Left stick X = left/right (inverted for intuitive control)
-            state.vz = right_y  # Right stick Y = up/down
-            state.yaw_rate = right_x
+            state.vx       =  pitch_input   # right Y: forward/backward
+            state.vy       = -roll_input    # right X: left/right (inverted)
+            state.vz       =  thrust_input  # left  Y: up/down
+            state.yaw_rate =  yaw_input     # left  X: yaw
 
         elif self._current_mode == "attitude":
-            # Attitude mode
-            state.roll = left_x     # Left stick X = roll
-            state.pitch = left_y    # Left stick Y = pitch
-            state.yaw_rate = right_x
-            state.thrust = self._get_trigger_value()  # RT - LT
+            state.roll     =  roll_input
+            state.pitch    =  pitch_input
+            state.yaw_rate =  yaw_input
+            # Thrust: spring-centred stick → centre = hover, up = rise, down = descend
+            # Matches KeyboardHandler behaviour (no input = hold altitude).
+            thrust = self._HOVER + thrust_input * self._THRUST_DELTA
+            state.thrust = float(max(0.0, min(1.0, thrust)))
 
         elif self._current_mode == "position":
-            # Position mode (same as velocity, but interpreted as position delta)
-            state.vx = left_y
-            state.vy = -left_x
-            state.vz = right_y
-            state.yaw_rate = right_x
+            state.vx       =  pitch_input
+            state.vy       = -roll_input
+            state.vz       =  thrust_input
+            state.yaw_rate =  yaw_input
 
-        # Button mappings (Xbox style)
-        # A=0, B=1, X=2, Y=3, LB=4, RB=5, Back=6, Start=7
-        if self._get_button(0):  # A - Velocity mode
-            state.mode_switch = "velocity"
-        elif self._get_button(1):  # B - Attitude mode
-            state.mode_switch = "attitude"
-        elif self._get_button(3):  # Y - Position mode
-            state.mode_switch = "position"
+        # ── Buttons (Xbox style) ──────────────────────────────────────────────
+        if self._get_button(0):   state.mode_switch = "velocity"
+        elif self._get_button(1): state.mode_switch = "attitude"
+        elif self._get_button(3): state.mode_switch = "position"
 
-        if self._get_button(7):  # Start - Reset
-            state.reset_requested = True
-        if self._get_button(6):  # Back - Quit
-            state.quit_requested = True
+        if self._get_button(7):   state.reset_requested = True
+        if self._get_button(6):   state.quit_requested  = True
 
         return state
 
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+
     def cleanup(self) -> None:
-        """Clean up pygame resources."""
         if self._initialized:
             if self._joystick is not None:
                 self._joystick.quit()
@@ -203,5 +213,4 @@ class GamepadHandler(BaseInputHandler):
             self._initialized = False
 
     def is_available(self) -> bool:
-        """Check if gamepad is available."""
         return self._initialized and self._joystick is not None

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import pathlib as _pathlib
-from typing import Literal
+from typing import Callable, Literal, Optional
 
 import gymnasium as gym
 import torch
@@ -39,6 +39,7 @@ _DEFAULT_DRONE_CONFIG = str(
 )
 
 ControlMode = Literal["position", "velocity", "attitude"]
+RateProfile = Literal["none", "betaflight", "actual", "kiss", "raceflight"]
 
 
 class TeleoperationEnvWindow(BaseEnvWindow):
@@ -67,16 +68,19 @@ class TeleoperationEnvCfg(DirectRLEnvCfg):
     debug_vis = True
 
     # Control limits
-    max_velocity = 1.0  # m/s
+    max_velocity = 3.0  # m/s
     max_position_delta = 0.5  # m per step
-    max_roll_pitch = 30.0 * math.pi / 180.0  # 30 deg max tilt
-    max_yaw_rate = 90.0 * math.pi / 180.0  # 90 deg/s max yaw rate
-    min_thrust_scale = 0.5  # fraction of hover thrust
+    max_roll_pitch = 30.0 * math.pi / 180.0  # 30 deg max tilt (angle mode)
+    max_yaw_rate = 90.0 * math.pi / 180.0  # 90 deg/s max yaw rate (angle mode)
     max_thrust_scale = 1.8  # fraction of hover thrust
 
     # Safety limits
     min_altitude = 0.1
     max_altitude = 3.0
+
+    # Rate profile for attitude mode: "none" = angle mode (default)
+    # Options: "none", "betaflight", "actual", "kiss", "raceflight"
+    rate_profile: str = "none"
 
     ui_window_class_type = TeleoperationEnvWindow
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
@@ -142,19 +146,51 @@ class TeleoperationEnv(DirectRLEnv):
             device=self.device,
         )
 
-        # Thrust limits for attitude mode
+        # Thrust limits
         self._hover_thrust = drone_cfg.physics.mass * 9.81
-        self._min_thrust = self.cfg.min_thrust_scale * self._hover_thrust
         self._max_thrust = self.cfg.max_thrust_scale * self._hover_thrust
+
+        # Rate profile function (None = angle mode)
+        self._rate_profile_fn: Optional[Callable] = self._build_rate_profile_fn(cfg.rate_profile)
+        if self._rate_profile_fn is not None:
+            print(f"[TeleoperationEnv] Attitude mode: rate profile = {cfg.rate_profile}")
+        else:
+            print("[TeleoperationEnv] Attitude mode: angle mode (no rate profile)")
 
         # Control references
         self._target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self._ref_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self._att_ref = torch.zeros(self.num_envs, 3, device=self.device)
+        self._body_rate_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._yaw_rate_ref = torch.zeros(self.num_envs, 1, device=self.device)
         self._thrust_cmd = torch.zeros(self.num_envs, 1, device=self.device)
 
         self.set_debug_vis(self.cfg.debug_vis)
+
+    # ── Rate profile factory ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_rate_profile_fn(profile: str) -> Optional[Callable]:
+        """Return the rate profile callable, or None for angle mode."""
+        if profile == "none":
+            return None
+        from drone.utils.rate_profiles import (
+            actual_rate_profile,
+            betaflight_rate_profile,
+            kiss_rate_profile,
+            raceflight_rate_profile,
+        )
+        _profiles = {
+            "betaflight": betaflight_rate_profile,
+            "actual":     actual_rate_profile,
+            "kiss":       kiss_rate_profile,
+            "raceflight": raceflight_rate_profile,
+        }
+        if profile not in _profiles:
+            raise ValueError(f"Unknown rate profile '{profile}'. Choose from {list(_profiles)} or 'none'.")
+        return _profiles[profile]
+
+    # ── Mode management ───────────────────────────────────────────────────────
 
     @property
     def control_mode(self) -> ControlMode:
@@ -162,11 +198,7 @@ class TeleoperationEnv(DirectRLEnv):
         return self._control_mode
 
     def set_control_mode(self, mode: ControlMode) -> None:
-        """Switch control mode at runtime.
-
-        Args:
-            mode: One of "position", "velocity", "attitude"
-        """
+        """Switch control mode at runtime."""
         if mode not in ("position", "velocity", "attitude"):
             raise ValueError(f"Invalid control mode: {mode}")
 
@@ -178,9 +210,12 @@ class TeleoperationEnv(DirectRLEnv):
             self._target_pos = self._robot.data.root_pos_w.clone()
             self._ref_vel.zero_()
             self._att_ref.zero_()
+            self._body_rate_ref.zero_()
             self._yaw_rate_ref.zero_()
-            # Set thrust to hover
-            self._thrust_cmd.fill_(self._hover_thrust / self._ctrl.thrust_cmd_scale)
+            # Keep thrust_cmd at current value so the first step after a switch
+            # doesn't jerk — it will be overwritten by _pre_physics_step anyway.
+
+    # ── Scene ─────────────────────────────────────────────────────────────────
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -196,41 +231,47 @@ class TeleoperationEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+    # ── Control ───────────────────────────────────────────────────────────────
+
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process actions based on current control mode.
 
         Action format (7D): [vx, vy, vz, roll, pitch, yaw_rate, thrust]
-        - Position mode: uses [vx, vy, vz] as position delta
-        - Velocity mode: uses [vx, vy, vz] as velocity setpoint
-        - Attitude mode: uses [roll, pitch, yaw_rate, thrust]
+        - Position mode : uses [vx, vy, vz] as position delta
+        - Velocity mode : uses [vx, vy, vz] as velocity setpoint
+        - Attitude mode :
+            angle mode  — [roll, pitch] → angle setpoints; [yaw_rate] → yaw rate; [thrust] → thrust
+            rate  mode  — [roll, pitch, yaw_rate] → rate profile → body rates; [thrust] → thrust
         """
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
         if self._control_mode == "position":
-            # Position delta from action [0:3]
             pos_delta = self._actions[:, :3] * self.cfg.max_position_delta
             self._target_pos = self._robot.data.root_pos_w + pos_delta
-            # Clamp altitude
             self._target_pos[:, 2] = torch.clamp(
-                self._target_pos[:, 2],
-                self.cfg.min_altitude,
-                self.cfg.max_altitude
+                self._target_pos[:, 2], self.cfg.min_altitude, self.cfg.max_altitude
             )
 
         elif self._control_mode == "velocity":
-            # Velocity reference from action [0:3]
             self._ref_vel = self._actions[:, :3] * self.cfg.max_velocity
 
         elif self._control_mode == "attitude":
-            # Attitude reference from action [3:7]
-            roll_ref = self._actions[:, 3] * self.cfg.max_roll_pitch
-            pitch_ref = self._actions[:, 4] * self.cfg.max_roll_pitch
-            self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
-            self._yaw_rate_ref = (self._actions[:, 5] * self.cfg.max_yaw_rate).unsqueeze(-1)
+            if self._rate_profile_fn is None:
+                # ── Angle mode (default) ──────────────────────────────────────
+                roll_ref  = self._actions[:, 3] * self.cfg.max_roll_pitch
+                pitch_ref = self._actions[:, 4] * self.cfg.max_roll_pitch
+                self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
+                self._yaw_rate_ref = (self._actions[:, 5] * self.cfg.max_yaw_rate).unsqueeze(-1)
+            else:
+                # ── Rate mode: stick → rate profile → body-rate setpoints ─────
+                # actions[:, 3:6] = [roll, pitch, yaw] sticks in [-1, 1]
+                rc_input = self._actions[:, 3:6]
+                self._body_rate_ref = self._rate_profile_fn(rc_input)  # [N, 3] rad/s
 
-            # Thrust from action [6], mapped from [-1,1] to [min_thrust, max_thrust]
-            thrust_normalized = (self._actions[:, 6] + 1.0) / 2.0
-            thrust_ref = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
+            # Thrust: action[6] in [0, 1] — 0 = no thrust (falls), 1 = max thrust.
+            # This is true for both angle and rate modes.
+            thrust_normalized = self._actions[:, 6].clamp(0.0, 1.0)
+            thrust_ref = thrust_normalized * self._max_thrust
             self._thrust_cmd = (thrust_ref / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
 
     def _apply_action(self):
@@ -260,18 +301,31 @@ class TeleoperationEnv(DirectRLEnv):
                 body_rates_in_body_frame=True,
             )
         elif self._control_mode == "attitude":
-            thrust, moment = self._ctrl(
-                root_state,
-                target_attitude=self._att_ref,
-                target_yaw_rate=self._yaw_rate_ref,
-                thrust_cmd=self._thrust_cmd,
-                command_level="attitude",
-                body_rates_in_body_frame=True,
-            )
+            if self._rate_profile_fn is None:
+                # Angle mode: angle setpoints → rate PID via attitude loop
+                thrust, moment = self._ctrl(
+                    root_state,
+                    target_attitude=self._att_ref,
+                    target_yaw_rate=self._yaw_rate_ref,
+                    thrust_cmd=self._thrust_cmd,
+                    command_level="attitude",
+                    body_rates_in_body_frame=True,
+                )
+            else:
+                # Rate mode: body-rate setpoints → rate PID directly
+                thrust, moment = self._ctrl(
+                    root_state,
+                    target_body_rates=self._body_rate_ref,
+                    thrust_cmd=self._thrust_cmd,
+                    command_level="body_rate",
+                    body_rates_in_body_frame=True,
+                )
 
         self._thrust[:, 0, 2] = thrust.squeeze(-1)
         self._moment[:, 0, :] = moment
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+
+    # ── Observations / rewards / dones ────────────────────────────────────────
 
     def _get_observations(self) -> dict:
         """Return full state observation: pos(3), quat(4), lin_vel(3), ang_vel(3)."""
@@ -292,12 +346,10 @@ class TeleoperationEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Check safety limits (altitude only, no timeout for teleop)."""
-        # Safety: drone too low or too high
         died = torch.logical_or(
             self._robot.data.root_pos_w[:, 2] < self.cfg.min_altitude,
-            self._robot.data.root_pos_w[:, 2] > self.cfg.max_altitude
+            self._robot.data.root_pos_w[:, 2] > self.cfg.max_altitude,
         )
-        # No timeout for teleoperation
         time_out = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         return died, time_out
 
@@ -310,21 +362,16 @@ class TeleoperationEnv(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
 
-        # Reset robot to default hover position
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
-        # Start at 1m altitude
         default_root_state[:, 2] = 1.0
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-        # Reset target position to current position
         self._target_pos[env_ids] = default_root_state[:, :3]
-
-        # Reset PID controller integrators
         self._ctrl.reset(env_ids)
 
     def _set_debug_vis_impl(self, debug_vis: bool):

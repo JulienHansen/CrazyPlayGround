@@ -22,7 +22,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
-from drone import CrazyfliePIDController, load_config
+from drone import CascadePIDController, load_config
 
 # Path to the Crazyflie config bundled with DroneModule.
 # Adjust if the project layout changes.
@@ -132,7 +132,7 @@ class QuadcopterEnv(DirectRLEnv):
         # CrazyfliePIDController loads gains and physical params from the YAML config,
         # and internally manages all four loops: position → velocity → attitude → rate.
         drone_cfg = load_config(self.cfg.drone_config_path)
-        self._ctrl = CrazyfliePIDController.from_drone_config(
+        self._ctrl = CascadePIDController.from_drone_config(
             drone_cfg,
             num_envs=self.num_envs,
             dt=self.cfg.sim.dt,

@@ -33,7 +33,7 @@ class InputState:
     roll: float = 0.0
     pitch: float = 0.0
     yaw_rate: float = 0.0
-    thrust: float = 0.0  # -1 to 1, will be mapped to thrust range
+    thrust: float = 0.0  # [0, 1]: 0 = no thrust (falls), 1 = max thrust
 
     # Control signals
     mode_switch: Optional[ControlMode] = None
@@ -87,6 +87,10 @@ class BaseInputHandler(ABC):
         Returns:
             InputState with current input values and control signals.
         """
+        pass
+
+    def reset(self) -> None:
+        """Reset handler state (called on environment reset). Override if needed."""
         pass
 
     @abstractmethod
