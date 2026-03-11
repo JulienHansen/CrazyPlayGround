@@ -5,7 +5,6 @@ import argparse
 import logging
 from typing import Any, Dict, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -16,6 +15,7 @@ from cflib.crazyflie.log import LogConfig
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] {message}",
@@ -58,12 +58,13 @@ class Policy(GaussianMixin, Model):
 
 class CrazyflieController:
     """Main Crazyflie controller for running trained RL agents"""
-    def __init__(self, uri: str, agent: PPO):
+    def __init__(self, uri: str, agent: PPO, hover_thrust: int = 30000):
         self.uri = uri
         self.cf = Crazyflie()
         self.agent = agent
-        self.previous_pos = torch.zeros(3, dtype=torch.float32, device=device)
+        self.hover_thrust = hover_thrust
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
+        self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
         self.position_received = False
         self.running = True
@@ -94,15 +95,20 @@ class CrazyflieController:
         self.running = False
 
     def _start_logging(self):
-        LOG_FREQUENCY_IN_MS = 50
-        log_pos = LogConfig(name="pos", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_pos.add_variable("stateEstimate.x", "float")
-        log_pos.add_variable("stateEstimate.y", "float")
-        log_pos.add_variable("stateEstimate.z", "float")
-        self.cf.log.add_config(log_pos)
-        log_pos.data_received_cb.add_callback(self._log_pos_callback)
-        log_pos.start()
+        LOG_FREQUENCY_IN_MS = 10  # 100 Hz — matches control loop
+        # Block 1: position + velocity (6 floats = 24 bytes, within 26-byte limit)
+        log_posvel = LogConfig(name="posvel", period_in_ms=LOG_FREQUENCY_IN_MS)
+        log_posvel.add_variable("stateEstimate.x", "float")
+        log_posvel.add_variable("stateEstimate.y", "float")
+        log_posvel.add_variable("stateEstimate.z", "float")
+        log_posvel.add_variable("stateEstimate.vx", "float")
+        log_posvel.add_variable("stateEstimate.vy", "float")
+        log_posvel.add_variable("stateEstimate.vz", "float")
+        self.cf.log.add_config(log_posvel)
+        log_posvel.data_received_cb.add_callback(self._log_posvel_callback)
+        log_posvel.start()
 
+        # Block 2: quaternion (4 floats = 16 bytes)
         log_quat = LogConfig(name="quat", period_in_ms=LOG_FREQUENCY_IN_MS)
         log_quat.add_variable("stateEstimate.qx", "float")
         log_quat.add_variable("stateEstimate.qy", "float")
@@ -120,13 +126,17 @@ class CrazyflieController:
         log_var.data_received_cb.add_callback(self._log_variance_callback)
         log_var.start()
 
-    def _log_pos_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
+    def _log_posvel_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
         with self.lock:
-            self.previous_pos = self.current_pos.clone()
             self.current_pos = torch.tensor([
                 data["stateEstimate.x"],
                 data["stateEstimate.y"],
                 data["stateEstimate.z"]
+            ], dtype=torch.float32, device=device)
+            self.current_vel = torch.tensor([
+                data["stateEstimate.vx"],
+                data["stateEstimate.vy"],
+                data["stateEstimate.vz"]
             ], dtype=torch.float32, device=device)
             self._last_pos_time = time.time()
             self.position_received = True
@@ -167,10 +177,6 @@ class CrazyflieController:
         INTERVAL = 0.01  # control frequency (s) - 100 Hz
         MAX_ANGLE = 30.0          # degrees  — must match att_hovering.py max_roll_pitch
         MAX_YAW_RATE = 90.0       # deg/s    — must match att_hovering.py max_yaw_rate
-        # Hover PWM: mass(0.027kg)×g / (max_thrust(0.638N)/PWM_max(65535)) ≈ 27 200
-        # Using firmware estimate from crazyflie.yaml thrust_base = 30 000.
-        # Calibrate empirically if the drone doesn't hold altitude at action[3]=0.
-        HOVER_THRUST = 30000
         MIN_THRUST_SCALE = 0.5    # fraction of hover — must match att_hovering.py
         MAX_THRUST_SCALE = 1.8    # fraction of hover — must match att_hovering.py
 
@@ -190,13 +196,13 @@ class CrazyflieController:
         RAMP_STEPS = int(TAKEOFF_DURATION / INTERVAL)
         for step in range(RAMP_STEPS):
             frac = min(1.0, step / (RAMP_STEPS * 0.4))  # ramp over first 40%
-            thrust = int(HOVER_THRUST * (0.3 + 0.7 * frac))  # 30% → 100%
+            thrust = int(self.hover_thrust * (0.3 + 0.7 * frac))  # 30% → 100%
             self.cf.commander.send_setpoint(0, 0, 0, thrust)
             time.sleep(INTERVAL)
         # Stabilise at hover thrust
         logger.info("Stabilising at hover...")
         for _ in range(int(STABILIZE_PAUSE / INTERVAL)):
-            self.cf.commander.send_setpoint(0, 0, 0, HOVER_THRUST)
+            self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
             time.sleep(INTERVAL)
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
         logger.info(f"Init target pos={target_pos}")
@@ -220,10 +226,10 @@ class CrazyflieController:
                 self._emergency_land()
                 break
 
-            obs = retrieve_and_create_observation(self.previous_pos, self.current_pos, self.current_quat, INTERVAL)
+            obs = retrieve_and_create_observation(self.current_vel, self.current_pos, self.current_quat)
             if obs is None:
                 logger.warning("No observation received, hovering...")
-                self.cf.commander.send_setpoint(0, 0, 0, HOVER_THRUST)
+                self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
                 time.sleep(INTERVAL)
                 continue
 
@@ -238,7 +244,7 @@ class CrazyflieController:
             # Thrust: action[3] in [0,1] — matches att_hovering.py and teleop_env.py convention.
             # 0 = min thrust, 1 = max thrust, ~0.556 = hover.
             thrust_norm = float(max(0.0, min(1.0, action[3].item())))
-            thrust = int(HOVER_THRUST * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
+            thrust = int(self.hover_thrust * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
             thrust = max(10000, min(60000, thrust))
 
             logger.info(f"Cmd: roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust} | pos={self.current_pos}")
@@ -265,18 +271,18 @@ class CrazyflieController:
         logger.info("Link closed")
 
 
-def retrieve_and_create_observation(previous_pos, current_pos, current_quat, time_elapsed) -> Optional[torch.Tensor]:
+def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
     global target_pos
     dist_to_target = torch.dist(current_pos, target_pos)
     if dist_to_target < 0.2:
         target_pos = torch.empty(3, dtype=torch.float32, device=device)
         target_pos[:2].uniform_(-1.5, 1.5)
         target_pos[2].uniform_(0.7, 1.5)
-        logger.info(f"/!\ New target={target_pos}")
-    linear_vel_world = (current_pos - previous_pos) / time_elapsed
-    linear_vel = quat_apply(quat_inv(current_quat), linear_vel_world)
+        logger.info(f"/!\\ New target={target_pos}")
+    # Rotate world-frame Kalman velocity into body frame
+    linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
-    obs = torch.cat([linear_vel, desired_pos_b], dim=-1)
+    obs = torch.cat([linear_vel_b, desired_pos_b], dim=-1)
     return obs
 
 def quat_apply(quat, vec):
@@ -301,20 +307,24 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models = {"policy": policy}
     cfg = PPO_DEFAULT_CONFIG.copy()
+    cfg["state_preprocessor"] = RunningStandardScaler
+    cfg["state_preprocessor_kwargs"] = {"size": obs_space, "device": device}
     agent = PPO(models=models, memory=None, cfg=cfg,
                 observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), "No valid checkpoint provided."
     agent.load(checkpoint_path)
-    print(f"Loaded checkpoint from {checkpoint_path}")
+    logger.info(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
 def main():
     parser = argparse.ArgumentParser(description="Run a trained SKRL PPO agent on a Crazyflie drone.")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E1")
+    parser.add_argument("--hover-thrust", type=int, default=30000,
+                        help="Hover thrust PWM (default: 30000, calibrate empirically)")
     args = parser.parse_args()
     agent = load_agent(args.checkpoint, device)
-    controller = CrazyflieController(uri=args.uri, agent=agent)
+    controller = CrazyflieController(uri=args.uri, agent=agent, hover_thrust=args.hover_thrust)
     try:
         controller.start()
         while not controller.cf.is_connected():
