@@ -23,9 +23,11 @@ logging.basicConfig(format="{asctime} [{levelname}] {message}",
                         datefmt="%Y-%m-%d %H:%M:%S",
                         level=logging.INFO)
 logger = logging.getLogger("CrazyflieRL")
-target_pos = torch.empty(3, dtype=torch.float32, device=device)
-target_pos[:2].uniform_(-1.5, 1.5)
-target_pos[2].uniform_(0.7, 1.5)
+# Target is initialized after takeoff. In training, targets are absolute
+# positions in XY=[-1,1] Z=[0.5,1.5] relative to env origin (= world origin).
+# Your room is 3x3x1.7m with origin centered, so walls at ±1.5m — this
+# leaves 0.5m margin on each side.
+target_pos = None  # initialized in control_loop after takeoff
 
 # ── Safety thresholds ────────────────────────────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
@@ -58,11 +60,12 @@ class Policy(GaussianMixin, Model):
 
 class CrazyflieController:
     """Main Crazyflie controller for running trained RL agents"""
-    def __init__(self, uri: str, agent: PPO, hover_thrust: int = 30000):
+    def __init__(self, uri: str, agent: PPO, hover_thrust: int = 30000, initial_target=None):
         self.uri = uri
         self.cf = Crazyflie()
         self.agent = agent
         self.hover_thrust = hover_thrust
+        self.initial_target = initial_target
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
@@ -205,6 +208,13 @@ class CrazyflieController:
             self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
             time.sleep(INTERVAL)
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
+        # Initialize target: use CLI --target if given, else hover above takeoff pos
+        global target_pos
+        if self.initial_target is not None:
+            target_pos = torch.tensor(self.initial_target, dtype=torch.float32, device=device)
+        else:
+            target_pos = self.current_pos.clone()
+            target_pos[2] = max(0.5, min(1.5, target_pos[2].item()))
         logger.info(f"Init target pos={target_pos}")
 
         # ── Phase 2: NN attitude control loop ────────────────────────────────
@@ -213,6 +223,11 @@ class CrazyflieController:
             start_time = time.time()
 
             # ── Safety watchdog ──────────────────────────────────────────────
+            # Position bounds matching training termination (z<0.1 or z>2.0)
+            if self.current_pos[2].item() < 0.1 or self.current_pos[2].item() > 2.5:
+                logger.error(f"Position out of bounds z={self.current_pos[2].item():.2f} — emergency landing")
+                self._emergency_land()
+                break
             if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
                 logger.error(
                     f"Position data stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
@@ -273,11 +288,15 @@ class CrazyflieController:
 
 def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
     global target_pos
+    if target_pos is None:
+        return None
     dist_to_target = torch.dist(current_pos, target_pos)
     if dist_to_target < 0.2:
+        # New target at absolute positions matching training distribution:
+        # XY in [-1, 1], Z in [0.5, 1.5] (within 3x3x1.7m room)
         target_pos = torch.empty(3, dtype=torch.float32, device=device)
-        target_pos[:2].uniform_(-1.5, 1.5)
-        target_pos[2].uniform_(0.7, 1.5)
+        target_pos[:2].uniform_(-1.0, 1.0)
+        target_pos[2].uniform_(0.5, 1.5)
         logger.info(f"/!\\ New target={target_pos}")
     # Rotate world-frame Kalman velocity into body frame
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
@@ -322,9 +341,13 @@ def main():
     parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E1")
     parser.add_argument("--hover-thrust", type=int, default=30000,
                         help="Hover thrust PWM (default: 30000, calibrate empirically)")
+    parser.add_argument("--target", type=float, nargs=3, default=None,
+                        help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
     args = parser.parse_args()
     agent = load_agent(args.checkpoint, device)
-    controller = CrazyflieController(uri=args.uri, agent=agent, hover_thrust=args.hover_thrust)
+    initial_target = args.target  # None or [x, y, z]
+    controller = CrazyflieController(uri=args.uri, agent=agent, hover_thrust=args.hover_thrust,
+                                     initial_target=initial_target)
     try:
         controller.start()
         while not controller.cf.is_connected():
