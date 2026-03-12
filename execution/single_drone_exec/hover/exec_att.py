@@ -62,7 +62,7 @@ class CrazyflieController:
     """Main Crazyflie controller for running trained RL agents"""
     def __init__(self, uri: str, agent: PPO, hover_thrust: int = 30000, initial_target=None):
         self.uri = uri
-        self.cf = Crazyflie()
+        self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
         self.hover_thrust = hover_thrust
         self.initial_target = initial_target
@@ -91,7 +91,8 @@ class CrazyflieController:
         pass
 
     def _connection_failed(self, uri: str, msg: str):
-        pass
+        logger.error(f"Connection to {uri} failed: {msg}")
+        self.running = False
 
     def _connection_lost(self, uri: str, msg: str):
         logger.warning(f"Connection to {uri} lost: {msg} — triggering safe landing")
@@ -203,10 +204,10 @@ class CrazyflieController:
             self.cf.commander.send_setpoint(0, 0, 0, thrust)
             time.sleep(INTERVAL)
         # Stabilise at hover thrust
-        logger.info("Stabilising at hover...")
-        for _ in range(int(STABILIZE_PAUSE / INTERVAL)):
-            self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
-            time.sleep(INTERVAL)
+        # logger.info("Stabilising at hover...")
+        # for _ in range(int(STABILIZE_PAUSE / INTERVAL)):
+        #     self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
+        #     time.sleep(INTERVAL)
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
         # Initialize target: use CLI --target if given, else hover above takeoff pos
         global target_pos
@@ -219,12 +220,16 @@ class CrazyflieController:
 
         # ── Phase 2: NN attitude control loop ────────────────────────────────
         logger.info("NN attitude control active.")
+        nn_start_time = time.time()
+        GRACE_PERIOD = 3.0  # seconds before enforcing z lower bound (let drone gain altitude)
         while self.cf.is_connected() and self.running:
             start_time = time.time()
 
             # ── Safety watchdog ──────────────────────────────────────────────
             # Position bounds matching training termination (z<0.1 or z>2.0)
-            if self.current_pos[2].item() < 0.1 or self.current_pos[2].item() > 2.5:
+            elapsed_since_nn = time.time() - nn_start_time
+            z = self.current_pos[2].item()
+            if (elapsed_since_nn > GRACE_PERIOD and z < 0.1) or z > 2.5:
                 logger.error(f"Position out of bounds z={self.current_pos[2].item():.2f} — emergency landing")
                 self._emergency_land()
                 break
@@ -250,7 +255,8 @@ class CrazyflieController:
 
             with torch.no_grad():
                 action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[0]
+                action = action_dict[2]["mean_actions"].squeeze(0)  # deterministic mean, not sampled
+                action = action.clamp(-1.0, 1.0)  # match training env clipping
                 logger.debug(f"Action={action}")
 
             roll  = action[0].item() * MAX_ANGLE
@@ -261,9 +267,10 @@ class CrazyflieController:
             thrust_norm = float(max(0.0, min(1.0, action[3].item())))
             thrust = int(self.hover_thrust * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
             thrust = max(10000, min(60000, thrust))
+            thrust_percentage = 100 * thrust_norm
 
-            logger.info(f"Cmd: roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust} | pos={self.current_pos}")
-            self.cf.commander.send_setpoint(roll, pitch, yaw, thrust)
+            logger.info(f"Cmd: roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust_percentage:.1f} | pos={self.current_pos}")
+            self.cf.commander.send_setpoint_manual(roll, pitch, yaw, thrust_percentage, rate=False)
 
             elapsed = time.time() - start_time
             time.sleep(max(0, INTERVAL - elapsed))
@@ -332,13 +339,14 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
                 observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), "No valid checkpoint provided."
     agent.load(checkpoint_path)
+    agent.set_running_mode("eval")
     logger.info(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
 def main():
     parser = argparse.ArgumentParser(description="Run a trained SKRL PPO agent on a Crazyflie drone.")
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E1")
+    parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8")
     parser.add_argument("--hover-thrust", type=int, default=30000,
                         help="Hover thrust PWM (default: 30000, calibrate empirically)")
     parser.add_argument("--target", type=float, nargs=3, default=None,
@@ -350,10 +358,19 @@ def main():
                                      initial_target=initial_target)
     try:
         controller.start()
-        while not controller.cf.is_connected():
+        timeout = 10  # seconds to wait for connection
+        elapsed = 0
+        while not controller.cf.is_connected() and controller.running:
             time.sleep(1)
+            elapsed += 1
+            if elapsed >= timeout:
+                logger.error(f"Connection timeout after {timeout}s — make sure cfclient is closed and drone is on")
+                return
+        if not controller.running:
+            logger.error("Connection failed — check radio URI and that cfclient is closed")
+            return
         logger.info("Cf is connected !")
-        while True:
+        while controller.running:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

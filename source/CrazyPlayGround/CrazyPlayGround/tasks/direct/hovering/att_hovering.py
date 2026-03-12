@@ -106,11 +106,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     lin_vel_reward_scale = -0.1
-    ang_vel_reward_scale = -0.05
+    ang_vel_reward_scale = -0.5
     distance_to_goal_reward_scale = 20.0
 
-    add_noise = False
-    noise_std = 0.01
+    add_noise = True
+    noise_std = 0.05
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
