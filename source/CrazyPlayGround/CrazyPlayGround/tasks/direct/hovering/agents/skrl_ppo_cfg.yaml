@@ -11,7 +11,7 @@ models:
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: -1.0
+    initial_log_std: -0.0
     network:
       - name: net
         input: OBSERVATIONS
@@ -43,7 +43,7 @@ agent:
   rollouts: 32
   learning_epochs: 8
   mini_batches: 8
-  discount_factor: 0.99
+  discount_factor: 0.9999
   lambda: 0.95
   learning_rate: 5.0e-04
   learning_rate_scheduler: KLAdaptiveLR
@@ -75,7 +75,7 @@ agent:
     wandb: True,             # whether to use Weights & Biases
     wandb_kwargs:
       project: "KTHxUlg"       # Can be changed to whatever project you want
-      entity: "hansenjulienpro-univesity-of-liege"   # your wandb username or team name
+      entity: "louettearthur"   # your wandb username
       
       
 # Sequential trainer

@@ -1,23 +1,11 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""Body-rate-controlled hovering environment.
 
-"""Attitude-controlled hovering environment.
+Identical to att_hovering except the action is [roll_rate, pitch_rate, yaw_rate, thrust_normalized]
+fed directly into the body-rate loop, bypassing position, velocity, and attitude PIDs.
+The agent directly commands the drone's angular rates and thrust.
 
-Identical to pos/vel_hovering except the action is [roll_ref, pitch_ref, yaw_rate_ref, thrust_normalized]
-fed directly into the attitude angle loop, bypassing both position and velocity PIDs.
-The agent directly commands the drone's orientation and thrust.
-
-Note on yaw control vs. the original implementation
-------------------------------------------------------
-The original att_hovering overrode the yaw rate setpoint directly after the attitude
-angle loop, effectively bypassing the yaw angle PID.  With CrazyfliePIDController the
-``"attitude"`` command level uses the yaw setpoint maintained by the controller:
-- ``target_yaw_rate`` integrates the yaw setpoint each step.
-- The attitude angle PID then tracks that integrated setpoint.
-The net effect is identical when yaw_rate = 0 (the controller holds the yaw at the
-value when reset) and very similar for nonzero yaw rates once the setpoint has settled.
+This is the lowest-level RL control interface: only the rate PID (which converts
+rate setpoints to moments) and the motor mixer sit below the agent.
 """
 
 from __future__ import annotations
@@ -66,8 +54,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
 
-    max_roll_pitch = 30.0 * math.pi / 180.0   # 30 deg max tilt
-    max_yaw_rate   = 90.0 * math.pi / 180.0   # 90 deg/s max yaw rate
+    max_body_rate = math.pi  # rad/s (~180 deg/s) max angular rate per axis
     min_thrust_scale = 0.5   # fraction of hover thrust
     max_thrust_scale = 1.8   # fraction of hover thrust
 
@@ -145,8 +132,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._min_thrust = self.cfg.min_thrust_scale * self._hover_thrust
         self._max_thrust = self.cfg.max_thrust_scale * self._hover_thrust
 
-        self._att_ref = torch.zeros(self.num_envs, 3, device=self.device)
-        self._yaw_rate_ref = torch.zeros(self.num_envs, 1, device=self.device)
+        self._rate_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._thrust_pwm = torch.zeros(self.num_envs, 1, device=self.device)
 
         self.set_debug_vis(self.cfg.debug_vis)
@@ -168,12 +154,11 @@ class QuadcopterEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
-        roll_ref  = self._actions[:, 0] * self.cfg.max_roll_pitch
-        pitch_ref = self._actions[:, 1] * self.cfg.max_roll_pitch
-        self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
-        self._yaw_rate_ref = (self._actions[:, 2] * self.cfg.max_yaw_rate).unsqueeze(-1)
+        # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s
+        self._rate_ref = self._actions[:, :3] * self.cfg.max_body_rate
 
-        thrust_normalized = (self._actions[:, 3] + 1.0) * 0.5  # [-1, 1] -> [0, 1]
+        # Thrust: action[3] in [-1, 1] mapped to [min_thrust, max_thrust] then to PWM
+        thrust_normalized = (self._actions[:, 3] + 1.0) * 0.5  # map [-1,1] -> [0,1]
         thrust_ref_n = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
         self._thrust_pwm = (thrust_ref_n / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
 
@@ -190,10 +175,9 @@ class QuadcopterEnv(DirectRLEnv):
 
         thrust, moment = self._ctrl(
             root_state,
-            target_attitude=self._att_ref,
-            target_yaw_rate=self._yaw_rate_ref,
+            target_body_rates=self._rate_ref,
             thrust_cmd=self._thrust_pwm,
-            command_level="attitude",
+            command_level="body_rate",
             body_rates_in_body_frame=True,
         )
 
