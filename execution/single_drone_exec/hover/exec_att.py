@@ -59,13 +59,40 @@ class Policy(GaussianMixin, Model):
         return mean, self.log_std_parameter, {}
 
 class CrazyflieController:
-    """Main Crazyflie controller for running trained RL agents"""
-    def __init__(self, uri: str, agent: PPO, hover_thrust: int = 30000, initial_target=None):
+    """Crazyflie controller for attitude (angle) RL agents.
+
+    Uses send_setpoint_manual with rate=False so roll/pitch are angles in
+    degrees; yaw is always a yaw rate in deg/s regardless of the flag.
+    Thrust mapping mirrors ``att_hovering.py`` exactly:
+        norm     = (a[3] + 1) / 2
+        thrust_N = m * g * (min_scale + (max_scale - min_scale) * norm)
+        thrust_% = 100 * thrust_N / max_thrust_N
+    Hover lands at ``a[3] ≈ -0.23`` (with 0.5/1.8 scaling), not a=0.
+    """
+    def __init__(
+        self,
+        uri: str,
+        agent: PPO,
+        initial_target=None,
+        mass_kg: float = 0.027,
+        max_thrust_N: float = 0.638,
+        min_thrust_scale: float = 0.5,
+        max_thrust_scale: float = 1.8,
+    ):
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
-        self.hover_thrust = hover_thrust
         self.initial_target = initial_target
+        self.mass_kg = float(mass_kg)
+        self.weight_N = self.mass_kg * 9.81
+        self.max_thrust_N = float(max_thrust_N)
+        self.min_thrust_scale = float(min_thrust_scale)
+        self.max_thrust_scale = float(max_thrust_scale)
+        self.hover_thrust_pct = 100.0 * self.weight_N / self.max_thrust_N
+        logger.info(
+            f"Thrust mapping: m={self.mass_kg:.4f} kg, weight={self.weight_N:.4f} N, "
+            f"max_thrust={self.max_thrust_N:.4f} N, hover_pct≈{self.hover_thrust_pct:.1f}%"
+        )
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
@@ -177,37 +204,28 @@ class CrazyflieController:
                 pass
 
     def control_loop(self):
-        """Main control loop: position-controlled takeoff, then NN attitude control"""
-        INTERVAL = 0.01  # control frequency (s) - 100 Hz
-        MAX_ANGLE = 30.0          # degrees  — must match att_hovering.py max_roll_pitch
-        MAX_YAW_RATE = 90.0       # deg/s    — must match att_hovering.py max_yaw_rate
-        MIN_THRUST_SCALE = 0.5    # fraction of hover — must match att_hovering.py
-        MAX_THRUST_SCALE = 1.8    # fraction of hover — must match att_hovering.py
+        """Main control loop: thrust-ramp takeoff, then NN attitude control."""
+        INTERVAL = 0.01  # 100 Hz control loop
+        MAX_ANGLE = 30.0          # degrees — must match att_hovering.py max_roll_pitch
+        MAX_YAW_RATE = 90.0       # deg/s   — must match att_hovering.py max_yaw_rate
 
-        TAKEOFF_HEIGHT   = 0.5   # metres — hover height before NN takes over
-        TAKEOFF_DURATION = 2.5   # seconds for the HLC to reach the height
-        STABILIZE_PAUSE  = 1.5   # extra seconds to let oscillations settle
+        TAKEOFF_HEIGHT   = 0.5
+        TAKEOFF_DURATION = 2.5
 
         logger.info("Waiting for position data...")
         while not self.position_received and self.running:
             time.sleep(0.1)
         logger.info(f"Position received: {self.current_pos}")
 
-        # ── Phase 1: attitude-controlled takeoff (no HLC) ─────────────────────
-        # Use send_setpoint directly from the start to avoid the HLC→low-level
-        # priority transition problem. Ramp thrust from zero to hover smoothly.
+        # ── Phase 1: attitude-controlled takeoff (angle mode) ────────────────
+        # Ramp the thrust percentage from 30% of hover to hover, zero tilt.
         logger.info(f"Attitude takeoff to ~{TAKEOFF_HEIGHT} m ...")
         RAMP_STEPS = int(TAKEOFF_DURATION / INTERVAL)
         for step in range(RAMP_STEPS):
             frac = min(1.0, step / (RAMP_STEPS * 0.4))  # ramp over first 40%
-            thrust = int(self.hover_thrust * (0.3 + 0.7 * frac))  # 30% → 100%
-            self.cf.commander.send_setpoint(0, 0, 0, thrust)
+            thrust_pct = self.hover_thrust_pct * (0.3 + 0.7 * frac)
+            self.cf.commander.send_setpoint_manual(0, 0, 0, thrust_pct, False)
             time.sleep(INTERVAL)
-        # Stabilise at hover thrust
-        # logger.info("Stabilising at hover...")
-        # for _ in range(int(STABILIZE_PAUSE / INTERVAL)):
-        #     self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
-        #     time.sleep(INTERVAL)
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
         # Initialize target: use CLI --target if given, else hover above takeoff pos
         global target_pos
@@ -248,29 +266,33 @@ class CrazyflieController:
 
             obs = retrieve_and_create_observation(self.current_vel, self.current_pos, self.current_quat)
             if obs is None:
-                logger.warning("No observation received, hovering...")
-                self.cf.commander.send_setpoint(0, 0, 0, self.hover_thrust)
+                logger.warning("No observation received, holding hover thrust...")
+                self.cf.commander.send_setpoint_manual(0, 0, 0, self.hover_thrust_pct, False)
                 time.sleep(INTERVAL)
                 continue
 
             with torch.no_grad():
                 action_dict = self.agent.act(obs, 1, 0)
                 action = action_dict[2]["mean_actions"].squeeze(0)  # deterministic mean, not sampled
-                action = action.clamp(-1.0, 1.0)  # match training env clipping
-                logger.debug(f"Action={action}")
+                action = action.clamp(-1.0, 1.0)
 
             roll  = action[0].item() * MAX_ANGLE
             pitch = action[1].item() * MAX_ANGLE
             yaw   = action[2].item() * MAX_YAW_RATE
-            # Thrust: action[3] in [-1, 1] -> [0, 1] -> [min, max] thrust PWM
-            thrust_norm = (action[3].item() + 1.0) * 0.5  # [-1, 1] -> [0, 1]
+            # Thrust: mirror of att_hovering.py (Newtons → % of max static thrust).
+            thrust_norm = (action[3].item() + 1.0) * 0.5
             thrust_norm = max(0.0, min(1.0, thrust_norm))
-            thrust = int(self.hover_thrust * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
-            thrust = max(10000, min(60000, thrust))
-            thrust_percentage = 100 * thrust_norm
+            thrust_N = self.weight_N * (
+                self.min_thrust_scale + thrust_norm * (self.max_thrust_scale - self.min_thrust_scale)
+            )
+            thrust_pct = max(0.0, min(100.0, 100.0 * thrust_N / self.max_thrust_N))
 
-            logger.info(f"Cmd: roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust_percentage:.1f} | pos={self.current_pos}")
-            self.cf.commander.send_setpoint_manual(roll, pitch, yaw, thrust_percentage, rate=False)
+            logger.info(
+                f"Cmd: roll={roll:+.1f}° pitch={pitch:+.1f}° yaw={yaw:+.1f}°/s  "
+                f"T={thrust_pct:5.1f}%  | pos={self.current_pos}"
+            )
+            # Angle mode (rate=False): roll/pitch in deg, yaw in deg/s, thrust in [0, 100] %.
+            self.cf.commander.send_setpoint_manual(roll, pitch, yaw, thrust_pct, False)
 
             elapsed = time.time() - start_time
             time.sleep(max(0, INTERVAL - elapsed))
@@ -294,17 +316,10 @@ class CrazyflieController:
 
 
 def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
+    # Target is fixed per run, matching the sim episode behaviour.
     global target_pos
     if target_pos is None:
         return None
-    dist_to_target = torch.dist(current_pos, target_pos)
-    if dist_to_target < 0.2:
-        # New target at absolute positions matching training distribution:
-        # XY in [-1, 1], Z in [0.5, 1.5] (within 3x3x1.7m room)
-        target_pos = torch.empty(3, dtype=torch.float32, device=device)
-        target_pos[:2].uniform_(-1.0, 1.0)
-        target_pos[2].uniform_(0.5, 1.5)
-        logger.info(f"/!\\ New target={target_pos}")
     # Rotate world-frame Kalman velocity into body frame
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
@@ -347,15 +362,27 @@ def main():
     parser = argparse.ArgumentParser(description="Run a trained SKRL PPO agent on a Crazyflie drone.")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8")
-    parser.add_argument("--hover-thrust", type=int, default=30000,
-                        help="Hover thrust PWM (default: 30000, calibrate empirically)")
+    parser.add_argument("--mass-kg", type=float, default=0.027,
+                        help="Drone mass in kg (must match drone.mass in crazyflie.yaml).")
+    parser.add_argument("--max-thrust-N", type=float, default=0.638,
+                        help="Total static thrust of all 4 motors in N (drone.max_thrust).")
+    parser.add_argument("--min-thrust-scale", type=float, default=0.5,
+                        help="Lower bound of thrust action, as fraction of hover weight.")
+    parser.add_argument("--max-thrust-scale", type=float, default=1.8,
+                        help="Upper bound of thrust action, as fraction of hover weight.")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
     args = parser.parse_args()
     agent = load_agent(args.checkpoint, device)
-    initial_target = args.target  # None or [x, y, z]
-    controller = CrazyflieController(uri=args.uri, agent=agent, hover_thrust=args.hover_thrust,
-                                     initial_target=initial_target)
+    controller = CrazyflieController(
+        uri=args.uri,
+        agent=agent,
+        initial_target=args.target,
+        mass_kg=args.mass_kg,
+        max_thrust_N=args.max_thrust_N,
+        min_thrust_scale=args.min_thrust_scale,
+        max_thrust_scale=args.max_thrust_scale,
+    )
     try:
         controller.start()
         timeout = 10  # seconds to wait for connection
