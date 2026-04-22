@@ -37,9 +37,6 @@ CONTROL_DT     = 0.01            # policy step (s) — must match decimation*sim
 
 # ── Position action params ─────────────────────────────────────────────────────
 MAX_POSITION_DELTA = 0.5   # m  (must match PosTrackingEnvCfg.max_position_delta)
-# go_to duration: slightly longer than CONTROL_DT to give the HLC time to execute
-# Increase if the drone oscillates; decrease if tracking lags
-GO_TO_DURATION = 0.05      # s
 
 
 # ── Trajectory utilities ───────────────────────────────────────────────────────
@@ -326,12 +323,11 @@ class CrazyflieController:
                 f"pos={[f'{v:.2f}' for v in pos.tolist()]}"
             )
 
-            self.cf.high_level_commander.go_to(
+            self.cf.commander.send_position_setpoint(
                 desired_pos[0].item(),
                 desired_pos[1].item(),
                 desired_pos[2].item(),
-                0.0,          # yaw (rad)
-                GO_TO_DURATION,
+                0.0,  # yaw (deg)
             )
 
             step += 1
