@@ -15,6 +15,7 @@ from cflib.crazyflie.log import LogConfig
 
 from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] {message}",
@@ -323,7 +324,8 @@ class CrazyflieController:
 
             with torch.no_grad():
                 action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[0]
+                action = action_dict[2]["mean_actions"].squeeze(0)
+                action = action.clamp(-1.0, 1.0)
 
             # action[0:2] = roll/pitch in [-1, 1] → degrees
             # action[2]   = yaw_rate   in [-1, 1] → deg/s
@@ -372,12 +374,15 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models  = {"policy": policy}
     cfg     = PPO_DEFAULT_CONFIG.copy()
+    cfg["state_preprocessor"] = RunningStandardScaler
+    cfg["state_preprocessor_kwargs"] = {"size": obs_space, "device": device}
     agent   = PPO(models=models, memory=None, cfg=cfg,
                   observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), \
         "No valid checkpoint provided."
     agent.load(checkpoint_path)
-    print(f"Loaded checkpoint from {checkpoint_path}")
+    agent.set_running_mode("eval")
+    logger.info(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
 
