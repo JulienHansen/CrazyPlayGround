@@ -36,11 +36,9 @@ TRAJ_STEP_SIZE = 5.0             # sim-steps between consecutive waypoints
 CONTROL_DT     = 0.01            # policy step (s) — must match decimation*sim_dt (5*0.002)
 
 # ── Attitude action params (must match AttTrackingEnvCfg) ─────────────────────
-MAX_ANGLE     = 30.0   # degrees  (max_roll_pitch in degrees for send_setpoint)
+MAX_ANGLE     = 30.0   # degrees  (max_roll_pitch for send_setpoint_manual angle mode)
 MAX_YAW_RATE  = 90.0   # deg/s
-HOVER_THRUST  = 30000  # PWM at hover — calibrate empirically if needed
-MIN_THRUST_SCALE = 0.5
-MAX_THRUST_SCALE = 1.8
+GRAVITY       = 9.81   # m/s²
 
 
 # ── Trajectory utilities ───────────────────────────────────────────────────────
@@ -138,10 +136,25 @@ class Policy(GaussianMixin, Model):
 class CrazyflieController:
     """Runs a trained trajectory-tracking attitude-control RL agent on the Crazyflie."""
 
-    def __init__(self, uri: str, agent: PPO):
+    def __init__(self, uri: str, agent: PPO,
+                 mass_kg: float = 0.027,
+                 max_thrust_N: float = 0.638,
+                 min_thrust_scale: float = 0.5,
+                 max_thrust_scale: float = 1.8):
         self.uri   = uri
         self.cf    = Crazyflie()
         self.agent = agent
+
+        self.mass_kg          = mass_kg
+        self.max_thrust_N     = max_thrust_N
+        self.min_thrust_scale = min_thrust_scale
+        self.max_thrust_scale = max_thrust_scale
+        self.weight_N         = mass_kg * GRAVITY
+        self.hover_thrust_pct = max(0.0, min(100.0, 100.0 * self.weight_N / self.max_thrust_N))
+        logger.info(
+            f"Physics: m={mass_kg} kg, max_thrust={max_thrust_N} N, "
+            f"hover_pct={self.hover_thrust_pct:.1f}%"
+        )
 
         self.current_pos     = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel_w   = torch.zeros(3, dtype=torch.float32, device=device)
@@ -287,11 +300,11 @@ class CrazyflieController:
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
 
         # ── Phase 2: hover handoff to low-level attitude commander ───────────
-        # Sending send_setpoint() switches the firmware away from HLC mode.
-        # Hold zero roll/pitch/yaw and hover thrust for a smooth handoff.
+        # Sending send_setpoint_manual() switches the firmware away from HLC mode.
+        # Hold zero roll/pitch/yaw and hover thrust (angle mode) for a smooth handoff.
         logger.info("Transitioning to attitude control (hover handoff)...")
         for _ in range(20):
-            self.cf.commander.send_setpoint(0, 0, 0, HOVER_THRUST)
+            self.cf.commander.send_setpoint_manual(0.0, 0.0, 0.0, self.hover_thrust_pct, False)
             time.sleep(CONTROL_DT)
 
         # ── Phase 3: NN attitude control loop ────────────────────────────────
@@ -329,20 +342,22 @@ class CrazyflieController:
 
             # action[0:2] = roll/pitch in [-1, 1] → degrees
             # action[2]   = yaw_rate   in [-1, 1] → deg/s
-            # action[3]   = thrust     in [ 0, 1] → PWM
+            # action[3]   = thrust     → clamped to [0, 1] (AttTrackingEnvCfg convention)
             roll  = action[0].item() * MAX_ANGLE
             pitch = action[1].item() * MAX_ANGLE
             yaw   = action[2].item() * MAX_YAW_RATE
-            thrust_norm = float(max(0.0, min(1.0, action[3].item())))
-            thrust = int(HOVER_THRUST * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
-            thrust = max(10000, min(60000, thrust))
+            thrust_norm = max(0.0, min(1.0, action[3].item()))
+            thrust_N = self.weight_N * (
+                self.min_thrust_scale + thrust_norm * (self.max_thrust_scale - self.min_thrust_scale)
+            )
+            thrust_pct = max(0.0, min(100.0, 100.0 * thrust_N / self.max_thrust_N))
 
             logger.info(
                 f"Step={step} | "
-                f"roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust} | "
+                f"roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust_pct:.1f}% | "
                 f"pos={[f'{v:.2f}' for v in pos.tolist()]}"
             )
-            self.cf.commander.send_setpoint(roll, pitch, yaw, thrust)
+            self.cf.commander.send_setpoint_manual(roll, pitch, yaw, thrust_pct, False)
 
             step += 1
             elapsed = time.time() - start_time
@@ -394,10 +409,25 @@ def main():
                         help="Path to the trained model checkpoint")
     parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E1",
                         help="Crazyflie radio URI")
+    parser.add_argument("--mass-kg", type=float, default=0.027,
+                        help="Drone mass (kg). Must match the sim cfg used for training.")
+    parser.add_argument("--max-thrust-N", type=float, default=0.638,
+                        help="Max total thrust (N, sum of 4 motors). Must match sim cfg.")
+    parser.add_argument("--min-thrust-scale", type=float, default=0.5,
+                        help="Min thrust scale factor of m·g (AttTrackingEnvCfg).")
+    parser.add_argument("--max-thrust-scale", type=float, default=1.8,
+                        help="Max thrust scale factor of m·g (AttTrackingEnvCfg).")
     args = parser.parse_args()
 
     agent = load_agent(args.checkpoint, device)
-    controller = CrazyflieController(uri=args.uri, agent=agent)
+    controller = CrazyflieController(
+        uri=args.uri,
+        agent=agent,
+        mass_kg=args.mass_kg,
+        max_thrust_N=args.max_thrust_N,
+        min_thrust_scale=args.min_thrust_scale,
+        max_thrust_scale=args.max_thrust_scale,
+    )
 
     try:
         controller.start()
