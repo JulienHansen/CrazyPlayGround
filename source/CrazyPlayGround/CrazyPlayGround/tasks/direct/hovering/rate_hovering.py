@@ -99,6 +99,15 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     add_noise = True
     noise_std = 0.05
 
+    # ── Domain randomization ──────────────────────────────────────
+    domain_rand = True
+    # max-thrust variability (battery / propellers / motor wear).
+    rand_thrust_scale_range = (0.85, 1.15)
+    # Per-episode additive bias on commanded thrust as a fraction of hover thrust
+    rand_thrust_bias_range = (-0.10, 0.10)
+    # Per-episode multiplier on the body-rate setpoint
+    rand_rate_scale_range = (0.90, 1.10)
+
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
@@ -135,6 +144,9 @@ class QuadcopterEnv(DirectRLEnv):
         self._rate_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._thrust_pwm = torch.zeros(self.num_envs, 1, device=self.device)
 
+        self._dr_thrust_scale = torch.ones(self.num_envs, device=self.device)
+        self._dr_thrust_bias_n = torch.zeros(self.num_envs, device=self.device)
+        self._dr_rate_scale = torch.ones(self.num_envs, device=self.device)
         self.set_debug_vis(self.cfg.debug_vis)
 
     def _setup_scene(self):
@@ -154,12 +166,16 @@ class QuadcopterEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
-        # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s
-        self._rate_ref = self._actions[:, :3] * self.cfg.max_body_rate
+        # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s,
+        # with per-env DR multiplier on the rate setpoint.
+        self._rate_ref = (
+            self._actions[:, :3] * self.cfg.max_body_rate * self._dr_rate_scale.unsqueeze(-1)
+        )
 
-        # Thrust: action[3] in [-1, 1] mapped to [min_thrust, max_thrust] then to PWM
         thrust_normalized = (self._actions[:, 3] + 1.0) * 0.5  # map [-1,1] -> [0,1]
         thrust_ref_n = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
+        thrust_ref_n = thrust_ref_n * self._dr_thrust_scale + self._dr_thrust_bias_n
+        thrust_ref_n = thrust_ref_n.clamp(min=0.0)
         self._thrust_pwm = (thrust_ref_n / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
 
     def _apply_action(self):
@@ -267,6 +283,22 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._ctrl.reset(env_ids)
+
+        # Sample new domain-randomization values for the reset envs.
+        if self.cfg.domain_rand:
+            n = len(env_ids)
+            ts_lo, ts_hi = self.cfg.rand_thrust_scale_range
+            tb_lo, tb_hi = self.cfg.rand_thrust_bias_range
+            rs_lo, rs_hi = self.cfg.rand_rate_scale_range
+            self._dr_thrust_scale[env_ids] = torch.empty(n, device=self.device).uniform_(ts_lo, ts_hi)
+            self._dr_thrust_bias_n[env_ids] = (
+                torch.empty(n, device=self.device).uniform_(tb_lo, tb_hi) * self._hover_thrust
+            )
+            self._dr_rate_scale[env_ids] = torch.empty(n, device=self.device).uniform_(rs_lo, rs_hi)
+        else:
+            self._dr_thrust_scale[env_ids] = 1.0
+            self._dr_thrust_bias_n[env_ids] = 0.0
+            self._dr_rate_scale[env_ids] = 1.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:

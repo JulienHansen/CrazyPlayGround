@@ -15,7 +15,7 @@ from cflib.crazyflie.log import LogConfig
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.agents.torch.ppo import PPO, PPO_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,8 +36,9 @@ class Policy(GaussianMixin, Model):
                  clip_actions=False, clip_log_std=True,
                  min_log_std=-20.0, max_log_std=2.0,
                  initial_log_std=0.0):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std,
+                               min_log_std=min_log_std, max_log_std=max_log_std)
         self.net_container = nn.Sequential(
             nn.Linear(self.num_observations, 32), nn.ELU(),
             nn.Linear(32, 32), nn.ELU()
@@ -47,27 +48,33 @@ class Policy(GaussianMixin, Model):
         self.log_std_parameter = nn.Parameter(torch.ones(self.num_actions) * initial_log_std)
 
     def compute(self, inputs, role):
-        x = self.net_container(inputs["states"])
+        x = self.net_container(inputs["observations"])
         if role == "policy":
             mean = self.policy_layer(x)
         else:
             mean = self.value_layer(x)
-        return mean, self.log_std_parameter, {}
+        return mean, {"log_std": self.log_std_parameter}
 
 
 class CrazyflieController:
     """Crazyflie controller for body-rate RL agents.
 
     Uses rate mode to send body rates in deg/s + thrust percentage.
-    Thrust mapping mirrors ``rate_hovering.py`` exactly:
-        norm     = (a[3] + 1) / 2                  # [-1, 1] -> [0, 1]
-        thrust_N = m * g * (min_scale + (max_scale - min_scale) * norm)
-        thrust_% = 100 * thrust_N / max_thrust_N
 
-    ``max_thrust_N`` is the drone's total measured static thrust (4 motors),
-    which matches ``drone.max_thrust`` in ``controllers/crazyflie.yaml``.
-    Hover lands at ``norm = (1 - min_scale) / (max_scale - min_scale)``
-    (≈ 0.385 with 0.5/1.8 scaling ⇒ a[3] ≈ -0.23), not a=0.
+    Thrust mapping is anchored on a *measured* real-drone hover thrust
+    percentage (``hover_thrust_pct``) instead of the theoretical
+    ``100 * weight_N / max_thrust_N``. This closes the most common
+    sim2real altitude-drift gap caused by battery sag, propeller wear,
+    and the non-linear PWM→thrust curve baked into ``send_setpoint_manual``
+    (``PWM = 10001 + 0.01 * pct * 49999``).
+
+    Pipeline:
+        norm   = (a[3] + 1) / 2                 # [-1, 1] -> [0, 1]
+        norm_hover = (1 - min_scale) / (max_scale - min_scale)
+        if norm <= norm_hover:
+            pct = lerp(min_pct, hover_pct, norm / norm_hover)
+        else:
+            pct = lerp(hover_pct, max_pct, (norm - norm_hover) / (1 - norm_hover))
     """
     def __init__(
         self,
@@ -78,6 +85,9 @@ class CrazyflieController:
         max_thrust_N: float = 0.638,
         min_thrust_scale: float = 0.5,
         max_thrust_scale: float = 1.8,
+        hover_thrust_pct: Optional[float] = None,
+        min_thrust_pct: float = 25.0,
+        max_thrust_pct: float = 90.0,
     ):
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
@@ -88,11 +98,44 @@ class CrazyflieController:
         self.max_thrust_N = float(max_thrust_N)
         self.min_thrust_scale = float(min_thrust_scale)
         self.max_thrust_scale = float(max_thrust_scale)
-        self.hover_thrust_pct = 100.0 * self.weight_N / self.max_thrust_N
+        if hover_thrust_pct is None:
+            # Backward-compatible physics-based mapping (assumes linear PWM↔N
+            # and ideal max thrust — typically too low for the real drone).
+            self.hover_thrust_pct = 100.0 * self.weight_N / self.max_thrust_N
+            self._calibrated = False
+        else:
+            self.hover_thrust_pct = float(hover_thrust_pct)
+            self._calibrated = True
+        self.min_thrust_pct = float(min_thrust_pct)
+        self.max_thrust_pct = float(max_thrust_pct)
+        # Hover sits at this point in the [0, 1] thrust_norm axis.
+        self._hover_norm = (1.0 - self.min_thrust_scale) / (
+            self.max_thrust_scale - self.min_thrust_scale
+        )
         logger.info(
             f"Thrust mapping: m={self.mass_kg:.4f} kg, weight={self.weight_N:.4f} N, "
-            f"max_thrust={self.max_thrust_N:.4f} N, hover_pct≈{self.hover_thrust_pct:.1f}%"
+            f"max_thrust={self.max_thrust_N:.4f} N, "
+            f"hover_pct={'(calibrated) ' if self._calibrated else '(physics) '}"
+            f"{self.hover_thrust_pct:.1f}% "
+            f"[min_pct={self.min_thrust_pct:.1f}%, max_pct={self.max_thrust_pct:.1f}%]"
         )
+        if not self._calibrated:
+            logger.warning(
+                "Using uncalibrated thrust mapping. If the drone cannot hold altitude, "
+                "measure the real hover thrust percentage (manually trim a stable hover "
+                "in rate mode with zero rates) and pass it via --hover-thrust-pct."
+            )
+
+    def _thrust_pct_from_action(self, action_thrust: float) -> float:
+        """Piecewise-linear map from action[3] in [-1, 1] to thrust pct in [0, 100]."""
+        norm = max(0.0, min(1.0, (action_thrust + 1.0) * 0.5))
+        if norm <= self._hover_norm:
+            t = norm / self._hover_norm if self._hover_norm > 0 else 0.0
+            pct = self.min_thrust_pct + t * (self.hover_thrust_pct - self.min_thrust_pct)
+        else:
+            t = (norm - self._hover_norm) / (1.0 - self._hover_norm)
+            pct = self.hover_thrust_pct + t * (self.max_thrust_pct - self.hover_thrust_pct)
+        return max(0.0, min(100.0, pct))
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
@@ -277,8 +320,8 @@ class CrazyflieController:
                 continue
 
             with torch.no_grad():
-                action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[2]["mean_actions"].squeeze(0)
+                actions, info = self.agent.act(obs, None, timestep=0, timesteps=1)
+                action = info.get("mean_actions", actions).squeeze(0)
                 action = action.clamp(-1.0, 1.0)
 
             # Body rates: [-1, 1] -> [-MAX_BODY_RATE_DEG, MAX_BODY_RATE_DEG] deg/s.
@@ -286,13 +329,10 @@ class CrazyflieController:
             pitch_rate = action[1].item() * MAX_BODY_RATE_DEG
             yaw_rate   = action[2].item() * MAX_BODY_RATE_DEG
 
-            # Thrust: mirror of rate_hovering.py (Newtons → % of max static thrust).
-            thrust_norm = (action[3].item() + 1.0) * 0.5
-            thrust_norm = max(0.0, min(1.0, thrust_norm))
-            thrust_N = self.weight_N * (
-                self.min_thrust_scale + thrust_norm * (self.max_thrust_scale - self.min_thrust_scale)
-            )
-            thrust_pct = max(0.0, min(100.0, 100.0 * thrust_N / self.max_thrust_N))
+            # Thrust: piecewise-linear in action space, anchored on hover_thrust_pct
+            # so the policy's hover output (a[3] ≈ -0.23) maps to a real-drone
+            # thrust percentage that actually holds altitude.
+            thrust_pct = self._thrust_pct_from_action(action[3].item())
 
             logger.info(
                 f"Cmd: roll={roll_rate:+.1f} pitch={pitch_rate:+.1f} yaw={yaw_rate:+.1f} deg/s  "
@@ -357,14 +397,15 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     act_space = 4
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models = {"policy": policy}
-    cfg = PPO_DEFAULT_CONFIG.copy()
-    cfg["state_preprocessor"] = RunningStandardScaler
-    cfg["state_preprocessor_kwargs"] = {"size": obs_space, "device": device}
+    cfg = PPO_CFG(
+        state_preprocessor=RunningStandardScaler,
+        state_preprocessor_kwargs={"size": obs_space, "device": device},
+    )
     agent = PPO(models=models, memory=None, cfg=cfg,
                 observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), "No valid checkpoint provided."
     agent.load(checkpoint_path)
-    agent.set_running_mode("eval")
+    agent.enable_training_mode(False)
     logger.info(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
@@ -383,6 +424,14 @@ def main():
                         help="Upper bound of thrust action, as fraction of hover weight.")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
+    parser.add_argument("--hover-thrust-pct", type=float, default=None,
+                        help="Measured real-drone hover thrust percentage (0-100). "
+                             "Find by trimming a stable rate-mode hover with zero rates. "
+                             "If unset, falls back to the (often inaccurate) physics formula.")
+    parser.add_argument("--min-thrust-pct", type=float, default=25.0,
+                        help="Thrust pct corresponding to action[3] = -1.")
+    parser.add_argument("--max-thrust-pct", type=float, default=90.0,
+                        help="Thrust pct corresponding to action[3] = +1.")
     args = parser.parse_args()
     agent = load_agent(args.checkpoint, device)
     controller = CrazyflieController(
@@ -393,6 +442,9 @@ def main():
         max_thrust_N=args.max_thrust_N,
         min_thrust_scale=args.min_thrust_scale,
         max_thrust_scale=args.max_thrust_scale,
+        hover_thrust_pct=args.hover_thrust_pct,
+        min_thrust_pct=args.min_thrust_pct,
+        max_thrust_pct=args.max_thrust_pct,
     )
     try:
         controller.start()
