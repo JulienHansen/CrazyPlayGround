@@ -74,8 +74,8 @@ agent:
     
     wandb: True,             # whether to use Weights & Biases
     wandb_kwargs:
-      project: "KTHxUlg"       # Can be changed to whatever project you want
-      entity: "louettearthur"   # your wandb username
+      project: "rate_contr"       # Can be changed to whatever project you want
+      entity: "hansenjulienpro-univesity-of-liege"   # your wandb username
       
       
 # Sequential trainer

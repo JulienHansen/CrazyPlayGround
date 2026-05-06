@@ -75,6 +75,16 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Test-Hovering",
+    entry_point=f"{__name__}.test_hovering:TestHoveringEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.test_hovering:TestHoveringEnvCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
 
 
 

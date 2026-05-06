@@ -125,6 +125,16 @@ class CrazyflieController:
                 "measure the real hover thrust percentage (manually trim a stable hover "
                 "in rate mode with zero rates) and pass it via --hover-thrust-pct."
             )
+        self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
+        self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
+        self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
+        self.current_ang_vel = torch.zeros(3, dtype=torch.float32, device=device)
+        self.position_received = False
+        self.running = True
+        self._last_pos_time: float = 0.0
+        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
+        self.lock = threading.Lock()
+        self._setup_callbacks()
 
     def _thrust_pct_from_action(self, action_thrust: float) -> float:
         """Piecewise-linear map from action[3] in [-1, 1] to thrust pct in [0, 100]."""
@@ -136,15 +146,6 @@ class CrazyflieController:
             t = (norm - self._hover_norm) / (1.0 - self._hover_norm)
             pct = self.hover_thrust_pct + t * (self.max_thrust_pct - self.hover_thrust_pct)
         return max(0.0, min(100.0, pct))
-        self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
-        self.position_received = False
-        self.running = True
-        self._last_pos_time: float = 0.0
-        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
-        self.lock = threading.Lock()
-        self._setup_callbacks()
 
     def _setup_callbacks(self):
         self.cf.connected.add_callback(self._connected)
@@ -201,6 +202,15 @@ class CrazyflieController:
         log_var.data_received_cb.add_callback(self._log_variance_callback)
         log_var.start()
 
+        # Block 4: body angular velocity (gyro, deg/s -> rad/s in callback).
+        log_gyro = LogConfig(name="gyro", period_in_ms=LOG_FREQUENCY_IN_MS)
+        log_gyro.add_variable("gyro.x", "float")
+        log_gyro.add_variable("gyro.y", "float")
+        log_gyro.add_variable("gyro.z", "float")
+        self.cf.log.add_config(log_gyro)
+        log_gyro.data_received_cb.add_callback(self._log_gyro_callback)
+        log_gyro.start()
+
     def _log_posvel_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
         with self.lock:
             self.current_pos = torch.tensor([
@@ -231,6 +241,16 @@ class CrazyflieController:
                 data["kalman.varPX"],
                 data["kalman.varPY"],
                 data["kalman.varPZ"],
+            ], dtype=torch.float32, device=device)
+
+    def _log_gyro_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
+        # Crazyflie gyro is in deg/s, body frame. Sim's root_ang_vel_b is rad/s.
+        deg2rad = math.pi / 180.0
+        with self.lock:
+            self.current_ang_vel = torch.tensor([
+                data["gyro.x"] * deg2rad,
+                data["gyro.y"] * deg2rad,
+                data["gyro.z"] * deg2rad,
             ], dtype=torch.float32, device=device)
 
     def _emergency_land(self):
@@ -312,7 +332,9 @@ class CrazyflieController:
                 self._emergency_land()
                 break
 
-            obs = retrieve_and_create_observation(self.current_vel, self.current_pos, self.current_quat)
+            obs = retrieve_and_create_observation(
+                self.current_vel, self.current_pos, self.current_quat, self.current_ang_vel
+            )
             if obs is None:
                 logger.warning("No observation received, holding hover thrust...")
                 self.cf.commander.send_setpoint_manual(0, 0, 0, self.hover_thrust_pct, True)
@@ -362,15 +384,40 @@ class CrazyflieController:
         logger.info("Link closed")
 
 
-def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
+def retrieve_and_create_observation(
+    current_vel, current_pos, current_quat, current_ang_vel
+) -> Optional[torch.Tensor]:
     # Target is fixed per run, matching the sim episode behaviour.
     global target_pos
     if target_pos is None:
         return None
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
-    obs = torch.cat([linear_vel_b, desired_pos_b], dim=-1)
+    rot_mat_flat = quat_to_rotmat_flat(current_quat)
+    obs = torch.cat([linear_vel_b, desired_pos_b, rot_mat_flat, current_ang_vel], dim=-1)
     return obs
+
+
+def quat_to_rotmat_flat(quat: torch.Tensor) -> torch.Tensor:
+    """Row-major flattened body→world rotation matrix.
+
+    Matches isaaclab.utils.math.matrix_from_quat(quat).reshape(-1, 9) so the
+    deployed observation lines up with the one produced in sim.
+    quat is (qw, qx, qy, qz).
+    """
+    qw, qx, qy, qz = quat[0], quat[1], quat[2], quat[3]
+    two_s = 2.0 / (qw * qw + qx * qx + qy * qy + qz * qz)
+    return torch.stack([
+        1 - two_s * (qy * qy + qz * qz),
+        two_s * (qx * qy - qz * qw),
+        two_s * (qx * qz + qy * qw),
+        two_s * (qx * qy + qz * qw),
+        1 - two_s * (qx * qx + qz * qz),
+        two_s * (qy * qz - qx * qw),
+        two_s * (qx * qz - qy * qw),
+        two_s * (qy * qz + qx * qw),
+        1 - two_s * (qx * qx + qy * qy),
+    ])
 
 
 def quat_apply(quat, vec):
@@ -393,7 +440,7 @@ def quat_inv(q, eps=1e-9):
 
 
 def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
-    obs_space = 6
+    obs_space = 18
     act_space = 4
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models = {"policy": policy}

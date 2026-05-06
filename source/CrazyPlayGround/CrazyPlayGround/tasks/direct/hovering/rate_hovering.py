@@ -25,7 +25,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
@@ -50,7 +50,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     decimation = 5
 
     action_space = 4
-    observation_space = 6
+    observation_space = 18
     state_space = 0
     debug_vis = True
 
@@ -93,7 +93,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     lin_vel_reward_scale = -0.1
-    ang_vel_reward_scale = -0.5
+    ang_vel_reward_scale = -0.05
     distance_to_goal_reward_scale = 20.0
 
     add_noise = True
@@ -208,10 +208,14 @@ class QuadcopterEnv(DirectRLEnv):
             self._desired_pos_w,
         )
 
+        rot_mat = matrix_from_quat(self._robot.data.root_quat_w).reshape(self.num_envs, 9)
+
         obs = torch.cat(
             [
                 self._robot.data.root_lin_vel_b,
                 desired_pos_b,
+                rot_mat,
+                self._robot.data.root_ang_vel_b,
             ],
             dim=-1,
         )
