@@ -78,6 +78,7 @@ import random
 from datetime import datetime
 
 import omni
+import omni.log
 import skrl
 from packaging import version
 
