@@ -15,6 +15,7 @@ from cflib.crazyflie.log import LogConfig
 
 from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] {message}",
@@ -36,9 +37,6 @@ CONTROL_DT     = 0.01            # policy step (s) — must match decimation*sim
 
 # ── Position action params ─────────────────────────────────────────────────────
 MAX_POSITION_DELTA = 0.5   # m  (must match PosTrackingEnvCfg.max_position_delta)
-# go_to duration: slightly longer than CONTROL_DT to give the HLC time to execute
-# Increase if the drone oscillates; decrease if tracking lags
-GO_TO_DURATION = 0.05      # s
 
 
 # ── Trajectory utilities ───────────────────────────────────────────────────────
@@ -314,7 +312,8 @@ class CrazyflieController:
 
             with torch.no_grad():
                 action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[0].clamp(-1.0, 1.0)
+                action = action_dict[2]["mean_actions"].squeeze(0)
+                action = action.clamp(-1.0, 1.0)
 
             # action is a position displacement in world frame
             desired_pos = pos + action * MAX_POSITION_DELTA
@@ -324,12 +323,11 @@ class CrazyflieController:
                 f"pos={[f'{v:.2f}' for v in pos.tolist()]}"
             )
 
-            self.cf.high_level_commander.go_to(
+            self.cf.commander.send_position_setpoint(
                 desired_pos[0].item(),
                 desired_pos[1].item(),
                 desired_pos[2].item(),
-                0.0,          # yaw (rad)
-                GO_TO_DURATION,
+                0.0,  # yaw (deg)
             )
 
             step += 1
@@ -361,12 +359,15 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models  = {"policy": policy}
     cfg     = PPO_DEFAULT_CONFIG.copy()
+    cfg["state_preprocessor"] = RunningStandardScaler
+    cfg["state_preprocessor_kwargs"] = {"size": obs_space, "device": device}
     agent   = PPO(models=models, memory=None, cfg=cfg,
                   observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), \
         "No valid checkpoint provided."
     agent.load(checkpoint_path)
-    print(f"Loaded checkpoint from {checkpoint_path}")
+    agent.set_running_mode("eval")
+    logger.info(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
 
