@@ -46,7 +46,7 @@ from .att_hovering import QuadcopterEnv, QuadcopterEnvCfg
 from CrazyPlayGround.controllers import load_config
 
 # DroneModule – CascadePIDController for the physics ghost
-from drone.controllers.cascade_pid import CascadePIDController as GhostPIDController
+from CrazyPlayGround.controllers.cascade_pid import CascadePIDController as GhostPIDController
 
 
 # ---------------------------------------------------------------------------

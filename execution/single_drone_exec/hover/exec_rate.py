@@ -291,8 +291,10 @@ class CrazyflieController:
         logger.info(f"Thrust-ramp takeoff to ~{TAKEOFF_HEIGHT} m ...")
         RAMP_STEPS = int(TAKEOFF_DURATION / INTERVAL)
         for step in range(RAMP_STEPS):
-            # Zero rates + ramp thrust in rate mode
-            self.cf.commander.send_hover_setpoint(0, 0, 0, 1)
+            # Zero rates + ramp thrust from 30% of hover to hover, in rate mode
+            frac = min(1.0, step / (RAMP_STEPS * 0.4))  # ramp over first 40%
+            thrust_pct = self.hover_thrust_pct * (0.3 + 0.7 * frac)
+            self.cf.commander.send_setpoint_manual(0, 0, 0, thrust_pct, True)
             time.sleep(INTERVAL)
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
 
@@ -445,8 +447,8 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models = {"policy": policy}
     cfg = PPO_CFG(
-        state_preprocessor=RunningStandardScaler,
-        state_preprocessor_kwargs={"size": obs_space, "device": device},
+        observation_preprocessor=RunningStandardScaler,
+        observation_preprocessor_kwargs={"size": obs_space, "device": device},
     )
     agent = PPO(models=models, memory=None, cfg=cfg,
                 observation_space=obs_space, action_space=act_space, device=device)

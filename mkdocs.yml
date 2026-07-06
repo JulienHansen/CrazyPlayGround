@@ -1,0 +1,30 @@
+site_name: CrazyPlayGround
+site_description: Crazyflie environments built on Isaac Lab
+repo_url: https://github.com/JulienHansen/CrazyPlayGround 
+repo_name: JulienHansen/CrazyPlayGround
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+  palette:
+    - scheme: default
+      toggle: {icon: material/brightness-7, name: Dark mode}
+    - scheme: slate
+      toggle: {icon: material/brightness-4, name: Light mode}
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - tables
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Environments: environments.md
+  - Controller: controller.md
+  - Configuration: configuration.md
+  - Deployment: deployment.md

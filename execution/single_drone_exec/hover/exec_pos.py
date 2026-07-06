@@ -14,7 +14,7 @@ from cflib.crazyflie.log import LogConfig
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.agents.torch.ppo import PPO, PPO_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,9 +39,9 @@ class Policy(GaussianMixin, Model):
                  clip_actions=False, clip_log_std=True,
                  min_log_std=-20.0, max_log_std=2.0,
                  initial_log_std=0.0):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std,
-                               min_log_std, max_log_std)
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std,
+                               min_log_std=min_log_std, max_log_std=max_log_std)
         self.net_container = nn.Sequential(
             nn.Linear(self.num_observations, 32), nn.ELU(),
             nn.Linear(32, 32), nn.ELU()
@@ -51,12 +51,12 @@ class Policy(GaussianMixin, Model):
         self.log_std_parameter = nn.Parameter(torch.ones(self.num_actions) * initial_log_std)
 
     def compute(self, inputs, role):
-        x = self.net_container(inputs["states"])
+        x = self.net_container(inputs["observations"])
         if role == "policy":
             mean = self.policy_layer(x)
         else:
             mean = self.value_layer(x)
-        return mean, self.log_std_parameter, {}
+        return mean, {"log_std": self.log_std_parameter}
 
 # ============================================================
 #                    CRAZYFLIE CONTROLLER
@@ -249,8 +249,8 @@ class CrazyflieController:
                 continue
 
             with torch.no_grad():
-                action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[2]["mean_actions"].squeeze(0)  # deterministic mean
+                _, outputs = self.agent.act(obs.unsqueeze(0), None, timestep=0, timesteps=1)
+                action = outputs["mean_actions"].squeeze(0)  # deterministic mean
                 action = action.clamp(-1.0, 1.0)
 
             # Position displacement: scale action by MAX_DISPLACEMENT
@@ -351,16 +351,17 @@ def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models = {"policy": policy}
 
-    cfg = PPO_DEFAULT_CONFIG.copy()
-    cfg["state_preprocessor"] = RunningStandardScaler
-    cfg["state_preprocessor_kwargs"] = {"size": obs_space, "device": device}
+    cfg = PPO_CFG(
+        observation_preprocessor=RunningStandardScaler,
+        observation_preprocessor_kwargs={"size": obs_space, "device": device},
+    )
     agent = PPO(models=models, memory=None, cfg=cfg,
                 observation_space=obs_space, action_space=act_space, device=device)
 
     assert checkpoint_path and os.path.exists(checkpoint_path), "No valid checkpoint provided. Please give a path for weights."
 
     agent.load(checkpoint_path)
-    agent.set_running_mode("eval")
+    agent.enable_training_mode(False)
     logger.info(f"Loaded checkpoint from {checkpoint_path}")
 
     return agent
