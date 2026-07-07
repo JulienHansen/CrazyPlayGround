@@ -59,6 +59,32 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Rate-Hovering",
+    entry_point=f"{__name__}.rate_hovering:QuadcopterEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rate_hovering:QuadcopterEnvCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        "skrl_amp_cfg_entry_point": f"{agents.__name__}:skrl_amp_cfg.yaml",
+        "skrl_ippo_cfg_entry_point": f"{agents.__name__}:skrl_ippo_cfg.yaml",
+        "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Test-Hovering",
+    entry_point=f"{__name__}.test_hovering:TestHoveringEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.test_hovering:TestHoveringEnvCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
 
 
 

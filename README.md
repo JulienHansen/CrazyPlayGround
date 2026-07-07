@@ -10,190 +10,50 @@
 
 # CrazyPlayGround - Collection of CrazyFlie Environments
 
-A collection of Crazyflie reinforcement learning environments built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab), using a self-contained cascaded PID inner-loop controller.
+A collection of Crazyflie reinforcement learning environments built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab). Trained policies can be deployed on real Crazyflie 2.1 drones via the scripts present in `execution/`.
 
-⚠️ This repository is still under construction. If you find a bug, a mistake, or a problem, do not hesitate to open an issue! ⚠️
+⚠️ This repository is under construction. If you find a bug or a problem, do not hesitate to open an issue! ⚠️
 
+## Quick start
 
----
+### 1. Install Isaac Lab
 
-## Overview
+Install [Isaac Lab 2.3.2](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html) (Isaac Sim 4.5+).
 
-CrazyPlayGround provides Isaac Lab environments for training RL agents on a simulated Crazyflie 2.1. Instead of letting the RL agent directly command motor thrusts, a **cascaded firmware-style PID controller** (position → velocity → attitude → rate) runs at 500 Hz as the inner loop. The RL agent operates at a higher level (100 Hz), commanding position deltas, velocity references, or attitude setpoints depending on the environment.
+### 2. Install CrazyPlayGround
 
-### Control architecture
-
-```
-RL agent (100 Hz)
-  └─ sets target (pos delta / vel ref / attitude)
-       └─ _apply_action() × 5  (500 Hz, each physics step)
-            └─ Cascade PID  →  thrust [N] + moment [N·m]
-                 └─ applied to Crazyflie rigid body via Isaac Lab
-```
-
-| Loop | Rate | Input → Output |
-|---|---|---|
-| Position | 100 Hz | position error [m] → velocity setpoint [m/s] |
-| Velocity | 100 Hz | velocity error [m/s] → roll/pitch command [rad] + thrust Δ |
-| Attitude | 500 Hz | attitude error [rad] → body-rate setpoint [rad/s] |
-| Rate | 500 Hz | rate error [rad/s] → moment [N·m] |
-
-### Simulation parameters
-
-| Parameter | Value |
-|---|---|
-| Physics timestep (`dt`) | 1/500 s = 2 ms |
-| Decimation | 5 |
-| Policy rate | 100 Hz |
-| Gyro LPF cutoff | 20 Hz |
-
----
-
-## Environments
-
-### Single-drone hovering
-
-Three variants differing only in the abstraction level of the RL action space:
-
-| Task ID | Action | Action space |
-|---|---|---|
-| `Pos-Hovering` | Position delta `[dx, dy, dz]` (m), clamped to ±0.1 | 3 |
-| `Vel-Hovering` | Velocity reference `[Vx, Vy, Vz]` (m/s), scaled by `max_velocity=1.0` | 3 |
-| `Att-Hovering` | `[roll, pitch, yaw_rate, thrust_normalized]` | 4 |
-
-All three share the same **observation space** (dim=6):
-
-```
-[lin_vel_b (3), desired_pos_b (3)]
-```
-- `lin_vel_b`: linear velocity in body frame [m/s]
-- `desired_pos_b`: goal position expressed in body frame [m]
-
-And the same **reward**:
-
-```
-r = - lin_vel_scale × ||ω_lin||²
-  - ang_vel_scale × ||ω_ang||²
-  + distance_scale × (1 - tanh(||pos - goal|| / 0.8))
-```
-
-Episode terminates when the drone goes below 0.1 m or above 2.0 m.
-
-### Multi-agent (MARL)
-
-| Task ID | Description |
-|---|---|
-| `Template-Crazyplayground-Marl-Direct-v0` | Multi-agent collaborative task |
-
----
-
-## Dependencies
-
-- [Isaac Lab](https://isaac-sim.github.io/IsaacLab) (Isaac Sim 4.5+)
-
----
-
-## Installation
-
-**1. Install Isaac Lab** following the [official guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-
-**2. Install CrazyPlayGround** (editable):
+Install with the extras you need:
 
 ```bash
-pip install -e source/CrazyPlayGround
+pip install -e "source/CrazyPlayGround[rl]"      # Simulation / Training
+pip install -e "source/CrazyPlayGround[deploy]"  # Deployment Hardware
+pip install -e "source/CrazyPlayGround[all]"    
 ```
 
-**3. Verify** — list available environments:
+### 3. Verify and train
 
 ```bash
 python scripts/list_envs.py
-```
-
-Expected output includes `Vel-Hovering`, `Pos-Hovering`, `Att-Hovering`, and `Template-Crazyplayground-Marl-Direct-v0`.
-
----
-
-## Usage
-
-### Train
-
-```bash
-# SKRL (PPO)
 python scripts/skrl/train.py --task=Vel-Hovering --num_envs=4096
-
-# RSL-RL
-python scripts/rsl_rl/train.py --task=Pos-Hovering --num_envs=4096
-
-# Stable Baselines 3
-python scripts/sb3/train.py --task=Att-Hovering --num_envs=512
 ```
 
-### Play / evaluate
+### Docker
+
+A Dockerfile is provided for reproducible training (Linux + NVIDIA GPU required):
 
 ```bash
-python scripts/skrl/play.py --task=Vel-Hovering --num_envs=16
+docker login nvcr.io                    
+docker build -t crazyplayground -f docker/Dockerfile .
+docker run --gpus all -it --rm -v $(pwd)/logs:/workspace/crazyplayground/logs crazyplayground
 ```
 
-### Debug with dummy agents
+Once inside the container, use the following command to verify and train (inside the container the `--headless` is mandatory):
 
 ```bash
-python scripts/zero_agent.py --task=Vel-Hovering
-python scripts/random_agent.py --task=Vel-Hovering
+/workspace/isaaclab/isaaclab.sh -p scripts/list_envs.py
+/workspace/isaaclab/isaaclab.sh -p scripts/skrl/train.py --task=Vel-Hovering --num_envs=4096 --headless
 ```
 
----
+## Documentation
 
-## Project structure
-
-```
-CrazyPlayGround/
-├── source/CrazyPlayGround/CrazyPlayGround/
-│   ├── controllers/                    # Self-contained cascade PID controller
-│   │   ├── cascade_pid.py
-│   │   ├── pid.py
-│   │   ├── config.py
-│   │   ├── crazyflie.yaml              # PID gains & physics params
-│   │   └── utils/math_utils.py
-│   └── tasks/direct/
-│       ├── hovering/                   # Single-drone envs
-│       │   ├── pos_hovering.py
-│       │   ├── vel_hovering.py
-│       │   ├── att_hovering.py
-│       │   └── agents/
-│       ├── track/
-│       ├── drone_racing/
-│       ├── drone_racing_marl/
-│       ├── formation/
-│       ├── fly_through/
-│       └── teleoperation/
-└── scripts/
-    ├── skrl/
-    ├── rsl_rl/
-    ├── sb3/
-    └── random_agent.py
-```
-
----
-
-## Configuration
-
-PID gains and simulation parameters are in `source/CrazyPlayGround/CrazyPlayGround/controllers/crazyflie.yaml` under the `controllers.cascade_pid` section. Key parameters:
-
-```yaml
-controllers:
-  cascade_pid:
-    sim_rate_hz:             500.0
-    pid_posvel_loop_rate_hz: 100.0
-    pid_loop_rate_hz:        500.0
-    gyro_lpf_cutoff_hz:       20.0
-
-    pos_kp:  [2.0, 2.0, 2.0]
-    vel_kp:  [25.0, 25.0, 25.0]
-    att_kp:  [6.0, 6.0, 6.0]
-    rate_kp: [250.0, 250.0, 120.0]
-```
-
-
-
-
-
+Full documentation (environments, controller architecture, configuration, real-drone deployment) lives in [`docs/`](docs/) and is built with MkDocs Material, an online version of the documentation will soon be available
