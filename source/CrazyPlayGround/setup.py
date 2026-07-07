@@ -19,7 +19,18 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 INSTALL_REQUIRES = [
     # NOTE: Add dependencies
     "psutil",
+    "pyyaml",
+    "toml",
 ]
+
+EXTRAS_REQUIRE = {
+    "rl":["skrl>=2.1.0", "rsl-rl-lib>=5.2.0", "stable-baselines3>=2.8.0", "rl-games>=1.6.1", "wandb>=0.26.1"],
+    "deploy":["cflib>=0.1.32"],
+    "teleop":["pygame>=2.6"],
+    "docs":["mkdocs-material>=9.5"],
+}
+
+EXTRAS_REQUIRE["all"] = sum(EXTRAS_REQUIRE.values(), [])
 
 # Installation operation
 setup(
@@ -32,6 +43,7 @@ setup(
     description=EXTENSION_TOML_DATA["package"]["description"],
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     install_requires=INSTALL_REQUIRES,
+    extras_require=EXTRAS_REQUIRE,
     license="Apache-2.0",
     include_package_data=True,
     python_requires=">=3.10",

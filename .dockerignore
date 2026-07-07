@@ -1,0 +1,9 @@
+  .git                                                                                                   
+  docs/assets                                                                                          
+  **/__pycache__
+  **/*.egg-info
+  **/cache                                                                                               
+  logs
+  outputs                                                                                                
+  *.pt                                                                                                 
+  *.onnx

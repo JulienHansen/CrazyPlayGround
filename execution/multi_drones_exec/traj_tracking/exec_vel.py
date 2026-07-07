@@ -14,7 +14,8 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 
 from skrl.models.torch import Model, GaussianMixin
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.agents.torch.ppo import PPO, PPO_CFG
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] [{name}] {message}",
@@ -104,8 +105,10 @@ class Policy(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device,
                  clip_actions=False, clip_log_std=True,
                  min_log_std=-20.0, max_log_std=2.0, initial_log_std=0.0):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
+        Model.__init__(self, observation_space=observation_space,
+                       action_space=action_space, device=device)
+        GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std,
+                               min_log_std=min_log_std, max_log_std=max_log_std)
         self.net_container = nn.Sequential(
             nn.Linear(self.num_observations, 256), nn.ELU(),
             nn.Linear(256, 128), nn.ELU(),
@@ -116,9 +119,9 @@ class Policy(GaussianMixin, Model):
         self.log_std_parameter = nn.Parameter(torch.ones(self.num_actions) * initial_log_std)
 
     def compute(self, inputs, role):
-        x = self.net_container(inputs["states"])
+        x = self.net_container(inputs["observations"])
         mean = self.policy_layer(x) if role == "policy" else self.value_layer(x)
-        return mean, self.log_std_parameter, {}
+        return mean, {"log_std": self.log_std_parameter}
 
 
 # ── Crazyflie controller ───────────────────────────────────────────────────────
@@ -158,7 +161,10 @@ class CrazyflieController:
         threading.Thread(target=self.control_loop, daemon=True).start()
 
     def _disconnected(self, uri: str): pass
-    def _connection_failed(self, uri: str, msg: str): pass
+
+    def _connection_failed(self, uri: str, msg: str):
+        self.log.error(f"Connection to {uri} failed: {msg}")
+        self.running = False
 
     def _connection_lost(self, uri: str, msg: str):
         self.log.warning(f"Connection lost: {msg} — triggering safe landing")
@@ -276,6 +282,8 @@ class CrazyflieController:
 
         self.log.info("NN velocity-control trajectory tracking active.")
         step = 0
+        GRACE_PERIOD = 3.0
+        nn_start_time = time.time()
         while self.cf.is_connected() and self.running:
             start_time = time.time()
 
@@ -298,11 +306,17 @@ class CrazyflieController:
                 quat = self.current_quat.clone()
                 ang  = self.current_ang_vel.clone()
 
+            z = pos[2].item()
+            if (time.time() - nn_start_time > GRACE_PERIOD and z < 0.1) or z > 2.5:
+                self.log.error(f"Altitude out of bounds (z={z:.2f} m) — emergency landing")
+                self._emergency_land()
+                break
+
             obs = build_observation(step, pos, vel, quat, ang, self.origin)
 
             with torch.no_grad():
-                action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[0].clamp(-1.0, 1.0)
+                _, outputs = self.agent.act(obs.unsqueeze(0), None, timestep=0, timesteps=1)
+                action = outputs["mean_actions"].squeeze(0).clamp(-1.0, 1.0)
 
             vel_cmd = action * MAX_VELOCITY
             self.log.info(
@@ -352,12 +366,16 @@ def load_agent(checkpoint_path: str, device: torch.device) -> PPO:
     act_space = 3
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models  = {"policy": policy}
-    cfg     = PPO_DEFAULT_CONFIG.copy()
+    cfg     = PPO_CFG(
+        observation_preprocessor=RunningStandardScaler,
+        observation_preprocessor_kwargs={"size": obs_space, "device": device},
+    )
     agent   = PPO(models=models, memory=None, cfg=cfg,
                   observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), \
         f"No valid checkpoint provided: {checkpoint_path}"
     agent.load(checkpoint_path)
+    agent.enable_training_mode(False)
     print(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
@@ -390,13 +408,22 @@ def main():
     c1 = CrazyflieController(name="cf1", uri=args.uri1, agent=agent1, origin=args.origin1)
     c2 = CrazyflieController(name="cf2", uri=args.uri2, agent=agent2, origin=args.origin2)
 
+    CONNECT_TIMEOUT_S = 15
     try:
         c1.start()
         c2.start()
+        deadline = time.time() + CONNECT_TIMEOUT_S
         while not (c1.cf.is_connected() and c2.cf.is_connected()):
-            time.sleep(1)
+            if not (c1.running and c2.running):
+                failed = [c.uri for c in (c1, c2) if not c.running]
+                logger.error(f"Connection failed for: {failed} — aborting")
+                return
+            if time.time() > deadline:
+                logger.error(f"Connection timeout after {CONNECT_TIMEOUT_S} s — aborting")
+                return
+            time.sleep(0.5)
         logger.info("Both Crazyflies connected!")
-        while True:
+        while c1.running or c2.running:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

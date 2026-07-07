@@ -1,23 +1,11 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+"""Body-rate-controlled hovering environment.
 
-"""Attitude-controlled hovering environment.
+Identical to att_hovering except the action is [roll_rate, pitch_rate, yaw_rate, thrust_normalized]
+fed directly into the body-rate loop, bypassing position, velocity, and attitude PIDs.
+The agent directly commands the drone's angular rates and thrust.
 
-Identical to pos/vel_hovering except the action is [roll_ref, pitch_ref, yaw_rate_ref, thrust_normalized]
-fed directly into the attitude angle loop, bypassing both position and velocity PIDs.
-The agent directly commands the drone's orientation and thrust.
-
-Note on yaw control vs. the original implementation
-------------------------------------------------------
-The original att_hovering overrode the yaw rate setpoint directly after the attitude
-angle loop, effectively bypassing the yaw angle PID.  With CrazyfliePIDController the
-``"attitude"`` command level uses the yaw setpoint maintained by the controller:
-- ``target_yaw_rate`` integrates the yaw setpoint each step.
-- The attitude angle PID then tracks that integrated setpoint.
-The net effect is identical when yaw_rate = 0 (the controller holds the yaw at the
-value when reset) and very similar for nonzero yaw rates once the setpoint has settled.
+This is the lowest-level RL control interface: only the rate PID (which converts
+rate setpoints to moments) and the motor mixer sit below the agent.
 """
 
 from __future__ import annotations
@@ -37,7 +25,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
@@ -62,12 +50,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     decimation = 5
 
     action_space = 4
-    observation_space = 6
+    observation_space = 18
     state_space = 0
     debug_vis = True
 
-    max_roll_pitch = 30.0 * math.pi / 180.0   # 30 deg max tilt
-    max_yaw_rate   = 90.0 * math.pi / 180.0   # 90 deg/s max yaw rate
+    max_body_rate = math.pi  # rad/s (~180 deg/s) max angular rate per axis
     min_thrust_scale = 0.5   # fraction of hover thrust
     max_thrust_scale = 1.8   # fraction of hover thrust
 
@@ -106,11 +93,20 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     lin_vel_reward_scale = -0.1
-    ang_vel_reward_scale = -0.5
+    ang_vel_reward_scale = -0.05
     distance_to_goal_reward_scale = 20.0
 
     add_noise = True
     noise_std = 0.05
+
+    # ── Domain randomization ──────────────────────────────────────
+    domain_rand = True
+    # max-thrust variability (battery / propellers / motor wear).
+    rand_thrust_scale_range = (0.85, 1.15)
+    # Per-episode additive bias on commanded thrust as a fraction of hover thrust
+    rand_thrust_bias_range = (-0.10, 0.10)
+    # Per-episode multiplier on the body-rate setpoint
+    rand_rate_scale_range = (0.90, 1.10)
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
@@ -145,10 +141,12 @@ class QuadcopterEnv(DirectRLEnv):
         self._min_thrust = self.cfg.min_thrust_scale * self._hover_thrust
         self._max_thrust = self.cfg.max_thrust_scale * self._hover_thrust
 
-        self._att_ref = torch.zeros(self.num_envs, 3, device=self.device)
-        self._yaw_rate_ref = torch.zeros(self.num_envs, 1, device=self.device)
+        self._rate_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._thrust_pwm = torch.zeros(self.num_envs, 1, device=self.device)
 
+        self._dr_thrust_scale = torch.ones(self.num_envs, device=self.device)
+        self._dr_thrust_bias_n = torch.zeros(self.num_envs, device=self.device)
+        self._dr_rate_scale = torch.ones(self.num_envs, device=self.device)
         self.set_debug_vis(self.cfg.debug_vis)
 
     def _setup_scene(self):
@@ -168,13 +166,16 @@ class QuadcopterEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
-        roll_ref  = self._actions[:, 0] * self.cfg.max_roll_pitch
-        pitch_ref = self._actions[:, 1] * self.cfg.max_roll_pitch
-        self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
-        self._yaw_rate_ref = (self._actions[:, 2] * self.cfg.max_yaw_rate).unsqueeze(-1)
+        # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s,
+        # with per-env DR multiplier on the rate setpoint.
+        self._rate_ref = (
+            self._actions[:, :3] * self.cfg.max_body_rate * self._dr_rate_scale.unsqueeze(-1)
+        )
 
-        thrust_normalized = (self._actions[:, 3] + 1.0) * 0.5  # [-1, 1] -> [0, 1]
+        thrust_normalized = (self._actions[:, 3] + 1.0) * 0.5  # map [-1,1] -> [0,1]
         thrust_ref_n = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
+        thrust_ref_n = thrust_ref_n * self._dr_thrust_scale + self._dr_thrust_bias_n
+        thrust_ref_n = thrust_ref_n.clamp(min=0.0)
         self._thrust_pwm = (thrust_ref_n / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
 
     def _apply_action(self):
@@ -190,10 +191,9 @@ class QuadcopterEnv(DirectRLEnv):
 
         thrust, moment = self._ctrl(
             root_state,
-            target_attitude=self._att_ref,
-            target_yaw_rate=self._yaw_rate_ref,
+            target_body_rates=self._rate_ref,
             thrust_cmd=self._thrust_pwm,
-            command_level="attitude",
+            command_level="body_rate",
             body_rates_in_body_frame=True,
         )
 
@@ -208,10 +208,14 @@ class QuadcopterEnv(DirectRLEnv):
             self._desired_pos_w,
         )
 
+        rot_mat = matrix_from_quat(self._robot.data.root_quat_w).reshape(self.num_envs, 9)
+
         obs = torch.cat(
             [
                 self._robot.data.root_lin_vel_b,
                 desired_pos_b,
+                rot_mat,
+                self._robot.data.root_ang_vel_b,
             ],
             dim=-1,
         )
@@ -283,6 +287,22 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._ctrl.reset(env_ids)
+
+        # Sample new domain-randomization values for the reset envs.
+        if self.cfg.domain_rand:
+            n = len(env_ids)
+            ts_lo, ts_hi = self.cfg.rand_thrust_scale_range
+            tb_lo, tb_hi = self.cfg.rand_thrust_bias_range
+            rs_lo, rs_hi = self.cfg.rand_rate_scale_range
+            self._dr_thrust_scale[env_ids] = torch.empty(n, device=self.device).uniform_(ts_lo, ts_hi)
+            self._dr_thrust_bias_n[env_ids] = (
+                torch.empty(n, device=self.device).uniform_(tb_lo, tb_hi) * self._hover_thrust
+            )
+            self._dr_rate_scale[env_ids] = torch.empty(n, device=self.device).uniform_(rs_lo, rs_hi)
+        else:
+            self._dr_thrust_scale[env_ids] = 1.0
+            self._dr_thrust_bias_n[env_ids] = 0.0
+            self._dr_rate_scale[env_ids] = 1.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:

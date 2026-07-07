@@ -14,7 +14,8 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 
 from skrl.models.torch import Model, GaussianMixin
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.agents.torch.ppo import PPO, PPO_CFG
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] [{name}] {message}",
@@ -34,11 +35,8 @@ TRAJ_STEP_SIZE = 5.0             # sim-steps between consecutive waypoints
 CONTROL_DT     = 0.01            # policy step (s) — must match decimation*sim_dt (5*0.002)
 
 # ── Attitude action params (must match AttTrackingEnvCfg) ─────────────────────
-MAX_ANGLE        = 30.0   # degrees  (max_roll_pitch in degrees for send_setpoint)
+MAX_ANGLE        = 30.0   # degrees  (max_roll_pitch in degrees for send_setpoint_manual)
 MAX_YAW_RATE     = 90.0   # deg/s
-HOVER_THRUST     = 30000  # PWM at hover — calibrate empirically if needed
-MIN_THRUST_SCALE = 0.5
-MAX_THRUST_SCALE = 1.8
 
 
 # ── Trajectory utilities ───────────────────────────────────────────────────────
@@ -106,8 +104,9 @@ class Policy(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device,
                  clip_actions=False, clip_log_std=True,
                  min_log_std=-20.0, max_log_std=2.0, initial_log_std=0.0):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std,
+                               min_log_std=min_log_std, max_log_std=max_log_std)
         self.net_container = nn.Sequential(
             nn.Linear(self.num_observations, 32), nn.ELU(),
             nn.Linear(32, 32), nn.ELU()
@@ -117,9 +116,9 @@ class Policy(GaussianMixin, Model):
         self.log_std_parameter = nn.Parameter(torch.ones(self.num_actions) * initial_log_std)
 
     def compute(self, inputs, role):
-        x = self.net_container(inputs["states"])
+        x = self.net_container(inputs["observations"])
         mean = self.policy_layer(x) if role == "policy" else self.value_layer(x)
-        return mean, self.log_std_parameter, {}
+        return mean, {"log_std": self.log_std_parameter}
 
 
 # ── Crazyflie controller ───────────────────────────────────────────────────────
@@ -127,13 +126,29 @@ class Policy(GaussianMixin, Model):
 class CrazyflieController:
     """Per-drone trajectory-tracking attitude-control RL agent runner."""
 
-    def __init__(self, name: str, uri: str, agent: PPO, origin: List[float]):
+    def __init__(self, name: str, uri: str, agent: PPO, origin: List[float],
+                 mass_kg: float = 0.027,
+                 max_thrust_N: float = 0.638,
+                 min_thrust_scale: float = 0.5,
+                 max_thrust_scale: float = 1.8):
         self.name   = name
         self.uri    = uri
         self.cf     = Crazyflie()
         self.agent  = agent
         self.origin = torch.tensor(origin, dtype=torch.float32, device=device)
         self.log    = logging.getLogger(f"CrazyflieRL.{name}")
+
+        # Physics-based thrust mapping (mirrors single-drone exec_att.py)
+        self.mass_kg          = float(mass_kg)
+        self.weight_N         = self.mass_kg * 9.81
+        self.max_thrust_N     = float(max_thrust_N)
+        self.min_thrust_scale = float(min_thrust_scale)
+        self.max_thrust_scale = float(max_thrust_scale)
+        self.hover_thrust_pct = max(0.0, min(100.0, 100.0 * self.weight_N / self.max_thrust_N))
+        self.log.info(
+            f"Physics: m={self.mass_kg} kg, max_thrust={self.max_thrust_N} N, "
+            f"hover_pct={self.hover_thrust_pct:.1f}%"
+        )
 
         self.current_pos     = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel_w   = torch.zeros(3, dtype=torch.float32, device=device)
@@ -159,7 +174,10 @@ class CrazyflieController:
         threading.Thread(target=self.control_loop, daemon=True).start()
 
     def _disconnected(self, uri: str): pass
-    def _connection_failed(self, uri: str, msg: str): pass
+
+    def _connection_failed(self, uri: str, msg: str):
+        self.log.error(f"Connection to {uri} failed: {msg}")
+        self.running = False
 
     def _connection_lost(self, uri: str, msg: str):
         self.log.warning(f"Connection lost: {msg} — triggering safe landing")
@@ -278,14 +296,22 @@ class CrazyflieController:
         # Hover handoff: switch firmware away from HLC mode by sending setpoints.
         self.log.info("Transitioning to attitude control (hover handoff)...")
         for _ in range(20):
-            self.cf.commander.send_setpoint(0, 0, 0, HOVER_THRUST)
+            self.cf.commander.send_setpoint_manual(0.0, 0.0, 0.0, self.hover_thrust_pct, False)
             time.sleep(CONTROL_DT)
 
         self.log.info("NN attitude-control trajectory tracking active.")
         step = 0
+        nn_start_time = time.time()
+        GRACE_PERIOD = 3.0  # seconds before enforcing z lower bound
         while self.cf.is_connected() and self.running:
             start_time = time.time()
 
+            # ── Safety watchdog: altitude bounds ─────────────────────────────
+            z = self.current_pos[2].item()
+            if (time.time() - nn_start_time > GRACE_PERIOD and z < 0.1) or z > 2.5:
+                self.log.error(f"Position out of bounds z={z:.2f} — emergency landing")
+                self._emergency_land()
+                break
             if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
                 self.log.error(
                     f"Position stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
@@ -308,22 +334,27 @@ class CrazyflieController:
             obs = build_observation(step, pos, vel, quat, ang, self.origin)
 
             with torch.no_grad():
-                action_dict = self.agent.act(obs, 1, 0)
-                action = action_dict[0]
+                _, outputs = self.agent.act(obs.unsqueeze(0), None, timestep=0, timesteps=1)
+                action = outputs["mean_actions"].squeeze(0)  # deterministic mean, not sampled
+                action = action.clamp(-1.0, 1.0)
 
             roll  = action[0].item() * MAX_ANGLE
             pitch = action[1].item() * MAX_ANGLE
             yaw   = action[2].item() * MAX_YAW_RATE
-            thrust_norm = float(max(0.0, min(1.0, action[3].item())))
-            thrust = int(HOVER_THRUST * (MIN_THRUST_SCALE + thrust_norm * (MAX_THRUST_SCALE - MIN_THRUST_SCALE)))
-            thrust = max(10000, min(60000, thrust))
+            # Thrust: clamp to [0, 1] (AttTrackingEnvCfg convention), then physics
+            # mapping Newtons → % of max static thrust (mirrors single-drone exec_att.py).
+            thrust_norm = max(0.0, min(1.0, action[3].item()))
+            thrust_N = self.weight_N * (
+                self.min_thrust_scale + thrust_norm * (self.max_thrust_scale - self.min_thrust_scale)
+            )
+            thrust_pct = max(0.0, min(100.0, 100.0 * thrust_N / self.max_thrust_N))
 
             self.log.info(
                 f"Step={step} | "
-                f"roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust} | "
+                f"roll={roll:.1f} pitch={pitch:.1f} yaw={yaw:.1f} thrust={thrust_pct:.1f}% | "
                 f"pos={[f'{v:.2f}' for v in pos.tolist()]}"
             )
-            self.cf.commander.send_setpoint(roll, pitch, yaw, thrust)
+            self.cf.commander.send_setpoint_manual(roll, pitch, yaw, thrust_pct, False)
 
             step += 1
             elapsed = time.time() - start_time
@@ -362,12 +393,16 @@ def load_agent(checkpoint_path: str, device: torch.device) -> PPO:
     act_space = 4
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models  = {"policy": policy}
-    cfg     = PPO_DEFAULT_CONFIG.copy()
+    cfg     = PPO_CFG(
+        observation_preprocessor=RunningStandardScaler,
+        observation_preprocessor_kwargs={"size": obs_space, "device": device},
+    )
     agent   = PPO(models=models, memory=None, cfg=cfg,
                   observation_space=obs_space, action_space=act_space, device=device)
     assert checkpoint_path and os.path.exists(checkpoint_path), \
         f"No valid checkpoint provided: {checkpoint_path}"
     agent.load(checkpoint_path)
+    agent.enable_training_mode(False)
     print(f"Loaded checkpoint from {checkpoint_path}")
     return agent
 
@@ -403,10 +438,20 @@ def main():
     try:
         c1.start()
         c2.start()
+        CONNECT_TIMEOUT_S = 15
+        waited = 0
         while not (c1.cf.is_connected() and c2.cf.is_connected()):
+            if not (c1.running and c2.running):
+                logger.error("A connection failed — aborting")
+                return
+            if waited >= CONNECT_TIMEOUT_S:
+                failed = [c.uri for c in (c1, c2) if not c.cf.is_connected()]
+                logger.error(f"Connection timeout after {CONNECT_TIMEOUT_S}s for: {failed}")
+                return
             time.sleep(1)
+            waited += 1
         logger.info("Both Crazyflies connected!")
-        while True:
+        while c1.running or c2.running:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
