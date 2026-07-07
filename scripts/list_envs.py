@@ -9,8 +9,7 @@ Script to print all the available environments in Isaac Lab.
 The script iterates over all registered environments and stores the details in a table.
 It prints the name of the environment, the entry point and the config file.
 
-All the environments are registered in the `CrazyPlayGround` extension. They start
-with `Isaac` in their name.
+All the environments are registered in the `CrazyPlayGround` extension.
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -27,7 +26,12 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 from prettytable import PrettyTable
 
+# Snapshot the registry before importing the extension so we can list exactly the
+# environments that CrazyPlayGround registers, regardless of how they are named.
+_tasks_before = set(gym.registry.keys())
 import CrazyPlayGround.tasks  # noqa: F401
+
+_crazyplayground_tasks = sorted(set(gym.registry.keys()) - _tasks_before)
 
 
 def main():
@@ -40,15 +44,12 @@ def main():
     table.align["Entry Point"] = "l"
     table.align["Config"] = "l"
 
-    # count of environments
-    index = 0
-    # acquire all Isaac environments names
-    for task_spec in gym.registry.values():
-        if "Template-" in task_spec.id:
-            # add details to table
-            table.add_row([index + 1, task_spec.id, task_spec.entry_point, task_spec.kwargs["env_cfg_entry_point"]])
-            # increment count
-            index += 1
+    # add every environment registered by the CrazyPlayGround extension
+    for index, task_id in enumerate(_crazyplayground_tasks):
+        task_spec = gym.registry[task_id]
+        table.add_row(
+            [index + 1, task_spec.id, task_spec.entry_point, task_spec.kwargs.get("env_cfg_entry_point", "-")]
+        )
 
     print(table)
 
