@@ -69,18 +69,18 @@ agent:
   experiment:
     directory: "cartpole_direct"
     experiment_name: ""
-    write_interval: auto
+    write_interval: 500
     checkpoint_interval: auto
-    
-    wandb: True,             # whether to use Weights & Biases
+
+    wandb: True               # whether to use Weights & Biases
     wandb_kwargs:
-      project: "rate_contr"       # Can be changed to whatever project you want
-      entity: "hansenjulienpro-univesity-of-liege"   # your wandb username
-      
-      
+      project: "crazyplayground"       # Can be changed to whatever project you want
+      entity: ""   # your wandb username
+
+
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 48000
+  timesteps: 5000
   environment_info: log
