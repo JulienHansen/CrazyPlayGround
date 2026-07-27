@@ -89,9 +89,11 @@ def main():
                "--seed", str(r["seed"])]
         cmd += [f"{k}={v}" for k, v in r["overrides"].items()]
         if not args.no_wandb:
-            cmd += [f"agent.agent.experiment.wandb_kwargs.name={tag}",
-                    f"agent.agent.experiment.wandb_kwargs.group={WANDB_GROUP}",
-                    f"agent.agent.experiment.wandb_kwargs.project={WANDB_PROJECT}"]
+            # `++` = set-or-append: `name`/`group` do not exist in skrl_ppo_cfg.yaml,
+            # and plain `key=value` fails on absent keys.
+            cmd += [f"++agent.agent.experiment.wandb_kwargs.name={tag}",
+                    f"++agent.agent.experiment.wandb_kwargs.group={WANDB_GROUP}",
+                    f"++agent.agent.experiment.wandb_kwargs.project={WANDB_PROJECT}"]
 
         print(f"\n[{i+1}/{len(runs)}] {tag}\n  {' '.join(cmd)}")
         if args.dry_run:
