@@ -149,8 +149,10 @@ class CollectingController:
 
     def __init__(self, uri: str, agent: PPO, run_dir: str, meta: dict,
                  initial_target=None, duration: Optional[float] = None,
-                 roam: bool = False, fast_rate_hz: int = 100):
+                 roam: bool = False, fast_rate_hz: int = 100, history_len: int = 1):
         self.uri = uri
+        self.history_len = max(1, int(history_len))
+        self._obs_hist: list = []
         self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
         self.run_dir = run_dir
@@ -362,8 +364,22 @@ class CollectingController:
                 time.sleep(INTERVAL)
                 continue
 
+            # Frame stacking for policies trained with env.history_len=K>1. The
+            # window is primed with the first observation so the very first control
+            # step is not fed zeros. Oldest first, newest last -- same order as
+            # vel_hovering_robust._get_observations.
+            if self.history_len > 1:
+                if not self._obs_hist:
+                    self._obs_hist = [obs.clone() for _ in range(self.history_len)]
+                else:
+                    self._obs_hist.append(obs.clone())
+                    self._obs_hist.pop(0)
+                policy_in = torch.cat(self._obs_hist, dim=-1)
+            else:
+                policy_in = obs
+
             with torch.no_grad():
-                _, outputs = self.agent.act(obs.unsqueeze(0), None, timestep=0, timesteps=1)
+                _, outputs = self.agent.act(policy_in.unsqueeze(0), None, timestep=0, timesteps=1)
                 action = outputs["mean_actions"].squeeze(0).clamp(-1.0, 1.0)
 
             velocity_cmd = action * MAX_VELOCITY
@@ -498,8 +514,9 @@ def quat_inv(q, eps=1e-9):
 #                    MODEL LOADING / MAIN
 # ============================================================
 
-def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
-    obs_space, act_space = 6, 3
+def load_agent(checkpoint_path: Optional[str], device: torch.device, history_len: int = 1) -> PPO:
+    # A policy trained with a K-step window expects 6*K inputs.
+    obs_space, act_space = 6 * max(1, int(history_len)), 3
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     cfg = PPO_CFG(
         observation_preprocessor=RunningStandardScaler,
@@ -570,7 +587,9 @@ def build_metadata(args, checkpoint_path) -> dict:
         "sim_dt": SIM_DT,
         "decimation": DECIMATION,
         "max_velocity_mps": MAX_VELOCITY,
-        "obs_layout": ["lin_vel_b(3)", "desired_pos_b(3)"],
+        "history_len": args.history_len,
+        "obs_layout": (["lin_vel_b(3)", "desired_pos_b(3)"] if args.history_len == 1 else
+                       [f"{args.history_len}x[lin_vel_b(3), desired_pos_b(3)] oldest-first"]),
         "action_layout": ["vx", "vy", "vz"],
         "quaternion_order": "wxyz (scalar first)",
         "velocity_frame": "world (stateEstimate.v*), rotated to body via quat_inv",
@@ -606,6 +625,9 @@ def main():
                         help="Flight duration in seconds before auto-land (protocol trial length). 0 = until Ctrl-C.")
     parser.add_argument("--roam", action="store_true",
                         help="Resample the target when reached (exec_vel.py behaviour). Default: hold fixed target.")
+    parser.add_argument("--history-len", type=int, default=1,
+                        help="Observation window length K; must match env.history_len the policy "
+                             "was trained with (1 = no stacking).")
     parser.add_argument("--log-rate-hz", type=int, default=100,
                         help="Rate for the fast log blocks (posvel/quat/imu). Lower to 50 if radio drops packets.")
     parser.add_argument("--outdir", type=str,
@@ -626,13 +648,13 @@ def main():
         run_name += f"_{args.tag}"
     run_dir = os.path.join(args.outdir, run_name)
 
-    agent = load_agent(args.checkpoint, device)
+    agent = load_agent(args.checkpoint, device, args.history_len)
     meta = build_metadata(args, args.checkpoint)
 
     controller = CollectingController(
         uri=args.uri, agent=agent, run_dir=run_dir, meta=meta,
         initial_target=args.target, duration=duration, roam=args.roam,
-        fast_rate_hz=args.log_rate_hz)
+        fast_rate_hz=args.log_rate_hz, history_len=args.history_len)
 
     logger.info(f"Run directory: {run_dir}")
     try:
