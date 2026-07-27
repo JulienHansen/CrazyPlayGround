@@ -38,7 +38,8 @@ parser.add_argument("--outdir", type=str, default=None, help="Root output dir (d
 parser.add_argument("--tag", type=str, default="", help="Label appended to the run folder name.")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--history-len", type=int, default=1,
-                    help="Observation window length; must match the trained policy (1 = no stacking).")
+                    help="Recorded in metadata only. Stacking is done by the env itself "
+                         "(pass env.history_len=K as a Hydra override for Vel-Hovering-Robust).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -123,8 +124,9 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     # so the recording is not truncated at a random point.
     uenv.episode_length_buf[:] = 0
 
+    # The env itself performs any observation stacking (Vel-Hovering-Robust), so the
+    # returned vector is already the full policy input: [1, 6*history_len].
     obs = uenv._get_observations()["policy"]
-    hist = [obs.clone() for _ in range(args_cli.history_len)]
 
     run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_velsim"
     if args_cli.tag:
@@ -140,9 +142,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         # keep the goal frozen even if the env resampled it on an internal reset
         uenv._desired_pos_w[:] = target_w
 
-        policy_in = torch.cat(hist, dim=-1) if args_cli.history_len > 1 else obs
         with torch.inference_mode():
-            _, outputs = runner.agent.act(policy_in, None, timestep=0, timesteps=0)
+            _, outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
             action = outputs["mean_actions"].clamp(-1.0, 1.0)
 
         # snapshot true sim state BEFORE stepping (matches "state that produced the action")
@@ -150,7 +151,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         vel = uenv._robot.data.root_lin_vel_w[0]
         quat = uenv._robot.data.root_quat_w[0]              # (w, x, y, z)
         gyro = uenv._robot.data.root_ang_vel_b[0] * RAD2DEG  # deg/s, matching firmware log units
-        o = policy_in[0] if args_cli.history_len == 1 else obs[0]
+        o = obs[0][-6:]   # newest frame of the (possibly stacked) observation
         a = action[0]
         cmd = a * max_velocity
         tgt = torch.tensor(args_cli.target, device=device)
@@ -181,9 +182,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         if bool(truncated[0].item()):
             print(f"[WARN] env truncated at step {step}")
             break
-
-        hist.append(obs.clone())
-        hist.pop(0)
 
     # ── write CSV / npz / metadata in the analyze_hover.py layout ─────────────
     csv_path = os.path.join(run_dir, "flight.csv")

@@ -72,10 +72,10 @@ agent:
     write_interval: auto
     checkpoint_interval: auto
     
-    wandb: True,             # whether to use Weights & Biases
+    wandb: true              # whether to use Weights & Biases
     wandb_kwargs:
-      project: "rate_contr"       # Can be changed to whatever project you want
-      entity: "hansenjulienpro-univesity-of-liege"   # your wandb username
+      project: "crazyplayground-hover"   # Can be changed to whatever project you want
+      # entity: left unset -> uses the logged-in account's default entity
       
       
 # Sequential trainer
