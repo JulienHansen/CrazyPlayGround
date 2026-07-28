@@ -52,6 +52,4 @@ execution/sim2real/data/
 execution/sim2real/data_sim/
 execution/sim2real/data_sweep/
 execution/sim2real/experiments/*.log
-execution/sim2real/experiments/sweep_index.json
-execution/sim2real/experiments/leaderboard.json
 wandb/
