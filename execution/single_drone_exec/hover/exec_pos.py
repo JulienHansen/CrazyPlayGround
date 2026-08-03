@@ -1,16 +1,21 @@
 import os
+import sys
 import time
 import threading
 import argparse
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
-from cflib.crazyflie.log import LogConfig
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
+from flight_recorder import FlightRecorder
+from flight_logger import FlightLogger, quat_to_euler_deg
+from utils import setup_state_logging, emergency_land, quat_apply, quat_inv
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -68,7 +73,9 @@ class CrazyflieController:
     Uses send_position_setpoint to command position in world frame.
     Sim equivalent: pos_hovering.py (command_level="position", action clamp ±0.1 displacement).
     """
-    def __init__(self, uri: str, agent: PPO, initial_target=None):
+    def __init__(self, uri: str, agent: PPO, initial_target=None,
+                 record_path: Optional[str] = None, record_interval_s: float = 0.1,
+                 log_interval_s: float = 1.0):
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
@@ -80,7 +87,32 @@ class CrazyflieController:
         self.position_received = False
         self._last_pos_time: float = 0.0
         self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
+        self.current_motor_pwm = [0, 0, 0, 0]
         self.lock = threading.Lock()
+
+        # Latest policy inference outputs, for the recorder thread
+        self.last_obs: Optional[torch.Tensor] = None
+        self.last_action: Optional[torch.Tensor] = None
+        self.last_cmd: Optional[torch.Tensor] = None
+        self.last_displacement: Optional[torch.Tensor] = None
+        self.last_control_time: float = 0.0
+
+        # File recording (separate cadence from CF telemetry logging)
+        self.record_path = record_path
+        self.recorder: Optional[FlightRecorder] = None
+        if self.record_path:
+            self.recorder = FlightRecorder(
+                self.record_path,
+                self._sample_for_recording,
+                obs_fields=["lin_vel_b_x", "lin_vel_b_y", "lin_vel_b_z",
+                            "des_pos_b_x", "des_pos_b_y", "des_pos_b_z"],
+                action_fields=["action_dx", "action_dy", "action_dz"],
+                cmd_fields=["desired_pos_x", "desired_pos_y", "desired_pos_z"],
+                record_interval_s=record_interval_s,
+            )
+
+        self.flight_logger = FlightLogger(logger, self._sample_for_status, log_interval_s=log_interval_s)
+
         self._setup_callbacks()
 
     # ---------- Crazyflie callbacks ----------
@@ -95,8 +127,11 @@ class CrazyflieController:
         logger.info(f"Connected to {uri}, taking off...")
         self.cf.high_level_commander.takeoff(0.5, 1)
         time.sleep(1.5)
-        self._start_logging()
+        setup_state_logging(self)
         threading.Thread(target=self.control_loop, daemon=True).start()
+        if self.recorder:
+            self.recorder.start()
+        self.flight_logger.start()
 
     def _disconnected(self, uri: str):
         pass
@@ -109,85 +144,47 @@ class CrazyflieController:
         logger.warning(f"Connection to {uri} lost: {msg} — triggering safe landing")
         self.running = False
 
-    # ---------- Logging setup ----------
+    # ---------- Flight recording ----------
 
-    def _start_logging(self):
-        LOG_FREQUENCY_IN_MS = 10  # 100 Hz — matches control loop
-
-        # Block 1: position + velocity (6 floats = 24 bytes, within 26-byte limit)
-        log_posvel = LogConfig(name="posvel", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_posvel.add_variable("stateEstimate.x", "float")
-        log_posvel.add_variable("stateEstimate.y", "float")
-        log_posvel.add_variable("stateEstimate.z", "float")
-        log_posvel.add_variable("stateEstimate.vx", "float")
-        log_posvel.add_variable("stateEstimate.vy", "float")
-        log_posvel.add_variable("stateEstimate.vz", "float")
-        self.cf.log.add_config(log_posvel)
-        log_posvel.data_received_cb.add_callback(self._log_posvel_callback)
-        log_posvel.start()
-
-        # Block 2: quaternion (4 floats = 16 bytes)
-        log_quat = LogConfig(name="quat", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_quat.add_variable("stateEstimate.qx", "float")
-        log_quat.add_variable("stateEstimate.qy", "float")
-        log_quat.add_variable("stateEstimate.qz", "float")
-        log_quat.add_variable("stateEstimate.qw", "float")
-        self.cf.log.add_config(log_quat)
-        log_quat.data_received_cb.add_callback(self._log_data_quat_callback)
-        log_quat.start()
-
-        # Block 3: Kalman variance (for safety watchdog)
-        log_var = LogConfig(name="quality", period_in_ms=200)
-        log_var.add_variable("kalman.varPX", "float")
-        log_var.add_variable("kalman.varPY", "float")
-        log_var.add_variable("kalman.varPZ", "float")
-        self.cf.log.add_config(log_var)
-        log_var.data_received_cb.add_callback(self._log_variance_callback)
-        log_var.start()
-
-    def _log_posvel_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
+    def _sample_for_recording(self):
         with self.lock:
-            self.current_pos = torch.tensor([
-                data["stateEstimate.x"],
-                data["stateEstimate.y"],
-                data["stateEstimate.z"]
-            ], dtype=torch.float32, device=device)
-            self.current_vel = torch.tensor([
-                data["stateEstimate.vx"],
-                data["stateEstimate.vy"],
-                data["stateEstimate.vz"]
-            ], dtype=torch.float32, device=device)
-            self._last_pos_time = time.time()
-            self.position_received = True
+            if self.last_obs is None:
+                return None
+            return {
+                "control_time": self.last_control_time,
+                "pos": self.current_pos.tolist(),
+                "vel": self.current_vel.tolist(),
+                "quat": self.current_quat.tolist(),
+                "target": target_pos.tolist() if target_pos is not None else None,
+                "obs": self.last_obs.tolist(),
+                "action": self.last_action.tolist(),
+                "cmd": self.last_cmd,
+                "motor": self.current_motor_pwm,
+            }
 
-    def _log_data_quat_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
+    def _sample_for_status(self):
         with self.lock:
-            self.current_quat = torch.tensor([
-                data['stateEstimate.qw'],
-                data['stateEstimate.qx'],
-                data['stateEstimate.qy'],
-                data['stateEstimate.qz'],
-            ], dtype=torch.float32, device=device)
+            if self.last_cmd is None:
+                return None
+            px, py, pz = self.current_pos.tolist()
+            vx_m, vy_m, vz_m = self.current_vel.tolist()
+            quat = self.current_quat.tolist()
+            dx, dy, dz = self.last_displacement.tolist()
+            desired_x, desired_y, desired_z = self.last_cmd
+            motor = self.current_motor_pwm
 
-    def _log_variance_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with self.lock:
-            self._pos_variance = torch.tensor([
-                data["kalman.varPX"],
-                data["kalman.varPY"],
-                data["kalman.varPZ"],
-            ], dtype=torch.float32, device=device)
-
-    def _emergency_land(self):
-        logger.warning("EMERGENCY LANDING triggered")
-        self.running = False
-        try:
-            self.cf.high_level_commander.land(0.0, 2.0)
-        except Exception as e:
-            logger.error(f"Emergency land command failed: {e}")
-            try:
-                self.cf.commander.send_stop_setpoint()
-            except Exception:
-                pass
+        roll, pitch, yaw = quat_to_euler_deg(quat)
+        state_line = (
+            f"State: pos=({px:+.2f}, {py:+.2f}, {pz:+.2f}) m "
+            f"vel=({vx_m:+.2f}, {vy_m:+.2f}, {vz_m:+.2f}) m/s "
+            f"rpy=({roll:+.1f}, {pitch:+.1f}, {yaw:+.1f})°"
+        )
+        cmd_line = (
+            f"Cmd: d=({dx:+.3f}, {dy:+.3f}, {dz:+.3f}) m -> "
+            f"desired_pos=({desired_x:+.2f}, {desired_y:+.2f}, {desired_z:+.2f}) "
+            f"| PWM: m1={motor[0]} m2={motor[1]} m3={motor[2]} m4={motor[3]}"
+        )
+        return state_line, cmd_line
 
     # ---------- Control loop ----------
 
@@ -227,19 +224,19 @@ class CrazyflieController:
             z = self.current_pos[2].item()
             if (elapsed_since_nn > GRACE_PERIOD and z < 0.1) or z > 2.5:
                 logger.error(f"Position out of bounds z={z:.2f} — emergency landing")
-                self._emergency_land()
+                emergency_land(self)
                 break
             if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
                 logger.error(
                     f"Position data stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
                 )
-                self._emergency_land()
+                emergency_land(self)
                 break
             with self.lock:
                 var = self._pos_variance.clone()
             if var.max().item() > POS_VARIANCE_THRESHOLD:
                 logger.error(f"Position variance too high {var.tolist()} — emergency landing")
-                self._emergency_land()
+                emergency_land(self)
                 break
 
             obs = retrieve_and_create_observation(self.current_vel, self.current_pos, self.current_quat)
@@ -259,11 +256,12 @@ class CrazyflieController:
 
             with self.lock:
                 desired_pos = self.current_pos + displacement
+                self.last_obs = obs
+                self.last_action = action
+                self.last_cmd = desired_pos.tolist()
+                self.last_displacement = displacement
+                self.last_control_time = time.time()
 
-            logger.info(
-                f"Cmd: dx={displacement[0].item():+.3f} dy={displacement[1].item():+.3f} "
-                f"dz={displacement[2].item():+.3f} m  -> pos={desired_pos}  | cur={self.current_pos}"
-            )
             # send_position_setpoint uses the firmware's full cascade PID
             # (position → velocity → attitude → rate → mixer), matching
             # sim's command_level="position"
@@ -294,6 +292,9 @@ class CrazyflieController:
         self.cf.high_level_commander.land(0.0, 2.0)
         time.sleep(2.5)
         self.cf.close_link()
+        if self.recorder:
+            self.recorder.close()
+        self.flight_logger.close()
         logger.info("Link closed")
 
 
@@ -321,24 +322,6 @@ def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> O
     obs = torch.cat([linear_vel_b, desired_pos_b], dim=-1)
     return obs
 
-
-def quat_apply(quat, vec):
-    shape = vec.shape
-    quat = quat.reshape(-1, 4)
-    vec = vec.reshape(-1, 3)
-    xyz = quat[:, 1:]
-    t = xyz.cross(vec, dim=-1) * 2
-    return (vec + quat[:, 0:1] * t + xyz.cross(t, dim=-1)).view(shape)
-
-
-def quat_conjugate(q):
-    shape = q.shape
-    q = q.reshape(-1, 4)
-    return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1).view(shape)
-
-
-def quat_inv(q, eps=1e-9):
-    return quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
 
 # ============================================================
 #                    MODEL LOADING / MAIN
@@ -373,11 +356,19 @@ def main():
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8", help="URI of the Crazyflie")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
+    parser.add_argument("--record-path", type=str, default=None,
+                        help="Parquet file path to record flight data to. If not set, recording is disabled.")
+    parser.add_argument("--record-interval", type=float, default=0.1,
+                        help="Interval in seconds between recorded rows (independent of the 100Hz control loop).")
+    parser.add_argument("--log-interval", type=float, default=1.0,
+                        help="Interval in seconds between terminal status lines (independent of the 100Hz control loop).")
     args = parser.parse_args()
 
     agent = load_agent(args.checkpoint, device)
 
-    controller = CrazyflieController(uri=args.uri, agent=agent, initial_target=args.target)
+    controller = CrazyflieController(uri=args.uri, agent=agent, initial_target=args.target,
+                                      record_path=args.record_path, record_interval_s=args.record_interval,
+                                      log_interval_s=args.log_interval)
 
     try:
         controller.start()
