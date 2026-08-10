@@ -13,25 +13,23 @@ Make sure you have the following available:
 
 1. Install the Lighthouse positioning deck on the Crazyflie, following [Getting started with expansion decks](https://www.bitcraze.io/documentation/tutorials/getting-started-with-expansion-decks/).
 
-2. Create a conda venv on your machine for the deployment.
+2. Create a Python virtual environment on your machine for the deployment, either a conda venv or a [`uv`](https://docs.astral.sh/uv/getting-started/installation/) venv.
 
-3. Install `uv` in your conda env via pip, following [Installing uv](https://docs.astral.sh/uv/getting-started/installation/).
+3. Install `cfclient` via pip or from source, following [Installation of the cfclient](https://www.bitcraze.io/documentation/repository/crazyflie-clients-python/master/installation/install/).
 
-4. Install `cfclient` via pip or from source, following [Installation of the cfclient](https://www.bitcraze.io/documentation/repository/crazyflie-clients-python/master/installation/install/).
-
-5. Install CrazyPlayGround from source with the `all` extra ([repo](https://github.com/JulienHansen/CrazyPlayGround)). The `deploy` extra alone isn't sufficient yet.
+4. Install CrazyPlayGround from source with the `all` extra ([repo](https://github.com/JulienHansen/CrazyPlayGround)). The `deploy` extra alone isn't sufficient yet.
 
    <!-- pip install -e "source/CrazyPlayGround[deploy]", radio permissions/udev -->
 
-6. Install and configure the Lighthouse base stations' channel, if not already done.
+5. Install and configure the Lighthouse base stations' channel, if not already done.
 
-7. Make sure the Crazyradio has the latest firmware installed, following [Getting started with the Crazyradio 2.0](https://www.bitcraze.io/documentation/tutorials/getting-started-with-crazyradio-2-0/).
+6. Make sure the Crazyradio has the latest firmware installed, following [Getting started with the Crazyradio 2.0](https://www.bitcraze.io/documentation/tutorials/getting-started-with-crazyradio-2-0/).
 
-8. If the Crazyflie isn't configured yet, plug it in over USB and configure it with the Crazyflie client: set it to 2 Mbit radio mode and note its address — you'll need this to connect to it via the Crazyradio.
+7. If the Crazyflie isn't configured yet, plug it in over USB and configure it with the Crazyflie client: set it to 2 Mbit radio mode and note its address — you'll need this to connect to it via the Crazyradio.
 
-9. Flash the firmware on the Crazyflie.
+8. Flash the firmware on the Crazyflie.
 
-10. Follow the [Getting started with Lighthouse](https://www.bitcraze.io/documentation/tutorials/getting-started-with-lighthouse/) tutorial from "Wait for calibration of the base stations" through "Take off and fly" to calibrate the Lighthouse system and make your first test flight.
+9. Follow the [Getting started with Lighthouse](https://www.bitcraze.io/documentation/tutorials/getting-started-with-lighthouse/) tutorial from "Wait for calibration of the base stations" through "Take off and fly" to calibrate the Lighthouse system and make your first test flight.
 
 ## Exporting a trained policy
 
