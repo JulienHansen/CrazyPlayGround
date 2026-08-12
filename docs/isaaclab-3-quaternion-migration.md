@@ -11,38 +11,6 @@ CrazyPlayGround currently pins **IsaacLab 2.3.2** (`docker/Dockerfile`, `README.
 correctly uses **WXYZ** today — there is no bug and nothing needs to change while pinned to 2.3.2.
 This document exists so that whoever upgrades past IsaacLab 3.0 knows exactly what to check.
 
-## Affected sites (WXYZ today, must be re-verified on upgrade)
-
-**Core shared utilities**
-- `execution/single_drone_exec/common/utils.py` — `quat_apply`, `quat_conjugate`, `quat_inv`, and the telemetry callback that builds `current_quat`
-- `execution/single_drone_exec/common/flight_logger.py` — `quat_to_euler_deg`
-- `execution/single_drone_exec/common/flight_recorder.py` — `quat_w/x/y/z` Parquet columns
-- `source/CrazyPlayGround/CrazyPlayGround/controllers/utils/math_utils.py` — standalone reimplementation kept convention-compatible with IsaacLab
-- `source/CrazyPlayGround/CrazyPlayGround/controllers/cascade_pid.py` — `root_state` layout assumptions
-
-**IsaacLab task/env files** (each imports `isaaclab.utils.math` directly)
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/drone_racing/drone_racing.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/drone_racing_marl/drone_racing_marl.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/fly_through/fly_through_env.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/hovering/att_hovering.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/hovering/vel_hovering.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/hovering/pos_hovering.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/hovering/rate_hovering.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/hovering/test_hovering.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/track/trajectories.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/track/tracking_env.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/formation/formation_env.py`
-- `source/CrazyPlayGround/CrazyPlayGround/tasks/direct/teleoperation/teleop_env.py`
-
-**Execution scripts** (several carry independent local copies of `quat_apply`/`quat_conjugate`/`quat_inv`)
-- `execution/single_drone_exec/hover/exec_att.py`, `exec_pos.py`, `exec_vel.py` (import the shared `common/utils.py` implementation)
-- `execution/single_drone_exec/hover/exec_rate.py` (local `quat_to_rotmat_flat`, cross-referenced against `isaaclab.utils.math.matrix_from_quat`)
-- `execution/single_drone_exec/traj_tracking/exec_pos.py`, `exec_vel.py`, `exec_att.py`
-- `execution/multi_drones_exec/traj_tracking/exec_pos.py`, `exec_vel.py`, `exec_att.py`
-
-**Teleoperation**
-- `scripts/teleoperation/teleop_drone.py`
-
 ## Checklist for upgrading past IsaacLab 3.0
 
 1. Run IsaacLab's own quaternion-finder migration tool against this repo first: [`scripts/tools/find_quaternions.py`](https://github.com/isaac-sim/IsaacLab/blob/main/scripts/tools/find_quaternions.py) in the IsaacLab repo (e.g. `python tools/find_quaternions.py --path <this-repo> --check-identity`). See the [migration guide](https://isaac-sim.github.io/IsaacLab/develop/source/migration/migrating_to_isaaclab_3-0.html) for full usage.
