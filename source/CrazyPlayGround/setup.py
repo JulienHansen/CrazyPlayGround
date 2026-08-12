@@ -25,7 +25,7 @@ INSTALL_REQUIRES = [
 
 EXTRAS_REQUIRE = {
     "rl":["skrl>=2.1.0", "rsl-rl-lib>=5.2.0", "stable-baselines3>=2.8.0", "rl-games>=1.6.1", "wandb>=0.26.1"],
-    "deploy":["cflib>=0.1.32", "pyarrow>=14.0"],
+    "deploy":["cflib>=0.1.32"],
     "teleop":["pygame>=2.6"],
     "docs":["mkdocs-material>=9.5"],
 }
