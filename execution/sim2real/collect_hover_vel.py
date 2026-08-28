@@ -31,6 +31,7 @@ Conventions (must match vel_hovering.py):
 
 import os
 import csv
+import math
 import json
 import time
 import hashlib
@@ -150,8 +151,9 @@ class CollectingController:
     def __init__(self, uri: str, agent: PPO, run_dir: str, meta: dict,
                  initial_target=None, duration: Optional[float] = None,
                  roam: bool = False, fast_rate_hz: int = 100, history_len: int = 1,
-                 action_hist_len: int = 0):
+                 action_hist_len: int = 0, excite: dict | None = None):
         self.uri = uri
+        self.excite = excite or {"mode": "none"}
         self.history_len = max(1, int(history_len))
         self.action_hist_len = max(0, int(action_hist_len))
         self._obs_hist: list = []
@@ -300,6 +302,29 @@ class CollectingController:
             except Exception:
                 pass
 
+    def _record(self, step, loop_start, obs, action, velocity_cmd, tgt, dist,
+                pos, vel, quat, gyro, acc, motor, vbat, varp, now_start=None):
+        """Append one time-aligned row (shared by the policy and excitation paths)."""
+        now = time.time()
+        self.records.append({
+            "t_mono": now - loop_start, "t_wall": now, "step": step,
+            "obs_vb_x": obs[0].item(), "obs_vb_y": obs[1].item(), "obs_vb_z": obs[2].item(),
+            "obs_errb_x": obs[3].item(), "obs_errb_y": obs[4].item(), "obs_errb_z": obs[5].item(),
+            "act_x": action[0].item(), "act_y": action[1].item(), "act_z": action[2].item(),
+            "cmd_vx": velocity_cmd[0].item(), "cmd_vy": velocity_cmd[1].item(),
+            "cmd_vz": velocity_cmd[2].item(), "cmd_yawrate": 0.0,
+            "tgt_x": tgt[0].item(), "tgt_y": tgt[1].item(), "tgt_z": tgt[2].item(),
+            "pos_x": pos[0].item(), "pos_y": pos[1].item(), "pos_z": pos[2].item(),
+            "vel_x": vel[0].item(), "vel_y": vel[1].item(), "vel_z": vel[2].item(),
+            "qw": quat[0].item(), "qx": quat[1].item(), "qy": quat[2].item(), "qz": quat[3].item(),
+            "gyro_x": gyro[0], "gyro_y": gyro[1], "gyro_z": gyro[2],
+            "acc_x": acc[0], "acc_y": acc[1], "acc_z": acc[2],
+            "m1": motor[0], "m2": motor[1], "m3": motor[2], "m4": motor[3],
+            "vbat": vbat,
+            "varPX": varp[0].item(), "varPY": varp[1].item(), "varPZ": varp[2].item(),
+            "dist_to_target": dist,
+        })
+
     # ---------- Control loop ----------
 
     def control_loop(self):
@@ -367,6 +392,28 @@ class CollectingController:
                 time.sleep(INTERVAL)
                 continue
 
+            # ── OL-2: open-loop system identification ────────────────────────
+            # The command is a known exogenous signal, NOT a function of the state,
+            # so the command->response lag is a valid estimate of the loop dead time.
+            # (In closed loop the policy reacts to the state it caused, and the
+            # apparent lag collapses onto the limit-cycle geometry instead.)
+            if self.excite["mode"] != "none":
+                te = time.time() - loop_start
+                a_ex = excitation_value(self.excite, te)
+                action = torch.zeros(3, dtype=torch.float32, device=device)
+                action[self.excite["axis"]] = a_ex
+                velocity_cmd = action * MAX_VELOCITY
+                self.cf.commander.send_velocity_world_setpoint(
+                    velocity_cmd[0].item(), velocity_cmd[1].item(), velocity_cmd[2].item(), 0.0)
+                self._record(step, now_start=start_time, loop_start=loop_start, obs=obs,
+                             action=action, velocity_cmd=velocity_cmd, tgt=tgt, dist=dist,
+                             pos=pos, vel=vel, quat=quat, gyro=gyro, acc=acc,
+                             motor=motor, vbat=vbat, varp=varp)
+                step += 1
+                elapsed = time.time() - start_time
+                time.sleep(max(0, INTERVAL - elapsed))
+                continue
+
             # Frame stacking for policies trained with env.history_len=K>1. The
             # window is primed with the first observation so the very first control
             # step is not fed zeros. Oldest first, newest last -- same order as
@@ -401,25 +448,10 @@ class CollectingController:
             self.cf.commander.send_velocity_world_setpoint(
                 velocity_cmd[0].item(), velocity_cmd[1].item(), velocity_cmd[2].item(), 0.0)
 
-            now = time.time()
-            self.records.append({
-                "t_mono": now - loop_start, "t_wall": now, "step": step,
-                "obs_vb_x": obs[0].item(), "obs_vb_y": obs[1].item(), "obs_vb_z": obs[2].item(),
-                "obs_errb_x": obs[3].item(), "obs_errb_y": obs[4].item(), "obs_errb_z": obs[5].item(),
-                "act_x": action[0].item(), "act_y": action[1].item(), "act_z": action[2].item(),
-                "cmd_vx": velocity_cmd[0].item(), "cmd_vy": velocity_cmd[1].item(),
-                "cmd_vz": velocity_cmd[2].item(), "cmd_yawrate": 0.0,
-                "tgt_x": tgt[0].item(), "tgt_y": tgt[1].item(), "tgt_z": tgt[2].item(),
-                "pos_x": pos[0].item(), "pos_y": pos[1].item(), "pos_z": pos[2].item(),
-                "vel_x": vel[0].item(), "vel_y": vel[1].item(), "vel_z": vel[2].item(),
-                "qw": quat[0].item(), "qx": quat[1].item(), "qy": quat[2].item(), "qz": quat[3].item(),
-                "gyro_x": gyro[0], "gyro_y": gyro[1], "gyro_z": gyro[2],
-                "acc_x": acc[0], "acc_y": acc[1], "acc_z": acc[2],
-                "m1": motor[0], "m2": motor[1], "m3": motor[2], "m4": motor[3],
-                "vbat": vbat,
-                "varPX": varp[0].item(), "varPY": varp[1].item(), "varPZ": varp[2].item(),
-                "dist_to_target": dist,
-            })
+            self._record(step, loop_start=loop_start, obs=obs, action=action,
+                         velocity_cmd=velocity_cmd, tgt=tgt, dist=dist,
+                         pos=pos, vel=vel, quat=quat, gyro=gyro, acc=acc,
+                         motor=motor, vbat=vbat, varp=varp)
             step += 1
 
             elapsed = time.time() - start_time
@@ -477,6 +509,33 @@ class CollectingController:
         with open(os.path.join(self.run_dir, "metadata.json"), "w") as f:
             json.dump(self.meta, f, indent=2, default=str)
         logger.info(f"Wrote {os.path.join(self.run_dir, 'metadata.json')}")
+
+
+# ============================================================
+#                 OPEN-LOOP EXCITATION (protocol OL-2)
+# ============================================================
+
+def excitation_value(spec: dict, t: float) -> float:
+    """Exogenous command at time t, normalised to [-1, 1].
+
+    A chirp sweeps frequency so one flight covers the whole band: the phase slope of
+    the command->response transfer gives the group delay directly. A square wave gives
+    a cleaner single-edge rise-time reading. Either way the command does not depend on
+    the measured state, which is what makes the resulting lag a valid delay estimate.
+    """
+    mode, A, T = spec["mode"], spec["amp"], spec["dur"]
+    if t < spec["settle"]:
+        return 0.0
+    te = t - spec["settle"]
+    if mode == "chirp":
+        f0, f1 = spec["f0"], spec["f1"]
+        T = max(T - spec["settle"], 1e-6)
+        phase = 2.0 * math.pi * (f0 * te + (f1 - f0) * te * te / (2.0 * T))
+        return A * math.sin(phase)
+    if mode == "step":
+        period = spec.get("step_period", 1.5)
+        return A if int(te / period) % 2 == 0 else -A
+    return 0.0
 
 
 # ============================================================
@@ -591,8 +650,8 @@ def build_metadata(args, checkpoint_path) -> dict:
         "controller": "velocity",
         "task": "Vel-Hovering",
         "command_primitive": "send_velocity_world_setpoint(vx, vy, vz, yaw_rate=0)",
-        "checkpoint_path": os.path.abspath(checkpoint_path),
-        "checkpoint_sha256": _sha256(checkpoint_path),
+        "checkpoint_path": os.path.abspath(checkpoint_path) if checkpoint_path else None,
+        "checkpoint_sha256": _sha256(checkpoint_path) if checkpoint_path else None,
         "git_commit": _git_commit(),
         "uri": args.uri,
         "seed": args.seed,
@@ -635,7 +694,8 @@ def build_metadata(args, checkpoint_path) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Collect sim2real data while flying the velocity hover policy.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to the skrl model checkpoint (.pt)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to the skrl model checkpoint (.pt). Not needed with --excite.")
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8", help="URI of the Crazyflie")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Fixed target [x y z] world frame. Default: hover above takeoff position.")
@@ -646,6 +706,14 @@ def main():
     parser.add_argument("--history-len", type=int, default=1,
                         help="Observation window length K; must match env.history_len the policy "
                              "was trained with (1 = no stacking).")
+    parser.add_argument("--excite", choices=["none", "chirp", "step"], default="none",
+                        help="Open-loop system identification (OL-2): replace the policy with a "
+                             "known exogenous command so the response lag measures real dead time.")
+    parser.add_argument("--excite-axis", choices=["x", "y", "z"], default="x")
+    parser.add_argument("--excite-amp", type=float, default=0.3, help="Amplitude in [0,1] of max_velocity.")
+    parser.add_argument("--excite-f0", type=float, default=0.2, help="Chirp start frequency [Hz].")
+    parser.add_argument("--excite-f1", type=float, default=4.0, help="Chirp end frequency [Hz].")
+    parser.add_argument("--excite-settle", type=float, default=2.0, help="Quiet hover before exciting [s].")
     parser.add_argument("--action-hist-len", type=int, default=0,
                         help="Number of past commanded actions in the observation; must match "
                              "env.action_hist_len the policy was trained with (0 = none).")
@@ -669,14 +737,25 @@ def main():
         run_name += f"_{args.tag}"
     run_dir = os.path.join(args.outdir, run_name)
 
-    agent = load_agent(args.checkpoint, device, args.history_len, args.action_hist_len)
+    excite = {"mode": args.excite, "axis": {"x": 0, "y": 1, "z": 2}[args.excite_axis],
+              "amp": args.excite_amp, "f0": args.excite_f0, "f1": args.excite_f1,
+              "settle": args.excite_settle, "dur": args.duration or 20.0}
+
+    if args.excite == "none":
+        if not args.checkpoint:
+            parser.error("--checkpoint is required unless --excite is used")
+        agent = load_agent(args.checkpoint, device, args.history_len, args.action_hist_len)
+    else:
+        agent = None
+        logger.info(f"OPEN-LOOP {args.excite} on {args.excite_axis}: the policy is NOT used")
     meta = build_metadata(args, args.checkpoint)
+    meta["excitation"] = excite
 
     controller = CollectingController(
         uri=args.uri, agent=agent, run_dir=run_dir, meta=meta,
         initial_target=args.target, duration=duration, roam=args.roam,
         fast_rate_hz=args.log_rate_hz, history_len=args.history_len,
-        action_hist_len=args.action_hist_len)
+        action_hist_len=args.action_hist_len, excite=excite)
 
     logger.info(f"Run directory: {run_dir}")
     try:
