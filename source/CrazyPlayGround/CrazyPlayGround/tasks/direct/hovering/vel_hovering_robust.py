@@ -1,25 +1,29 @@
 """Robustness-oriented variant of the velocity hovering environment.
 
-Extends :mod:`vel_hovering` with three sim-to-real knobs, all disabled by default
-so the environment behaves exactly like ``Vel-Hovering`` unless overridden:
+Extends :mod:`vel_hovering` with the sim-to-real knobs, all disabled by default so
+the environment behaves exactly like ``Vel-Hovering`` unless overridden:
 
-1. **Observation noise** -- reuses the base ``add_noise`` / ``noise_std``.
-2. **External disturbances** -- a per-episode constant force/torque bias plus
-   random intra-episode gusts (decaying impulses), applied as an external wrench
-   in the body frame on top of the controller output.
-3. **Observation history window** -- the policy sees the last ``history_len``
-   observations concatenated, giving it the temporal context needed to infer the
-   disturbance/noise it is subject to (implicit online adaptation).
+1. **Observation noise** -- white or temporally correlated (AR(1)), with an optional
+   per-episode bias. Real EKF error is correlated and biased, not white; white noise
+   is unrealistically easy to filter by temporal averaging.
+2. **External disturbances** -- per-episode constant force/torque bias plus random
+   intra-episode gusts (decaying impulses), applied as an external wrench in the body
+   frame on top of the controller output.
+3. **Observation history window** -- the last ``history_len`` observations.
+4. **Action history** -- the last ``action_hist_len`` commanded actions. Without this
+   the policy cannot perceive its own previous command, so it can neither regulate its
+   step-to-step change directly nor infer a disturbance (which needs the residual
+   between what was commanded and what happened).
+5. **Loop latency** -- ``action_latency_steps`` delays the applied command, modelling
+   radio + estimator dead time. Delay plus high gain is the classic cause of the
+   limit-cycle chatter observed on hardware.
 
-Motivation: the measured sim-to-real gap on the real Crazyflie was concentrated in
-control smoothness -- the deployed policy chattered its velocity command ~10x more
-on hardware than in sim -- because it was trained on noiseless observations and
-undisturbed dynamics. An optional ``action_rate_reward_scale`` penalty directly
-discourages that chatter.
+Observation layout (all oldest-first):
+    [ history_len x (lin_vel_b(3), desired_pos_b(3)) ,  action_hist_len x action(3) ]
+    observation_space = 6 * history_len + 3 * action_hist_len
 
-A K-step window multiplies the observation size, so ``observation_space`` becomes
-``6 * history_len``; the skrl/rsl_rl configs size their input layers from this
-field automatically, so no agent-config change is needed.
+The skrl/rsl_rl configs size their input layers from ``observation_space``, so no
+agent-config change is needed.
 """
 
 from __future__ import annotations
@@ -27,68 +31,81 @@ from __future__ import annotations
 import torch
 
 from isaaclab.utils import configclass
+from isaaclab.utils.math import subtract_frame_transforms
 
 from .vel_hovering import QuadcopterEnv as _BaseQuadcopterEnv
 from .vel_hovering import QuadcopterEnvCfg as _BaseQuadcopterEnvCfg
 
-BASE_OBS_DIM = 6  # [lin_vel_b(3), desired_pos_b(3)]
+BASE_OBS_DIM = 6   # [lin_vel_b(3), desired_pos_b(3)]
+ACTION_DIM = 3     # [vx, vy, vz]
 
 
 @configclass
 class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
-    """Velocity hovering cfg with noise / disturbance / history knobs."""
+    """Velocity hovering cfg with noise / disturbance / history / latency knobs."""
 
     # ── Observation history (frame stacking) ─────────────────────────────────
-    # 1 = no stacking (identical to Vel-Hovering).
-    history_len: int = 1
+    history_len: int = 1          # 1 = no stacking (identical to Vel-Hovering)
+
+    # ── Action history ───────────────────────────────────────────────────────
+    action_hist_len: int = 0      # 0 = policy does not see its previous commands
+
+    # ── Loop latency ─────────────────────────────────────────────────────────
+    # Policy steps of dead time between commanding an action and it being applied.
+    # At 100 Hz, 2 steps = 20 ms (radio + estimator lag is of this order).
+    action_latency_steps: int = 0
+
+    # ── Observation noise shape ──────────────────────────────────────────────
+    # noise_corr: AR(1) coefficient. 0.0 = white (default), 0.9 = strongly correlated.
+    noise_corr: float = 0.0
+    # Per-episode constant observation bias, as a std (0 = unbiased).
+    noise_bias_std: float = 0.0
 
     # ── External disturbances ────────────────────────────────────────────────
     disturb: bool = False
-    # Per-episode constant wrench bias (body frame). Crazyflie weight ~0.265 N,
-    # so 0.02 N is ~7.5% of weight -- a meaningful but survivable bias.
-    disturb_force_bias_range: tuple[float, float] = (-0.02, 0.02)      # N, per axis
-    disturb_torque_bias_range: tuple[float, float] = (-2.0e-4, 2.0e-4)  # N.m, per axis
-    # Intra-episode gusts: with this probability per policy step a new impulse is
-    # drawn, then decays geometrically.
-    disturb_gust_prob: float = 0.0
-    disturb_gust_force_range: tuple[float, float] = (-0.06, 0.06)       # N, per axis
-    disturb_gust_torque_range: tuple[float, float] = (-6.0e-4, 6.0e-4)  # N.m, per axis
-    disturb_gust_decay: float = 0.92                                     # per policy step
+    # Crazyflie weight ~0.265 N, so 0.02 N is ~7.5% of weight.
+    disturb_force_bias_range: tuple[float, float] = (-0.02, 0.02)       # N per axis
+    disturb_torque_bias_range: tuple[float, float] = (-2.0e-4, 2.0e-4)  # N.m per axis
+    disturb_gust_prob: float = 0.0                                       # per policy step
+    disturb_gust_force_range: tuple[float, float] = (-0.06, 0.06)
+    disturb_gust_torque_range: tuple[float, float] = (-6.0e-4, 6.0e-4)
+    disturb_gust_decay: float = 0.92
 
     # ── Anti-chatter ─────────────────────────────────────────────────────────
-    # Penalty on ||a_t - a_{t-1}||^2. Negative = penalty (same sign convention as
-    # the other reward scales).
+    # Penalty on ||a_t - a_{t-1}||^2. Negative = penalty.
     action_rate_reward_scale: float = 0.0
 
     def __post_init__(self):
-        # DirectRLEnvCfg/configclass may or may not define __post_init__.
         parent_post = getattr(super(), "__post_init__", None)
         if callable(parent_post):
             parent_post()
         if self.history_len < 1:
             raise ValueError(f"history_len must be >= 1, got {self.history_len}")
-        self.observation_space = BASE_OBS_DIM * self.history_len
+        if self.action_hist_len < 0:
+            raise ValueError(f"action_hist_len must be >= 0, got {self.action_hist_len}")
+        if self.action_latency_steps < 0:
+            raise ValueError(f"action_latency_steps must be >= 0, got {self.action_latency_steps}")
+        self.observation_space = BASE_OBS_DIM * self.history_len + ACTION_DIM * self.action_hist_len
 
 
 class RobustQuadcopterEnv(_BaseQuadcopterEnv):
-    """Velocity hovering with observation history and external disturbances."""
+    """Velocity hovering with observation/action history, latency and disturbances."""
 
     cfg: RobustQuadcopterEnvCfg
 
     def __init__(self, cfg: RobustQuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
-        # `__post_init__` runs when the cfg object is built, i.e. BEFORE Hydra applies
-        # `env.history_len=K` from the CLI, so recompute here (this runs after all
-        # overrides and before DirectRLEnv reads cfg.observation_space to build the
-        # gym spaces). Getting this wrong makes skrl reinterpret [N, 6K] as [N*K, 6].
+        # `__post_init__` runs when the cfg is built, i.e. BEFORE Hydra applies CLI
+        # overrides, so recompute here -- this runs after all overrides and before
+        # DirectRLEnv reads cfg.observation_space. Getting it wrong makes skrl
+        # reinterpret [N, D] as [N*x, D/x].
         if int(cfg.history_len) < 1:
             raise ValueError(f"history_len must be >= 1, got {cfg.history_len}")
-        cfg.observation_space = BASE_OBS_DIM * int(cfg.history_len)
+        cfg.observation_space = (BASE_OBS_DIM * int(cfg.history_len)
+                                 + ACTION_DIM * int(cfg.action_hist_len))
 
         super().__init__(cfg, render_mode, **kwargs)
 
-        self._k = int(self.cfg.history_len)
         self._ensure_buffers()
-
         self._prev_actions = torch.zeros_like(self._actions)
         if self.cfg.action_rate_reward_scale != 0.0:
             self._episode_sums["action_rate"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -96,17 +113,26 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
     # ---------- buffers ----------
 
     def _ensure_buffers(self):
-        """Allocate history / disturbance buffers (lazily: base __init__ may call
-        into _reset_idx or _get_observations before our __init__ body runs)."""
+        """Allocate buffers lazily: the base __init__ may reach _reset_idx or
+        _get_observations before our __init__ body runs."""
         if getattr(self, "_buffers_ready", False):
             return
-        k = int(getattr(self.cfg, "history_len", 1))
-        self._k = k
-        self._obs_hist = torch.zeros(self.num_envs, k, BASE_OBS_DIM, device=self.device)
-        self._dist_force = torch.zeros(self.num_envs, 3, device=self.device)
-        self._dist_torque = torch.zeros(self.num_envs, 3, device=self.device)
-        self._gust_force = torch.zeros(self.num_envs, 3, device=self.device)
-        self._gust_torque = torch.zeros(self.num_envs, 3, device=self.device)
+        n, dev = self.num_envs, self.device
+        self._k = int(getattr(self.cfg, "history_len", 1))
+        self._m = int(getattr(self.cfg, "action_hist_len", 0))
+        self._d = int(getattr(self.cfg, "action_latency_steps", 0))
+
+        self._obs_hist = torch.zeros(n, self._k, BASE_OBS_DIM, device=dev)
+        self._act_hist = torch.zeros(n, max(self._m, 1), ACTION_DIM, device=dev)
+        self._act_delay = torch.zeros(n, max(self._d, 1), ACTION_DIM, device=dev)
+
+        self._noise_state = torch.zeros(n, BASE_OBS_DIM, device=dev)
+        self._noise_bias = torch.zeros(n, BASE_OBS_DIM, device=dev)
+
+        self._dist_force = torch.zeros(n, 3, device=dev)
+        self._dist_torque = torch.zeros(n, 3, device=dev)
+        self._gust_force = torch.zeros(n, 3, device=dev)
+        self._gust_torque = torch.zeros(n, 3, device=dev)
         self._buffers_ready = True
 
     @staticmethod
@@ -114,40 +140,84 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         lo, hi = rng
         return torch.empty(*shape, device=device).uniform_(lo, hi)
 
-    # ---------- observation window ----------
+    # ---------- observation ----------
+
+    def _base_obs(self) -> torch.Tensor:
+        """Clean 6-D observation (same content as the base env, before noise)."""
+        desired_pos_b, _ = subtract_frame_transforms(
+            self._robot.data.root_pos_w,
+            self._robot.data.root_quat_w,
+            self._desired_pos_w,
+        )
+        return torch.cat([self._robot.data.root_lin_vel_b, desired_pos_b], dim=-1)
+
+    def _noisy_obs(self) -> torch.Tensor:
+        obs = self._base_obs()
+        if not self.cfg.add_noise:
+            return obs
+        rho = float(self.cfg.noise_corr)
+        eps = torch.randn_like(obs)
+        if rho > 0.0:
+            # AR(1): correlated in time, unit stationary variance
+            self._noise_state = rho * self._noise_state + (1.0 - rho ** 2) ** 0.5 * eps
+            n = self._noise_state
+        else:
+            n = eps
+        return obs + n * self.cfg.noise_std + self._noise_bias
 
     def _get_observations(self) -> dict:
-        base = super()._get_observations()["policy"]  # [N, 6], noise already applied
         self._ensure_buffers()
-        if self._k == 1:
-            return {"policy": base}
-        # oldest first, newest last
-        self._obs_hist = torch.roll(self._obs_hist, shifts=-1, dims=1)
-        self._obs_hist[:, -1, :] = base
-        return {"policy": self._obs_hist.reshape(self.num_envs, self._k * BASE_OBS_DIM)}
+        base = self._noisy_obs()
 
-    # ---------- disturbances ----------
+        if self._k == 1:
+            obs_part = base
+        else:
+            self._obs_hist = torch.roll(self._obs_hist, shifts=-1, dims=1)
+            self._obs_hist[:, -1, :] = base
+            obs_part = self._obs_hist.reshape(self.num_envs, self._k * BASE_OBS_DIM)
+
+        if self._m > 0:
+            act_part = self._act_hist[:, -self._m:, :].reshape(self.num_envs, self._m * ACTION_DIM)
+            return {"policy": torch.cat([obs_part, act_part], dim=-1)}
+        return {"policy": obs_part}
+
+    # ---------- action: history, latency, disturbances ----------
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        self._ensure_buffers()
         self._prev_actions = self._actions.clone()
-        super()._pre_physics_step(actions)
+
+        commanded = actions.clone().clamp(-1.0, 1.0)
+
+        # record what the policy commanded (this is what the real deploy script knows)
+        if self._m > 0:
+            self._act_hist = torch.roll(self._act_hist, shifts=-1, dims=1)
+            self._act_hist[:, -1, :] = commanded
+
+        # loop dead time: apply the command issued `d` steps ago
+        if self._d > 0:
+            applied = self._act_delay[:, 0, :].clone()
+            self._act_delay = torch.roll(self._act_delay, shifts=-1, dims=1)
+            self._act_delay[:, -1, :] = commanded
+        else:
+            applied = commanded
+
+        super()._pre_physics_step(applied)
 
         if not self.cfg.disturb:
             return
-        self._ensure_buffers()
-        # decay any active gust, then possibly trigger a new one
         self._gust_force *= self.cfg.disturb_gust_decay
         self._gust_torque *= self.cfg.disturb_gust_decay
         if self.cfg.disturb_gust_prob > 0.0:
             fire = torch.rand(self.num_envs, device=self.device) < self.cfg.disturb_gust_prob
             if bool(fire.any()):
-                n = int(fire.sum())
-                self._gust_force[fire] = self._uniform((n, 3), self.cfg.disturb_gust_force_range, self.device)
-                self._gust_torque[fire] = self._uniform((n, 3), self.cfg.disturb_gust_torque_range, self.device)
+                k = int(fire.sum())
+                self._gust_force[fire] = self._uniform((k, 3), self.cfg.disturb_gust_force_range, self.device)
+                self._gust_torque[fire] = self._uniform((k, 3), self.cfg.disturb_gust_torque_range, self.device)
 
     def _apply_action(self):
         # Base fills self._thrust[:, 0, 2] / self._moment from the cascade PID and
-        # applies the wrench; we add the disturbance and re-apply (last call wins).
+        # applies the wrench; add the disturbance and re-apply (last call wins).
         super()._apply_action()
         if not self.cfg.disturb:
             return
@@ -181,12 +251,18 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         self._ensure_buffers()
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
+        n = len(env_ids)
 
         if hasattr(self, "_prev_actions"):
             self._prev_actions[env_ids] = 0.0
+        self._act_hist[env_ids] = 0.0
+        self._act_delay[env_ids] = 0.0
+        self._noise_state[env_ids] = 0.0
+        self._noise_bias[env_ids] = (
+            torch.randn(n, BASE_OBS_DIM, device=self.device) * self.cfg.noise_bias_std
+            if (self.cfg.add_noise and self.cfg.noise_bias_std > 0.0) else 0.0
+        )
 
-        # fresh per-episode disturbance bias; clear any in-flight gust
-        n = len(env_ids)
         if self.cfg.disturb:
             self._dist_force[env_ids] = self._uniform((n, 3), self.cfg.disturb_force_bias_range, self.device)
             self._dist_torque[env_ids] = self._uniform((n, 3), self.cfg.disturb_torque_bias_range, self.device)
@@ -196,8 +272,8 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         self._gust_force[env_ids] = 0.0
         self._gust_torque[env_ids] = 0.0
 
-        # prime the history with the post-reset observation so no stale frames from
-        # the previous episode leak across the reset boundary
+        # prime the observation window with the post-reset observation so no stale
+        # frames leak across the reset boundary
         if self._k > 1:
-            base = _BaseQuadcopterEnv._get_observations(self)["policy"]
+            base = self._base_obs()
             self._obs_hist[env_ids] = base[env_ids].unsqueeze(1).repeat(1, self._k, 1)

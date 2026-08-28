@@ -50,8 +50,9 @@ class Policy(GaussianMixin, Model):
         return mean, {"log_std": self.log_std_parameter}
 
 
-def load_agent(checkpoint_path, device, history_len=1):
-    obs_space, act_space = 6 * max(1, int(history_len)), 3
+def load_agent(checkpoint_path, device, history_len=1, action_hist_len=0):
+    obs_space = 6 * max(1, int(history_len)) + 3 * max(0, int(action_hist_len))
+    act_space = 3
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     cfg = PPO_CFG(observation_preprocessor=RunningStandardScaler,
                   observation_preprocessor_kwargs={"size": obs_space, "device": device})
@@ -63,9 +64,11 @@ def load_agent(checkpoint_path, device, history_len=1):
     return agent
 
 
-def act(agent, obs_list, device, history_len=1):
-    # A steady-state window is the same observation repeated K times.
-    obs = torch.tensor([list(obs_list) * max(1, int(history_len))], dtype=torch.float32, device=device)
+def act(agent, obs_list, device, history_len=1, action_hist_len=0):
+    # A steady-state window is the same observation repeated K times; the action
+    # history is left at zero (the policy has not commanded anything yet).
+    vec = list(obs_list) * max(1, int(history_len)) + [0.0] * (3 * max(0, int(action_hist_len)))
+    obs = torch.tensor([vec], dtype=torch.float32, device=device)
     with torch.no_grad():
         _, outputs = agent.act(obs, None, timestep=0, timesteps=1)
         a = outputs["mean_actions"].squeeze(0).clamp(-1.0, 1.0)
@@ -78,13 +81,15 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="cpu / cuda / mps. Default: auto.")
     parser.add_argument("--history-len", type=int, default=1,
                         help="Observation window K the policy was trained with (1 = no stacking).")
+    parser.add_argument("--action-hist-len", type=int, default=0,
+                        help="Past commanded actions M the policy was trained with (0 = none).")
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] device={device}, torch={torch.__version__}, history_len={args.history_len}")
 
-    agent = load_agent(args.checkpoint, device, args.history_len)
+    agent = load_agent(args.checkpoint, device, args.history_len, args.action_hist_len)
     print(f"[INFO] loaded {args.checkpoint}\n")
 
     # [lin_vel_b(x,y,z), desired_pos_b(x,y,z)]
@@ -99,15 +104,15 @@ def main():
     print(f"{'case':30s} {'action (vx,vy,vz)':>34s}   cmd [m/s]")
     ok = True
     for name, obs in cases:
-        a = act(agent, obs, device, args.history_len)
+        a = act(agent, obs, device, args.history_len, args.action_hist_len)
         cmd = [round(x * MAX_VELOCITY, 3) for x in a]
         print(f"{name:30s} {str([round(x,3) for x in a]):>34s}   {cmd}")
         if name.startswith("at target") and max(abs(x) for x in a) > 0.3:
             ok = False
     print()
     # directional sanity: command should point toward the target
-    ax = act(agent, [0, 0, 0, 0.5, 0, 0], device, args.history_len)[0]
-    az = act(agent, [0, 0, 0, 0, 0, 0.5], device, args.history_len)[2]
+    ax = act(agent, [0, 0, 0, 0.5, 0, 0], device, args.history_len, args.action_hist_len)[0]
+    az = act(agent, [0, 0, 0, 0, 0, 0.5], device, args.history_len, args.action_hist_len)[2]
     signs_ok = ax > 0 and az > 0
     print(f"[CHECK] +x target -> vx>0: {ax:+.3f}   |   +z target -> vz>0: {az:+.3f}")
     if ok and signs_ok:
