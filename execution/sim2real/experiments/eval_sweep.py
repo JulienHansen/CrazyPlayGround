@@ -42,14 +42,25 @@ TEST_CONDITION = {
     "env.disturb_gust_force_range": "[-0.08,0.08]",
     "env.disturb_gust_torque_range": "[-0.0008,0.0008]",
 }
+
+# v2 adds what the measured latency sweep showed reality actually has: loop dead time
+# (4 steps = 40 ms reproduces 75% of the hardware chatter) and correlated, biased
+# observation noise instead of white.
+TEST_CONDITION_V2 = dict(TEST_CONDITION, **{
+    "env.action_latency_steps": 4,
+    "env.action_latency_max": 4,
+    "env.noise_corr": 0.9,
+    "env.noise_bias_std": 0.01,
+})
 TARGETS = [(0.0, 0.0, 1.0), (1.0, 1.0, 1.0)]
 
 
-def run_eval(ckpt, history_len, target, duration, outdir, tag, extra_env_overrides):
+def run_eval(ckpt, history_len, target, duration, outdir, tag, extra_env_overrides,
+             action_hist_len=0):
     cmd = [PYTHON, EVAL, "--checkpoint", ckpt, "--task", "Vel-Hovering-Robust",
            "--target", *[str(t) for t in target], "--duration", str(duration),
            "--outdir", outdir, "--tag", tag, "--headless",
-           f"env.history_len={history_len}"]
+           f"env.history_len={history_len}", f"env.action_hist_len={action_hist_len}"]
     cmd += [f"{k}={v}" for k, v in extra_env_overrides.items()]
     env = dict(os.environ, WANDB_MODE="disabled")
     r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, env=env)
@@ -72,14 +83,21 @@ def metrics_for(run_glob):
 def main():
     p = argparse.ArgumentParser(description="Evaluate and rank the sweep's policies.")
     p.add_argument("--index", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_index.json"))
+    p.add_argument("--out-suffix", default="", help="Suffix for the leaderboard filename.")
     p.add_argument("--duration", type=float, default=15.0)
     p.add_argument("--chatter-weight", type=float, default=5.0)
     p.add_argument("--outroot", default=os.path.join(REPO, "execution", "sim2real", "data_sweep"))
-    p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "leaderboard.json"))
+    p.add_argument("--out", default=None)
     p.add_argument("--only", nargs="*", default=None)
     p.add_argument("--nominal", action="store_true",
                    help="Also evaluate under the nominal (clean) condition for reference.")
+    p.add_argument("--condition", choices=["v1", "v2"], default="v1",
+                   help="v1 = noise+disturbance (sweep 1). v2 = adds measured loop latency "
+                        "and correlated noise (use for sweep 2).")
     args = p.parse_args()
+    if args.out is None:
+        args.out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                f"leaderboard{args.out_suffix}.json")
 
     index = json.load(open(args.index))
     runs = {k: v for k, v in index["runs"].items() if v.get("checkpoint")}
@@ -87,18 +105,21 @@ def main():
         runs = {k: v for k, v in runs.items() if k in args.only}
     print(f"[INFO] evaluating {len(runs)} policies under the held-out test condition")
 
-    conditions = {"test": TEST_CONDITION}
+    conditions = {"test": TEST_CONDITION_V2 if args.condition == "v2" else TEST_CONDITION}
     if args.nominal:
-        conditions["nominal"] = {"env.add_noise": "False", "env.disturb": "False"}
+        conditions["nominal"] = {"env.add_noise": "False", "env.disturb": "False",
+                                 "env.action_latency_steps": 0, "env.action_latency_max": 0}
 
     rows = []
     for i, (tag, info) in enumerate(sorted(runs.items())):
         k = int(info["factors"]["history_len"])
+        m = int(info["factors"].get("action_hist_len", 0))
         row = {"tag": tag, **info["factors"]}
         for cond_name, cond in conditions.items():
             outdir = os.path.join(args.outroot, cond_name, tag)
             for ti, tgt in enumerate(TARGETS):
-                run_eval(info["checkpoint"], k, tgt, args.duration, outdir, f"t{ti}", cond)
+                run_eval(info["checkpoint"], k, tgt, args.duration, outdir, f"t{ti}", cond,
+                         action_hist_len=m)
             ms = metrics_for(os.path.join(outdir, "*"))
             if not ms:
                 row[f"{cond_name}_ok"] = False
@@ -131,7 +152,8 @@ def main():
               f"{r['test_chatter']:>8.5f} {r['test_crash_rate']:>6.2f} {r['score']:>7.4f}")
 
     with open(args.out, "w") as f:
-        json.dump({"chatter_weight": args.chatter_weight, "condition": TEST_CONDITION,
+        json.dump({"chatter_weight": args.chatter_weight, "condition_name": args.condition,
+                   "condition": conditions["test"],
                    "targets": TARGETS, "rows": rows}, f, indent=2)
     print(f"\n[INFO] leaderboard -> {args.out}")
 

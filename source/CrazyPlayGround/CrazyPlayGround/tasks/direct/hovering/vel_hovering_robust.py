@@ -14,9 +14,12 @@ the environment behaves exactly like ``Vel-Hovering`` unless overridden:
    the policy cannot perceive its own previous command, so it can neither regulate its
    step-to-step change directly nor infer a disturbance (which needs the residual
    between what was commanded and what happened).
-5. **Loop latency** -- ``action_latency_steps`` delays the applied command, modelling
-   radio + estimator dead time. Delay plus high gain is the classic cause of the
-   limit-cycle chatter observed on hardware.
+5. **Loop latency** -- ``action_latency_steps`` (optionally randomised per episode up
+   to ``action_latency_max``) delays the applied command, modelling radio + estimator
+   dead time. Measured effect on the deployed policy, everything else clean:
+   0 steps -> 0.0060 chatter, 2 -> 0.0300, 4 -> 0.0517, against 0.0690 on real
+   hardware. Delay reproduces most of the observed sim-to-real chatter gap while
+   barely moving position error -- the same asymmetry seen on the real drone.
 
 Observation layout (all oldest-first):
     [ history_len x (lin_vel_b(3), desired_pos_b(3)) ,  action_hist_len x action(3) ]
@@ -54,6 +57,10 @@ class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
     # Policy steps of dead time between commanding an action and it being applied.
     # At 100 Hz, 2 steps = 20 ms (radio + estimator lag is of this order).
     action_latency_steps: int = 0
+    # If > action_latency_steps, the per-episode delay is sampled uniformly from
+    # [action_latency_steps, action_latency_max]. The true hardware latency is not
+    # measured, so randomising is safer than baking in one guessed value.
+    action_latency_max: int = 0
 
     # ── Observation noise shape ──────────────────────────────────────────────
     # noise_corr: AR(1) coefficient. 0.0 = white (default), 0.9 = strongly correlated.
@@ -85,6 +92,8 @@ class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
             raise ValueError(f"action_hist_len must be >= 0, got {self.action_hist_len}")
         if self.action_latency_steps < 0:
             raise ValueError(f"action_latency_steps must be >= 0, got {self.action_latency_steps}")
+        if self.action_latency_max and self.action_latency_max < self.action_latency_steps:
+            raise ValueError("action_latency_max must be >= action_latency_steps")
         self.observation_space = BASE_OBS_DIM * self.history_len + ACTION_DIM * self.action_hist_len
 
 
@@ -122,9 +131,13 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         self._m = int(getattr(self.cfg, "action_hist_len", 0))
         self._d = int(getattr(self.cfg, "action_latency_steps", 0))
 
+        self._d_max = max(self._d, int(getattr(self.cfg, "action_latency_max", 0)))
         self._obs_hist = torch.zeros(n, self._k, BASE_OBS_DIM, device=dev)
         self._act_hist = torch.zeros(n, max(self._m, 1), ACTION_DIM, device=dev)
-        self._act_delay = torch.zeros(n, max(self._d, 1), ACTION_DIM, device=dev)
+        # buffer holds the newest at index -1, so a delay of d reads index -1-d
+        self._act_delay = torch.zeros(n, self._d_max + 1, ACTION_DIM, device=dev)
+        self._delay_steps = torch.full((n,), self._d, dtype=torch.long, device=dev)
+        self._env_arange = torch.arange(n, device=dev)
 
         self._noise_state = torch.zeros(n, BASE_OBS_DIM, device=dev)
         self._noise_bias = torch.zeros(n, BASE_OBS_DIM, device=dev)
@@ -194,11 +207,12 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
             self._act_hist = torch.roll(self._act_hist, shifts=-1, dims=1)
             self._act_hist[:, -1, :] = commanded
 
-        # loop dead time: apply the command issued `d` steps ago
-        if self._d > 0:
-            applied = self._act_delay[:, 0, :].clone()
+        # loop dead time: apply the command issued `delay_steps` steps ago
+        if self._d_max > 0:
             self._act_delay = torch.roll(self._act_delay, shifts=-1, dims=1)
             self._act_delay[:, -1, :] = commanded
+            idx = (self._act_delay.shape[1] - 1) - self._delay_steps
+            applied = self._act_delay[self._env_arange, idx]
         else:
             applied = commanded
 
@@ -257,6 +271,11 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
             self._prev_actions[env_ids] = 0.0
         self._act_hist[env_ids] = 0.0
         self._act_delay[env_ids] = 0.0
+        if self._d_max > self._d:
+            self._delay_steps[env_ids] = torch.randint(
+                self._d, self._d_max + 1, (n,), device=self.device)
+        else:
+            self._delay_steps[env_ids] = self._d
         self._noise_state[env_ids] = 0.0
         self._noise_bias[env_ids] = (
             torch.randn(n, BASE_OBS_DIM, device=self.device) * self.cfg.noise_bias_std

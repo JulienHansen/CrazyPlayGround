@@ -24,7 +24,19 @@ import subprocess
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from configs import SWEEP, TASK, NUM_ENVS, MAX_ITERATIONS, WANDB_PROJECT, WANDB_GROUP  # noqa: E402
+
+# Which sweep design to run: `configs` (sweep 1) or `configs_v2` (action history +
+# latency). Selected with --configs; imported dynamically so both stay reproducible.
+_CFG_MODULE = os.environ.get("SWEEP_CONFIGS", "configs")
+for _i, _a in enumerate(sys.argv):
+    if _a == "--configs" and _i + 1 < len(sys.argv):
+        _CFG_MODULE = sys.argv[_i + 1]
+    elif _a.startswith("--configs="):
+        _CFG_MODULE = _a.split("=", 1)[1]
+_cfg = __import__(_CFG_MODULE)
+SWEEP, TASK = _cfg.SWEEP, _cfg.TASK
+NUM_ENVS, MAX_ITERATIONS = _cfg.NUM_ENVS, _cfg.MAX_ITERATIONS
+WANDB_PROJECT, WANDB_GROUP = _cfg.WANDB_PROJECT, _cfg.WANDB_GROUP
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 PYTHON = os.environ.get("ISAAC_PYTHON", sys.executable)
@@ -53,13 +65,19 @@ def snapshot_runs():
 
 def main():
     p = argparse.ArgumentParser(description="Run the hover robustness training sweep.")
+    p.add_argument("--configs", default="configs",
+                   help="Sweep design module: configs (sweep 1) or configs_v2.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--only", nargs="*", default=None, help="Run only these tags.")
     p.add_argument("--num-envs", type=int, default=NUM_ENVS)
     p.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
     p.add_argument("--no-wandb", action="store_true", help="Disable W&B for this sweep.")
-    p.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_index.json"))
+    p.add_argument("--out", default=None,
+                   help="Index file (default: sweep_index[_<configs>].json)")
     args = p.parse_args()
+    if args.out is None:
+        suffix = "" if args.configs == "configs" else "_" + args.configs.replace("configs_", "")
+        args.out = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"sweep_index{suffix}.json")
 
     runs = SWEEP if not args.only else [r for r in SWEEP if r["tag"] in args.only]
     if not runs:
