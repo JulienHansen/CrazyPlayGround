@@ -80,3 +80,88 @@ python execution/sim2real/collect_hover_vel.py --checkpoint <ckpt> --history-len
 ```
 A mismatched `--history-len` fails at load time with a state_dict size mismatch
 rather than flying a wrongly-shaped policy.
+
+---
+
+# Sweep 2 — action history and loop latency
+
+Sweep 1 left out the two factors most likely to explain the hardware chatter: the
+policy could not see its own previous command, and there was no loop latency at all.
+Sweep 2 fixes both. 12 runs (~24 min each, 4.8 h), K=8 + disturbances + AR(1)
+correlated noise held fixed, varying:
+
+    action_hist_len M       0, 1, 4
+    latency                 none  /  2-6 steps randomised per episode
+    action-rate penalty     0, -0.05
+
+W&B group `hover-robustness-sweep-v2`; raw records in `sweep_index_v2.json`,
+`leaderboard_v2.json`, `leaderboard_v1refs.json`.
+
+## What motivated it: the latency diagnostic
+
+Evaluating the *deployed* policy with everything clean except loop dead time:
+
+| delay | 0 | 1 (10 ms) | 2 (20 ms) | 3 (30 ms) | 4 (40 ms) | real hardware |
+|---|---|---|---|---|---|---|
+| chatter | 0.0060 | 0.0147 | 0.0300 | 0.0422 | 0.0517 | **0.0690** |
+| pos err | 0.039 | 0.040 | 0.043 | 0.049 | 0.056 | 0.097 |
+
+Latency alone reproduces ~75% of the chatter gap *and* its signature — chatter
+explodes 8.6x while tracking barely moves — which noise and disturbances never
+explained. This partly supersedes the sweep-1 framing of the gap as a
+noise-robustness problem.
+
+## Marginal effects (v2 condition)
+
+| factor | level | chatter | pos err |
+|---|---|---:|---:|
+| trained latency | 0 | 0.1217 | 0.1366 |
+| | **2-6** | **0.0925** | **0.1273** |
+| action history M | 0 | 0.1064 | 0.1461 |
+| | **1** | **0.0879** | 0.1207 |
+| | 4 | 0.1269 | 0.1291 |
+| action-rate penalty | off | **0.0972** | **0.1231** |
+| | on | 0.1169 | 0.1409 |
+
+## Cross-sweep ranking, one identical condition
+
+All policies re-evaluated under 40 ms latency + correlated noise + disturbances:
+
+| # | source | policy | pos err | chatter | vs baseline |
+|---:|---|---|---:|---:|---:|
+| 1 | sweep 2 | `m1_laton_aroff` | 0.1336 | 0.0732 | 2.21x |
+| 2 | sweep 2 | **`m0_laton_aroff`** | **0.0960** | **0.0763** | **2.12x** |
+| 3 | sweep 2 | `m1_laton_aron` | 0.1127 | 0.0766 | 2.11x |
+| 5 | sweep 1 | `n0.05_k8_d1_ar_s42` | 0.1504 | 0.0951 | 1.70x |
+| 7 | sweep 1 | `n0.02_k8_d1_s42` | 0.1087 | 0.1060 | 1.53x |
+| 14 | sweep 1 | `n0.0_k1_d0_s42` (deployed) | 0.1013 | 0.1616 | 1.00x |
+
+**Deploy candidate: `m0_laton_aroff`** (K=8, M=0, latency-trained, no penalty) --
+2.12x less chatter than the deployed policy *and* slightly better position error
+(0.0960 vs 0.1013). A strict improvement on both axes, and it beats sweep 1's best
+by ~20%. sha256 `f5878876...`, offline gate PASS.
+
+## Conclusions
+
+1. **Training under latency is the real win** -- the only factor with consistent
+   support, improving both chatter and tracking. It came from asking what sweep 1
+   had not tested.
+2. **One step of action history helps; four hurt.** M=4 is worse than none, likely
+   because 12 extra inputs on a [32,32] net at 19.2k timesteps cost more than they
+   inform.
+3. **The action-rate penalty backfired.** Predicted to help once `a_{t-1}` was
+   observable, it made chatter *and* tracking worse at this magnitude -- it competes
+   with the distance reward. Hypothesis rejected.
+
+## Caveats
+
+- **n=4 per level, single seed.** Only the latency effect has clean support; the
+  M=0 vs M=1 gap is within plausible seed noise, and the best balanced policy
+  (`m0_laton_aroff`) uses no action history at all.
+- **The v2 condition overshoots reality.** The deployed policy scores 0.1616 there
+  against 0.0690 measured on hardware, so v2 is a stress test for *relative*
+  ranking, not an absolute predictor.
+- **The latency value is bracketed, not measured.** 2-6 steps came from matching a
+  simulated curve. It cannot be identified from closed-loop logs (see
+  `measure_delay_noise.py`); the open-loop chirp flight would pin it down.
+- Still no hardware validation of any sweep policy.
