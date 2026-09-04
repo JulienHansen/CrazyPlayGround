@@ -219,8 +219,18 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
 
         if self._m > 0:
             act_part = self._act_hist[:, -self._m:, :].reshape(self.num_envs, self._m * ACTION_DIM)
-            return {"policy": torch.cat([obs_part, act_part], dim=-1)}
-        return {"policy": obs_part}
+            policy_obs = torch.cat([obs_part, act_part], dim=-1)
+        else:
+            policy_obs = obs_part
+
+        # NOTE: DirectRLEnv never calls `_get_states()` (it is only wired up in
+        # DirectMARLEnv), and skrl reads the privileged tensor from
+        # `observations["critic"]` (skrl/envs/wrappers/torch/isaaclab_envs.py:67).
+        # rsl_rl likewise selects critic inputs by observation group. So the
+        # privileged vector has to be returned HERE to reach an asymmetric critic.
+        if self.cfg.privileged_state:
+            return {"policy": policy_obs, "critic": self._get_states()}
+        return {"policy": policy_obs}
 
     # ---------- action: history, latency, disturbances ----------
 
@@ -312,7 +322,11 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
 
     def _get_states(self) -> torch.Tensor:
         """Ground-truth randomisation vector, for a critic only. Never given to the
-        actor: the whole point is that the actor must infer this from its history."""
+        actor: the whole point is that the actor must infer this from its history.
+
+        Surfaced through `_get_observations()["critic"]` rather than relied on as a
+        DirectRLEnv hook, because that hook is never invoked for single-agent envs.
+        """
         self._ensure_buffers()
         base = self._base_obs()          # noise-free
         lat = self._delay_steps.float().unsqueeze(-1) / 10.0

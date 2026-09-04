@@ -1,0 +1,89 @@
+# Asymmetric actor-critic for Vel-Hovering-Robust.
+#
+# The actor sees only what the drone can measure (its observation, optionally a
+# stacked window plus past actions). The critic additionally sees the ground-truth
+# randomisation vector exposed as the "critic" observation group by
+# vel_hovering_robust (mass/inertia/thrust/torque scales, disturbance wrench, gust,
+# latency, noise sigma, noise-free observation).
+#
+# Requires env.privileged_state=True, otherwise state_space is 0 and STATES is empty.
+#
+# Critic input is concatenate([STATES, OBSERVATIONS]) rather than STATES alone: with a
+# history-dependent actor a state-only critic is biased (Louette et al., memory-state
+# critic). Concatenating the actor's observation is the observation-state variant; a
+# true memory-state critic needs the recurrent actor's hidden state and a custom model.
+seed: 42
+
+models:
+  separate: True          # actor and critic have different inputs -> cannot share a trunk
+  policy:
+    class: GaussianMixin
+    clip_actions: False
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: -0.0
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [64, 64]
+        activations: elu
+    output: ACTIONS
+  value:
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: concatenate([STATES, OBSERVATIONS])
+        layers: [128, 128]
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+agent:
+  class: PPO
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 8
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  learning_rate: 5.0e-04
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.008
+  # Declare BOTH: skrl 2.x silently renames a lone `state_preprocessor` to
+  # `observation_preprocessor` (runner.py:95-103), which would leave the critic's
+  # privileged input unnormalised.
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: True
+  entropy_loss_scale: 0.0
+  value_loss_scale: 2.0
+  kl_threshold: 0.0
+  rewards_shaper_scale: 0.1
+  time_limit_bootstrap: False
+  experiment:
+    directory: "hover_asym"
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+    wandb: false
+    wandb_kwargs:
+      project: "crazyplayground-hover"
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 19200
+  environment_info: log
