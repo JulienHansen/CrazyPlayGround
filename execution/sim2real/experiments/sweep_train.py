@@ -44,14 +44,20 @@ LOG_ROOT = os.path.join(REPO, "logs", "skrl")
 
 
 def newest_run_dir(before: set):
-    """The run directory that appeared since `before` was captured."""
+    """The run directory that appeared since `before` was captured (most recent by
+    mtime -- see the sort note below; a path sort mis-assigns across experiments)."""
     now = set()
     for exp in os.listdir(LOG_ROOT) if os.path.isdir(LOG_ROOT) else []:
         d = os.path.join(LOG_ROOT, exp)
         if os.path.isdir(d):
             now |= {os.path.join(d, r) for r in os.listdir(d)}
-    new = sorted(now - before)
-    return new[-1] if new else None
+    new = now - before
+    if not new:
+        return None
+    # Sort by mtime, NOT by path: run directories live under per-experiment folders
+    # (e.g. logs/skrl/cartpole_direct vs logs/skrl/hover_asym) and a path sort picks
+    # the alphabetically-last experiment rather than the run we just launched.
+    return max(new, key=lambda d: os.path.getmtime(d))
 
 
 def snapshot_runs():
