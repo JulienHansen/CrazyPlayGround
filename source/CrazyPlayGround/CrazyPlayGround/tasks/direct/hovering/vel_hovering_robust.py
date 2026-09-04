@@ -42,6 +42,12 @@ from .vel_hovering import QuadcopterEnvCfg as _BaseQuadcopterEnvCfg
 BASE_OBS_DIM = 6   # [lin_vel_b(3), desired_pos_b(3)]
 ACTION_DIM = 3     # [vx, vy, vz]
 
+# Privileged critic state, in order:
+#   mass_scale(1), inertia_scale(1), thrust_scale(1), torque_scale(1),
+#   dist_force(3), dist_torque(3), gust_force(3), gust_torque(3),
+#   latency_steps(1), noise_std(1), true lin_vel_b(3), true desired_pos_b(3)
+PRIV_STATE_DIM = 24
+
 
 @configclass
 class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
@@ -78,6 +84,22 @@ class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
     disturb_gust_torque_range: tuple[float, float] = (-6.0e-4, 6.0e-4)
     disturb_gust_decay: float = 0.92
 
+    # ── Physical domain randomization ────────────────────────────────────────
+    # The cascade PID keeps its NOMINAL mass/inertia from crazyflie.yaml, so
+    # randomising the simulated body creates a real model mismatch the policy has
+    # to absorb -- the setting adaptive-control methods (RMA et al.) target.
+    physical_dr: bool = False
+    rand_mass_scale_range: tuple[float, float] = (0.8, 1.25)       # x nominal 27 g
+    rand_inertia_scale_range: tuple[float, float] = (0.8, 1.25)    # extra, on top of mass scaling
+    # Actuation effectiveness: battery sag, worn props, per-build variation.
+    rand_thrust_scale_range: tuple[float, float] = (0.85, 1.15)
+    rand_torque_scale_range: tuple[float, float] = (0.85, 1.15)
+
+    # ── Privileged state for an asymmetric critic ────────────────────────────
+    # When True, `_get_states()` exposes the ground-truth randomisation vector so a
+    # critic can condition on it while the actor cannot (asymmetric actor-critic).
+    privileged_state: bool = False
+
     # ── Anti-chatter ─────────────────────────────────────────────────────────
     # Penalty on ||a_t - a_{t-1}||^2. Negative = penalty.
     action_rate_reward_scale: float = 0.0
@@ -95,6 +117,7 @@ class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
         if self.action_latency_max and self.action_latency_max < self.action_latency_steps:
             raise ValueError("action_latency_max must be >= action_latency_steps")
         self.observation_space = BASE_OBS_DIM * self.history_len + ACTION_DIM * self.action_hist_len
+        self.state_space = PRIV_STATE_DIM if self.privileged_state else 0
 
 
 class RobustQuadcopterEnv(_BaseQuadcopterEnv):
@@ -111,6 +134,7 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
             raise ValueError(f"history_len must be >= 1, got {cfg.history_len}")
         cfg.observation_space = (BASE_OBS_DIM * int(cfg.history_len)
                                  + ACTION_DIM * int(cfg.action_hist_len))
+        cfg.state_space = PRIV_STATE_DIM if cfg.privileged_state else 0
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -142,6 +166,10 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         self._noise_state = torch.zeros(n, BASE_OBS_DIM, device=dev)
         self._noise_bias = torch.zeros(n, BASE_OBS_DIM, device=dev)
 
+        self._mass_scale = torch.ones(n, device=dev)
+        self._inertia_scale = torch.ones(n, device=dev)
+        self._thrust_scale = torch.ones(n, device=dev)
+        self._torque_scale = torch.ones(n, device=dev)
         self._dist_force = torch.zeros(n, 3, device=dev)
         self._dist_torque = torch.zeros(n, 3, device=dev)
         self._gust_force = torch.zeros(n, 3, device=dev)
@@ -233,9 +261,17 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         # Base fills self._thrust[:, 0, 2] / self._moment from the cascade PID and
         # applies the wrench; add the disturbance and re-apply (last call wins).
         super()._apply_action()
+        self._ensure_buffers()
+
+        # actuation effectiveness (battery sag / prop wear / build variation)
+        if self.cfg.physical_dr:
+            self._thrust[:, 0, 2] *= self._thrust_scale
+            self._moment[:, 0, :] *= self._torque_scale.unsqueeze(-1)
+            if not self.cfg.disturb:
+                self._robot.set_external_force_and_torque(
+                    self._thrust, self._moment, body_ids=self._body_id)
         if not self.cfg.disturb:
             return
-        self._ensure_buffers()
         fx = self._dist_force + self._gust_force
         tq = self._dist_torque + self._gust_torque
         # x/y are never reset by the base -> assign (not +=) to avoid accumulation.
@@ -244,6 +280,53 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
         self._thrust[:, 0, 2] += fx[:, 2]
         self._moment[:, 0, :] += tq
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+
+    # ---------- physical properties ----------
+
+    def _write_body_properties(self, env_ids: torch.Tensor):
+        """Push randomised mass/inertia into PhysX (pattern from IsaacLab
+        `mdp.events.randomize_rigid_body_mass`: the views are CPU-side and are always
+        re-derived from the defaults, never from previously randomised values)."""
+        view = self._robot.root_physx_view
+        ids_cpu = env_ids.detach().cpu()
+
+        masses = view.get_masses()
+        default_m = self._robot.data.default_mass
+        scale_cpu = self._mass_scale[env_ids].detach().cpu().unsqueeze(-1)
+        masses[ids_cpu] = (default_m[ids_cpu] * scale_cpu).clamp(min=1e-6)
+        view.set_masses(masses, ids_cpu)
+
+        try:
+            inertias = view.get_inertias()
+            default_i = self._robot.data.default_inertia
+            # inertia follows the mass, times an extra independent factor
+            tot = (self._mass_scale[env_ids] * self._inertia_scale[env_ids]).detach().cpu()
+            inertias[ids_cpu] = default_i[ids_cpu] * tot.view(-1, 1, 1)
+            view.set_inertias(inertias, ids_cpu)
+        except (AttributeError, RuntimeError) as e:
+            if not getattr(self, "_warned_inertia", False):
+                print(f"[WARN] inertia randomisation unavailable ({e}); mass only.")
+                self._warned_inertia = True
+
+    # ---------- privileged state (asymmetric critic) ----------
+
+    def _get_states(self) -> torch.Tensor:
+        """Ground-truth randomisation vector, for a critic only. Never given to the
+        actor: the whole point is that the actor must infer this from its history."""
+        self._ensure_buffers()
+        base = self._base_obs()          # noise-free
+        lat = self._delay_steps.float().unsqueeze(-1) / 10.0
+        return torch.cat([
+            self._mass_scale.unsqueeze(-1),
+            self._inertia_scale.unsqueeze(-1),
+            self._thrust_scale.unsqueeze(-1),
+            self._torque_scale.unsqueeze(-1),
+            self._dist_force, self._dist_torque,
+            self._gust_force, self._gust_torque,
+            lat,
+            torch.full((self.num_envs, 1), float(self.cfg.noise_std), device=self.device),
+            base,
+        ], dim=-1)
 
     # ---------- reward ----------
 
@@ -290,6 +373,20 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
             self._dist_torque[env_ids] = 0.0
         self._gust_force[env_ids] = 0.0
         self._gust_torque[env_ids] = 0.0
+
+        # physical body randomisation: mass + inertia written into the simulation,
+        # while the controller keeps its nominal values (deliberate mismatch)
+        if self.cfg.physical_dr:
+            self._mass_scale[env_ids] = self._uniform((n,), self.cfg.rand_mass_scale_range, self.device)
+            self._inertia_scale[env_ids] = self._uniform((n,), self.cfg.rand_inertia_scale_range, self.device)
+            self._thrust_scale[env_ids] = self._uniform((n,), self.cfg.rand_thrust_scale_range, self.device)
+            self._torque_scale[env_ids] = self._uniform((n,), self.cfg.rand_torque_scale_range, self.device)
+            self._write_body_properties(env_ids)
+        else:
+            self._mass_scale[env_ids] = 1.0
+            self._inertia_scale[env_ids] = 1.0
+            self._thrust_scale[env_ids] = 1.0
+            self._torque_scale[env_ids] = 1.0
 
         # prime the observation window with the post-reset observation so no stale
         # frames leak across the reset boundary
