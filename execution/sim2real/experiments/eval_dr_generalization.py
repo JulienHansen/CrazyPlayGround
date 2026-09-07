@@ -19,7 +19,11 @@ import argparse, json, os, sys
 from isaaclab.app import AppLauncher
 
 p = argparse.ArgumentParser()
-p.add_argument("--index", required=True)
+p.add_argument("--index", default=None, help="Sweep index (driver mode is in eval_dr_sweep.py).")
+p.add_argument("--checkpoint", default=None, help="Single checkpoint to evaluate.")
+p.add_argument("--tag", default="policy")
+p.add_argument("--history-len", type=int, default=1)
+p.add_argument("--action-hist-len", type=int, default=0)
 p.add_argument("--num-envs", type=int, default=256, help="Randomised bodies per policy.")
 p.add_argument("--duration", type=float, default=10.0)
 p.add_argument("--out", default=None)
@@ -137,6 +141,17 @@ def evaluate(ckpt, hist, act_hist, width):
     }
 
 
+def main_single():
+    """Evaluate exactly one checkpoint. IsaacLab cannot build a second env in the
+    same process (the stage cannot be rebuilt -- it hangs), so batching over
+    policies must happen at the process level, not in a Python loop."""
+    m = evaluate(args.checkpoint, args.history_len, args.action_hist_len, args.dr_width)
+    m["tag"] = args.tag
+    print("RESULT " + json.dumps(m), flush=True)
+    if args.out:
+        json.dump(m, open(args.out, "w"), indent=2)
+
+
 def main():
     index = json.load(open(args.index))
     runs = {k: v for k, v in index["runs"].items() if v.get("checkpoint")}
@@ -174,5 +189,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if args.checkpoint:
+        main_single()
+    else:
+        main()
     app.close()
