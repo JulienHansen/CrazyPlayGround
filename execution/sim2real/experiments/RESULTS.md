@@ -165,3 +165,66 @@ by ~20%. sha256 `f5878876...`, offline gate PASS.
   simulated curve. It cannot be identified from closed-loop logs (see
   `measure_delay_noise.py`); the open-loop chirp flight would pin it down.
 - Still no hardware validation of any sweep policy.
+
+---
+
+# Sweep 3 — physical domain randomization (negative result)
+
+12 policies over training-DR width (off / narrow 0.9-1.1x / wide 0.7-1.4x mass) x
+observation history K (1/8) x action history M (0/1), with 40 ms latency and
+correlated noise held on. Evaluated on **256 randomised bodies per policy** over a
+held-out range strictly wider than training (mass 0.6-1.6x, thrust 0.75-1.25x).
+
+## Marginal means (held-out DR)
+
+| factor | level | pos err | chatter | crash |
+|---|---|---:|---:|---:|
+| training DR | off | 0.2165 | 0.0688 | 0.099 |
+| | narrow | **0.1962** | 0.0763 | 0.086 |
+| | wide | 0.2167 | 0.0823 | 0.090 |
+| obs history K | **1** | **0.1999** | 0.0862 | **0.078** |
+| | 8 | 0.2198 | **0.0654** | 0.105 |
+| action history M | 0 | 0.2087 | 0.0772 | 0.092 |
+| | 1 | 0.2110 | 0.0745 | 0.090 |
+
+## What this says
+
+1. **Physical DR did not buy generalization.** Wide DR (0.2167) is no better than no
+   DR at all (0.2165); only narrow DR is marginally better (0.1962). Randomising the
+   body harder did not make policies more robust to unseen bodies.
+2. **The observation window hurt accuracy and safety while helping smoothness.**
+   K=8 lowers chatter (0.086 -> 0.065, consistent with sweeps 1-2) but raises position
+   error (0.200 -> 0.220), crash rate (7.8% -> 10.5%) and especially the **p90 tail**
+   (K=1: 0.23-0.44 m, K=8: 0.36-0.78 m). Six of the top seven policies are K=1.
+3. **Action history M=1 did nothing** (0.2087 vs 0.2110 pos err) -- within seed noise.
+4. **No policy is robust**: crash rates are 7-12% across the board.
+
+## Why -- the likely cause, and it is structural
+
+The observation is `[lin_vel_b(3), desired_pos_b(3)]`. **Mass, inertia and thrust
+scale are close to unobservable through that interface.** The action is a velocity
+setpoint handed to the firmware cascade PID, whose inner loops absorb exactly the
+mismatch we are randomising: a heavier drone sags, the velocity loop compensates, and
+the velocity error the policy sees is largely restored. There is no acceleration, no
+attitude and no thrust channel in the observation -- the very signals that reveal a
+mass or actuation mismatch.
+
+Zhang et al. do not have this problem because their observation *is* the revealing
+signal: mass-normalized thrust plus body rates plus the commanded thrust/rates, with
+actions at the motor level. Adaptation is observable there; in a velocity-setpoint
+interface it largely is not.
+
+**Implication: the velocity action space is the wrong interface for adaptation work.**
+Adaptive-policy experiments should move to `Rate-Hovering` (CTBR), where thrust and
+body rates are both commanded and observed. This is the same conclusion the chatter
+analysis reached from a different direction.
+
+## Caveats
+
+- **600 iterations = 19.2k timesteps.** Zhang trains phase 1 for **100M steps**,
+  ~5000x more. Adaptation may simply not have had the budget to emerge; this sweep
+  cannot distinguish "does not work here" from "not trained long enough".
+- **Single seed per cell** (n=4 per marginal level). Differences of ~0.02 m in
+  position error are plausibly seed noise; only the K=1 vs K=8 tail difference and
+  the chatter trend look larger than that.
+- Held-out width (mass 0.6-1.6x) is a modest extrapolation next to the papers' 16x.
