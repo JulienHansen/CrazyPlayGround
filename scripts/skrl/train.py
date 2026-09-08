@@ -92,7 +92,11 @@ if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
     exit()
 
 if args_cli.ml_framework.startswith("torch"):
-    from skrl.utils.runner.torch import Runner
+    # MemoryStateRunner adds the recurrent-actor / privileged-critic components
+    # (GaussianRNNMixin, SzCriticMixin, PPO_RNN_SZ) that stock skrl's component map
+    # does not know. It delegates every other name to the stock Runner, so this is a
+    # drop-in replacement for the existing configs.
+    from CrazyPlayGround.skrl_ext import MemoryStateRunner as Runner
 elif args_cli.ml_framework.startswith("jax"):
     from skrl.utils.runner.jax import Runner
 

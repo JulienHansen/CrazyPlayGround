@@ -43,7 +43,7 @@ PYTHON = os.environ.get("ISAAC_PYTHON", sys.executable)
 LOG_ROOT = os.path.join(REPO, "logs", "skrl")
 
 
-def newest_run_dir(before: set):
+def newest_run_dir(before: set, root: str | None = None):
     """The run directory that appeared since `before` was captured (most recent by
     mtime -- see the sort note below; a path sort mis-assigns across experiments)."""
     now = set()
@@ -52,6 +52,8 @@ def newest_run_dir(before: set):
         if os.path.isdir(d):
             now |= {os.path.join(d, r) for r in os.listdir(d)}
     new = now - before
+    if root:
+        new = {d for d in new if os.path.abspath(d).startswith(os.path.abspath(root))}
     if not new:
         return None
     # Sort by mtime, NOT by path: run directories live under per-experiment folders
@@ -139,7 +141,20 @@ def main():
             rc = subprocess.call(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT, env=env)
         dt = time.time() - t0
 
-        run_dir = newest_run_dir(before)
+        # Restrict the search to the experiment root this run actually reported.
+        # Without it, a concurrent training under a DIFFERENT experiment directory can
+        # be picked up instead (observed: a smoke test writing to logs/skrl/hover_sz
+        # was credited to an asym run). train.py prints the root on startup.
+        exp_root = None
+        try:
+            with open(logf) as fh:
+                for line in fh:
+                    if "Logging experiment in directory:" in line:
+                        exp_root = line.split("Logging experiment in directory:")[1].strip()
+                        break
+        except OSError:
+            pass
+        run_dir = newest_run_dir(before, root=exp_root)
         ckpt = None
         if run_dir:
             cand = os.path.join(run_dir, "checkpoints", "best_agent.pt")

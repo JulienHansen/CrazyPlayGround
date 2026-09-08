@@ -117,6 +117,30 @@ PPO_RNN_VSH_DEFAULT_CONFIG = {
 # fmt: on
 
 
+class _DictAgentCfg(dict):
+    """Bridge between the ported dict config and skrl 2.x's dataclass AgentCfg.
+
+    skrl 2.x expects `cfg` to be an AgentCfg dataclass (it calls ``cfg.expand()`` and
+    reads ``cfg.experiment.*``), while this agent -- written against skrl 1.4.3 --
+    accesses its config as a dict throughout. This subclass supports both: dict
+    lookups for the agent's own code, plus attribute access and a no-op ``expand()``
+    for the base class. Attribute assignment writes through to the dict, so the base
+    class replacing ``experiment`` with an ExperimentCfg is visible to both views.
+    """
+
+    def expand(self):  # skrl 2.x AgentCfg hook; the dict is already flat
+        return self
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
 class PPO_RNN_VSH(Agent):
     def __init__(
         self,
@@ -152,6 +176,7 @@ class PPO_RNN_VSH(Agent):
         """
         _cfg = copy.deepcopy(PPO_RNN_VSH_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})
+        _cfg = _DictAgentCfg(_cfg)   # skrl 2.x expects an AgentCfg-like object
         super().__init__(
             models=models,
             memory=memory,
@@ -291,7 +316,7 @@ class PPO_RNN_VSH(Agent):
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent"""
         super().init(trainer_cfg=trainer_cfg)
-        self.set_mode("eval")
+        self.enable_models_training_mode(False)
 
         # Determine critic state size from config or fall back to observation space
         critic_pp_kwargs = self.cfg.get("critic_state_preprocessor_kwargs") or {}
@@ -444,7 +469,15 @@ class PPO_RNN_VSH(Agent):
 
         return {"critic_image": image, "critic_past_actions": past_actions}
 
-    def act(self, states: torch.Tensor, timestep: int, timesteps: int) -> torch.Tensor:
+    def act(self, observations: torch.Tensor, states: torch.Tensor = None, *,
+            timestep: int = 0, timesteps: int = 0) -> torch.Tensor:
+        # skrl 2.x trainer calls act(observations, states, timestep=..., timesteps=...).
+        # In 1.4.3 the first positional arg was the observation and was named
+        # `states`; keep the body unchanged by rebinding here. `states` is now the
+        # PRIVILEGED state and is consumed via self._current_critic_states.
+        if states is not None:
+            self._current_critic_states = states
+        states = observations
         """Process the environment's states to make a decision (actions) using the main policy
 
         :param states: Environment's states
@@ -487,16 +520,26 @@ class PPO_RNN_VSH(Agent):
 
     def record_transition(
         self,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
-        next_states: torch.Tensor,
-        terminated: torch.Tensor,
-        truncated: torch.Tensor,
-        infos: Any,
-        timestep: int,
-        timesteps: int,
+        observations: torch.Tensor = None,
+        states: torch.Tensor = None,
+        actions: torch.Tensor = None,
+        rewards: torch.Tensor = None,
+        next_observations: torch.Tensor = None,
+        next_states: torch.Tensor = None,
+        terminated: torch.Tensor = None,
+        truncated: torch.Tensor = None,
+        infos: Any = None,
+        timestep: int = 0,
+        timesteps: int = 0,
     ) -> None:
+        # skrl 2.x passes observations and privileged states separately; 1.4.3 passed a
+        # single `states` that meant the observation. Rebind so the body below is
+        # unchanged, and route the privileged tensors to the critic-state slots.
+        _priv_states = states if observations is not None else None
+        _priv_next_states = next_states if observations is not None else None
+        if observations is not None:
+            states = observations
+            next_states = next_observations if next_observations is not None else next_states
         """Record an environment transition in memory
 
         :param states: Observations/states of the environment used to make the decision
@@ -519,7 +562,17 @@ class PPO_RNN_VSH(Agent):
         :type timesteps: int
         """
         super().record_transition(
-            states, actions, rewards, next_states, terminated, truncated, infos, timestep, timesteps
+            observations=states,
+            states=_priv_states,
+            actions=actions,
+            rewards=rewards,
+            next_observations=next_states,
+            next_states=_priv_next_states,
+            terminated=terminated,
+            truncated=truncated,
+            infos=infos,
+            timestep=timestep,
+            timesteps=timesteps,
         )
 
         if self.memory is not None:
@@ -529,10 +582,14 @@ class PPO_RNN_VSH(Agent):
             critic_states = infos.get("critic_states", None) if isinstance(infos, dict) else None
             next_critic_states = infos.get("next_critic_states", None) if isinstance(infos, dict) else None
             # Current critic states should align with current observations
-            self._current_critic_states = critic_states if critic_states is not None else states
+            self._current_critic_states = (
+                critic_states if critic_states is not None
+                else (_priv_states if _priv_states is not None else states)
+            )
             # Next critic states are used for bootstrapping
             self._current_next_critic_states = (
-                next_critic_states if next_critic_states is not None else next_states
+                next_critic_states if next_critic_states is not None
+                else _priv_next_states if _priv_next_states is not None else next_states
             )
 
             # reward shaping
@@ -697,12 +754,17 @@ class PPO_RNN_VSH(Agent):
         """
         self._rollout += 1
         if not self._rollout % self._rollouts and timestep >= self._learning_starts:
-            self.set_mode("train")
+            self.enable_models_training_mode(True)
             self._update(timestep, timesteps)
-            self.set_mode("eval")
+            self.enable_models_training_mode(False)
 
         # write tracking data and checkpoints
         super().post_interaction(timestep, timesteps)
+
+    def update(self, timestep: int, timesteps: int) -> None:
+        """skrl 2.x renamed the abstract update hook from ``_update`` to ``update``;
+        delegate so the ported implementation below is unchanged."""
+        return self._update(timestep, timesteps)
 
     def _update(self, timestep: int, timesteps: int) -> None:
         """Algorithm's main update step

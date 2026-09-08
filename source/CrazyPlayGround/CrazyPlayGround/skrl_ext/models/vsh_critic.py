@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from skrl.models.torch import DeterministicMixin, Model
+from skrl.utils.spaces.torch import compute_space_size
 
 
 class VshCriticModel(DeterministicMixin, Model):
@@ -29,6 +30,7 @@ class VshCriticModel(DeterministicMixin, Model):
     def __init__(
         self,
         observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
+        state_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
         action_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
         device: Optional[Union[str, torch.device]] = None,
         clip_actions: bool = False,
@@ -39,15 +41,19 @@ class VshCriticModel(DeterministicMixin, Model):
         layers: Sequence[int] = (256, 128, 64),
         **kwargs,
     ) -> None:
-        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        Model.__init__(self, observation_space=observation_space, state_space=state_space,
+                       action_space=action_space, device=device)
         DeterministicMixin.__init__(self, clip_actions=clip_actions)
 
         self._z_dim = actor_hidden_size
         self._z_opp_dim = z_opp_dim
         self._opp_id_dim = opp_id_dim
 
-        # observation_space is the privileged state_space (e.g. 27 dims)
-        state_size = self.num_observations
+        # skrl 2.x has a dedicated state_space for privileged info; size from it when
+        # given (1.4.3 passed the privileged space in as observation_space instead).
+        # Storing it also matters because Model.init_state_dict() samples `states` from
+        # self.state_space -- if unset, the dry-run compute() receives states=None.
+        state_size = compute_space_size(state_space) if state_space is not None else self.num_observations
         input_size = state_size + actor_hidden_size + z_opp_dim + opp_id_dim
 
         self.opp_id_embedding: Optional[nn.Embedding] = None
@@ -67,7 +73,11 @@ class VshCriticModel(DeterministicMixin, Model):
         self.net = nn.Sequential(*modules)
 
     def compute(self, inputs: Mapping[str, Any], role: str = ""):
-        states = inputs.get("states")  # preprocessed critic states
+        states = inputs.get("states")  # preprocessed privileged state (skrl 2.x)
+        if states is None:
+            # dry-run init or a config that routes the privileged vector as the
+            # observation: fall back so the model can still be initialised.
+            states = inputs.get("observations")
         # Accept both new (z_theta) and legacy (actor_hidden) key names
         z_theta = inputs.get("z_theta")
         if z_theta is None:
@@ -115,12 +125,16 @@ class VshCriticModel(DeterministicMixin, Model):
                 opp_emb = opp_emb.view(*states.shape[:-1], self._opp_id_dim)
             parts.append(opp_emb)
 
+        if len({p.shape[0] for p in parts}) > 1:
+            raise RuntimeError("VshCriticModel batch mismatch: "
+                               + str([tuple(p.shape) for p in parts]))
         x = torch.cat(parts, dim=-1)
         return self.net(x), {}
 
 
 def vsh_critic_model(
     observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
+    state_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
     action_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
     device: Optional[Union[str, torch.device]] = None,
     clip_actions: bool = False,
@@ -150,6 +164,7 @@ def vsh_critic_model(
 
     return VshCriticModel(
         observation_space=observation_space,
+        state_space=state_space,
         action_space=action_space,
         device=device,
         clip_actions=clip_actions,

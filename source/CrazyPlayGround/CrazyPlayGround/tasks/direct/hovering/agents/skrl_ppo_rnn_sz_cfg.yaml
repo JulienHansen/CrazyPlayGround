@@ -1,0 +1,87 @@
+# V(s,z) MEMORY-STATE CRITIC for Vel-Hovering-Robust.
+#
+# Recurrent actor: GRU over the drone's own noisy observation. Its hidden state z_theta
+# is DETACHED and handed to the critic together with the privileged state, so the value
+# function is well-defined and the policy gradient is unbiased without a second
+# recurrent encoder (Louette et al., memory-state critic).
+#
+# Requires env.privileged_state=True (state_space = 24). Ported from MemoryStateCritic.
+#
+# sz_z_dim MUST equal the actor's rnn.hidden_size and the critic's actor_hidden_size.
+seed: 42
+
+models:
+  separate: True                      # actor and critic have different inputs
+  policy:
+    class: GaussianRNNMixin           # registered by CrazyPlayGround.skrl_ext.MemoryStateRunner
+    clip_actions: False
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: -0.0
+    network:
+      - name: net
+        input: OBSERVATIONS           # the actor never sees STATES
+        layers: [64, 64]
+        activations: elu
+    rnn:
+      type: gru
+      hidden_size: 128
+      num_layers: 1
+      sequence_length: 16
+    output: ACTIONS
+  value:
+    class: SzCriticMixin              # MLP(concat(state, detached z_theta))
+    clip_actions: False
+    actor_hidden_size: 128            # == rnn.hidden_size
+    layers: [256, 128, 64]
+
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+agent:
+  class: PPO_RNN_SZ
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 8
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 5.0e-04
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.008
+  # `state_preprocessor` here normalises the ACTOR's observation (the agent keeps the
+  # skrl-1.x field name); `critic_state_preprocessor` normalises the privileged state.
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  critic_state_preprocessor: RunningStandardScaler
+  critic_state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: True
+  entropy_loss_scale: 0.0
+  value_loss_scale: 2.0
+  kl_threshold: 0.0
+  time_limit_bootstrap: False
+  # ---- the memory-state critic switch ----
+  sz_critic: True
+  sz_z_dim: 128
+  experiment:
+    directory: "hover_sz"
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+    wandb: false
+    wandb_kwargs:
+      project: "crazyplayground-hover"
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 19200
+  environment_info: log

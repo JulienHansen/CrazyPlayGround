@@ -1,0 +1,133 @@
+{
+  "created": "2026-09-08T11:08:45.006423",
+  "task": "Vel-Hovering-Robust",
+  "num_envs": 4096,
+  "max_iterations": 600,
+  "runs": {
+    "sym_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 13.3,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_sym/2026-09-08_11-08-55_sym_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_sym/2026-09-08_11-08-55_sym_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "critic": "sym",
+        "seed": 42,
+        "history_len": 8,
+        "action_hist_len": 0,
+        "noise_std": 0.05,
+        "physical_dr": "off",
+        "disturb": true
+      },
+      "overrides": {
+        "env.privileged_state": "True",
+        "env.physical_dr": "False",
+        "env.history_len": 8,
+        "env.action_hist_len": 0,
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.noise_corr": 0.9,
+        "env.noise_bias_std": 0.01,
+        "env.action_latency_steps": 2,
+        "env.action_latency_max": 6,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_sym_s42.log"
+    },
+    "sym_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 12.71,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_sym/2026-09-08_11-22-09_sym_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_sym/2026-09-08_11-22-09_sym_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "critic": "sym",
+        "seed": 123,
+        "history_len": 8,
+        "action_hist_len": 0,
+        "noise_std": 0.05,
+        "physical_dr": "off",
+        "disturb": true
+      },
+      "overrides": {
+        "env.privileged_state": "True",
+        "env.physical_dr": "False",
+        "env.history_len": 8,
+        "env.action_hist_len": 0,
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.noise_corr": 0.9,
+        "env.noise_bias_std": 0.01,
+        "env.action_latency_steps": 2,
+        "env.action_latency_max": 6,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_sym_s123.log"
+    },
+    "asym_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 12.68,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_asym/2026-09-08_11-34-51_asym_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_asym/2026-09-08_11-34-51_asym_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "critic": "asym",
+        "seed": 42,
+        "history_len": 8,
+        "action_hist_len": 0,
+        "noise_std": 0.05,
+        "physical_dr": "off",
+        "disturb": true
+      },
+      "overrides": {
+        "env.privileged_state": "True",
+        "env.physical_dr": "False",
+        "env.history_len": 8,
+        "env.action_hist_len": 0,
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.noise_corr": 0.9,
+        "env.noise_bias_std": 0.01,
+        "env.action_latency_steps": 2,
+        "env.action_latency_max": 6,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_asym_s42.log",
+      "note": "run dir recovered: a concurrent smoke test created a newer dir that the mtime lookup picked up; training itself completed normally"
+    },
+    "asym_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 12.67,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_asym/2026-09-08_11-47-32_asym_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/hover_asym/2026-09-08_11-47-32_asym_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "critic": "asym",
+        "seed": 123,
+        "history_len": 8,
+        "action_hist_len": 0,
+        "noise_std": 0.05,
+        "physical_dr": "off",
+        "disturb": true
+      },
+      "overrides": {
+        "env.privileged_state": "True",
+        "env.physical_dr": "False",
+        "env.history_len": 8,
+        "env.action_hist_len": 0,
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.noise_corr": 0.9,
+        "env.noise_bias_std": 0.01,
+        "env.action_latency_steps": 2,
+        "env.action_latency_max": 6,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_asym_s123.log"
+    }
+  }
+}
