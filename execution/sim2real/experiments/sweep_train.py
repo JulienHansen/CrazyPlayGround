@@ -111,6 +111,10 @@ def main():
                "--num_envs", str(args.num_envs),
                "--max_iterations", str(args.max_iterations),
                "--seed", str(r["seed"])]
+        # per-run agent entry point (used by the asymmetric-critic comparison, where
+        # two runs share an env config but differ in the agent YAML)
+        if r.get("agent"):
+            cmd += ["--agent", r["agent"]]
         cmd += [f"{k}={v}" for k, v in r["overrides"].items()]
         if not args.no_wandb:
             # `++` = set-or-append: `name`/`group` do not exist in skrl_ppo_cfg.yaml,
