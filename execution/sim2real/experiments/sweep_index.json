@@ -1,0 +1,566 @@
+{
+  "created": "2026-07-27T17:15:53.840448",
+  "task": "Vel-Hovering-Robust",
+  "num_envs": 4096,
+  "max_iterations": 600,
+  "runs": {
+    "n0.0_k1_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.55,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_17-16-00_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_17-16-00_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.0,
+        "history_len": 1,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "False",
+        "env.noise_std": 0.0,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.0_k1_d0_s42.log"
+    },
+    "n0.0_k1_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.54,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_17-43-34_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_17-43-34_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.0,
+        "history_len": 1,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "False",
+        "env.noise_std": 0.0,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.0_k1_d0_s123.log"
+    },
+    "n0.0_k4_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.32,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_18-10-06_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_18-10-06_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.0,
+        "history_len": 4,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "False",
+        "env.noise_std": 0.0,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.0_k4_d0_s42.log"
+    },
+    "n0.0_k4_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.6,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_18-36-25_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_18-36-25_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.0,
+        "history_len": 4,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "False",
+        "env.noise_std": 0.0,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.0_k4_d0_s123.log"
+    },
+    "n0.0_k8_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.53,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_19-03-01_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_19-03-01_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.0,
+        "history_len": 8,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "False",
+        "env.noise_std": 0.0,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.0_k8_d0_s42.log"
+    },
+    "n0.0_k8_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.38,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_19-29-33_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_19-29-33_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.0,
+        "history_len": 8,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "False",
+        "env.noise_std": 0.0,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.0_k8_d0_s123.log"
+    },
+    "n0.02_k1_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.3,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_19-55-56_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_19-55-56_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 1,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k1_d0_s42.log"
+    },
+    "n0.02_k1_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.25,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_20-22-14_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_20-22-14_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 1,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k1_d0_s123.log"
+    },
+    "n0.02_k4_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.26,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_20-48-29_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_20-48-29_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 4,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k4_d0_s42.log"
+    },
+    "n0.02_k4_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.42,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_21-14-45_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_21-14-45_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 4,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k4_d0_s123.log"
+    },
+    "n0.02_k8_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.51,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_21-41-10_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_21-41-10_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 8,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k8_d0_s42.log"
+    },
+    "n0.02_k8_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.34,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_22-07-41_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_22-07-41_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 8,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k8_d0_s123.log"
+    },
+    "n0.05_k1_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.32,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_22-34-01_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_22-34-01_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 1,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k1_d0_s42.log"
+    },
+    "n0.05_k1_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.29,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_23-00-20_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_23-00-20_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 1,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k1_d0_s123.log"
+    },
+    "n0.05_k4_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.6,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_23-26-38_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_23-26-38_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 4,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k4_d0_s42.log"
+    },
+    "n0.05_k4_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.5,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_23-53-14_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-27_23-53-14_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 4,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k4_d0_s123.log"
+    },
+    "n0.05_k8_d0_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.48,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_00-19-44_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_00-19-44_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 8,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k8_d0_s42.log"
+    },
+    "n0.05_k8_d0_s123": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 26.53,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_00-46-13_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_00-46-13_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 8,
+        "disturb": false,
+        "action_rate": 0.0,
+        "seed": 123
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "False"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k8_d0_s123.log"
+    },
+    "n0.02_k4_d1_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.8,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_01-12-44_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_01-12-44_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 4,
+        "disturb": true,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01,
+        "env.disturb_force_bias_range": "[-0.02,0.02]",
+        "env.disturb_torque_bias_range": "[-0.0002,0.0002]",
+        "env.disturb_gust_force_range": "[-0.06,0.06]",
+        "env.disturb_gust_torque_range": "[-0.0006,0.0006]"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k4_d1_s42.log"
+    },
+    "n0.02_k8_d1_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.72,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_01-40-32_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_01-40-32_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.02,
+        "history_len": 8,
+        "disturb": true,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.02,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01,
+        "env.disturb_force_bias_range": "[-0.02,0.02]",
+        "env.disturb_torque_bias_range": "[-0.0002,0.0002]",
+        "env.disturb_gust_force_range": "[-0.06,0.06]",
+        "env.disturb_gust_torque_range": "[-0.0006,0.0006]"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.02_k8_d1_s42.log"
+    },
+    "n0.05_k4_d1_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.42,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_02-08-15_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_02-08-15_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 4,
+        "disturb": true,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 4,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01,
+        "env.disturb_force_bias_range": "[-0.02,0.02]",
+        "env.disturb_torque_bias_range": "[-0.0002,0.0002]",
+        "env.disturb_gust_force_range": "[-0.06,0.06]",
+        "env.disturb_gust_torque_range": "[-0.0006,0.0006]"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k4_d1_s42.log"
+    },
+    "n0.05_k8_d1_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.57,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_02-35-40_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_02-35-40_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 8,
+        "disturb": true,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01,
+        "env.disturb_force_bias_range": "[-0.02,0.02]",
+        "env.disturb_torque_bias_range": "[-0.0002,0.0002]",
+        "env.disturb_gust_force_range": "[-0.06,0.06]",
+        "env.disturb_gust_torque_range": "[-0.0006,0.0006]"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k8_d1_s42.log"
+    },
+    "n0.05_k1_d1_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.31,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_03-03-14_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_03-03-14_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 1,
+        "disturb": true,
+        "action_rate": 0.0,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 1,
+        "env.action_rate_reward_scale": 0.0,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01,
+        "env.disturb_force_bias_range": "[-0.02,0.02]",
+        "env.disturb_torque_bias_range": "[-0.0002,0.0002]",
+        "env.disturb_gust_force_range": "[-0.06,0.06]",
+        "env.disturb_gust_torque_range": "[-0.0006,0.0006]"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k1_d1_s42.log"
+    },
+    "n0.05_k8_d1_ar_s42": {
+      "status": "ok",
+      "returncode": 0,
+      "minutes": 27.74,
+      "run_dir": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_03-30-33_ppo_torch",
+      "checkpoint": "/home/alouette/Bureau/CrazyPlayGround/logs/skrl/cartpole_direct/2026-07-28_03-30-33_ppo_torch/checkpoints/best_agent.pt",
+      "factors": {
+        "noise_std": 0.05,
+        "history_len": 8,
+        "disturb": true,
+        "action_rate": -0.05,
+        "seed": 42
+      },
+      "overrides": {
+        "env.add_noise": "True",
+        "env.noise_std": 0.05,
+        "env.history_len": 8,
+        "env.action_rate_reward_scale": -0.05,
+        "env.disturb": "True",
+        "env.disturb_gust_prob": 0.01,
+        "env.disturb_force_bias_range": "[-0.02,0.02]",
+        "env.disturb_torque_bias_range": "[-0.0002,0.0002]",
+        "env.disturb_gust_force_range": "[-0.06,0.06]",
+        "env.disturb_gust_torque_range": "[-0.0006,0.0006]"
+      },
+      "log": "/home/alouette/Bureau/CrazyPlayGround/execution/sim2real/experiments/train_n0.05_k8_d1_ar_s42.log"
+    }
+  }
+}
