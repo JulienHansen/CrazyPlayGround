@@ -49,7 +49,7 @@ Thumbs.db
 
 # Collected flight data (real + sim)
 execution/sim2real/data/
-execution/sim2real/data_sim/
+execution/sim2real/data_sim*/
 execution/sim2real/data_sweep*/
 execution/sim2real/experiments/*.log
 wandb/

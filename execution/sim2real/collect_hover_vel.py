@@ -114,6 +114,15 @@ class Policy(GaussianMixin, Model):
         return mean, {"log_std": self.log_std_parameter}
 
 
+def blank_row() -> dict:
+    """Every schema column at 0.0.
+
+    Producers start from this and overwrite what they can measure, so adding a
+    column here cannot leave another producer writing a short row.
+    """
+    return {c: 0.0 for c in CSV_COLUMNS}
+
+
 def wait_until(deadline: float, spin_margin: float) -> tuple[float, float, int]:
     """Hold until `deadline` (a perf_counter value). Returns (held_until, slept_ms, overran).
 

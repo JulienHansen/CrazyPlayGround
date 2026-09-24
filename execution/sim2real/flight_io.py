@@ -36,6 +36,13 @@ def write_flight(run_dir: str, records, columns, prefer_parquet: bool = True,
     Falls back to CSV when pyarrow is missing: losing a flight because a library
     is absent is never the right trade.
     """
+    if records:
+        missing = [c for c in columns if c not in records[0]]
+        if missing:
+            raise ValueError(
+                f"recording is missing {len(missing)} schema column(s): {missing}. "
+                "Start the row from collect_hover_vel.blank_row()."
+            )
     os.makedirs(run_dir, exist_ok=True)
     wrote = None
     if prefer_parquet and pq is not None:

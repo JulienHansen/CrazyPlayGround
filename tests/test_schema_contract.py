@@ -54,3 +54,27 @@ def test_a_run_missing_metadata_still_loads(tmp_path, columns, hover_rows):
     os.remove(os.path.join(str(d), "metadata.json"))
     m = compute_metrics(load_flight(str(d)))
     assert m["ended_early"] is False
+
+
+def test_blank_row_covers_the_whole_schema(columns):
+    """Producers build on blank_row, so it must stay in step with CSV_COLUMNS."""
+    from collect_hover_vel import blank_row
+    row = blank_row()
+    assert set(row) == set(columns)
+    assert all(isinstance(v, float) for v in row.values())
+
+
+def test_writing_a_short_row_names_the_missing_columns(tmp_path, columns, hover_rows):
+    """A new schema column must fail loudly in the producer, not as a bare KeyError.
+
+    The sim evaluator once wrote every column but the four loop-timing ones, and
+    the failure surfaced as KeyError('dt_infer_ms') from inside pyarrow.
+    """
+    from flight_io import write_flight
+    rows = hover_rows(columns)
+    for r in rows:
+        del r[columns[-1]]
+    with pytest.raises(ValueError) as e:
+        write_flight(str(tmp_path / "run"), rows, columns)
+    assert columns[-1] in str(e.value)
+    assert "blank_row" in str(e.value)

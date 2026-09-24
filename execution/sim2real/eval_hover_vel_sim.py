@@ -70,7 +70,7 @@ import CrazyPlayGround.tasks  # noqa: F401
 
 # reuse the exact schema + metadata helpers the real collector writes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from collect_hover_vel import CSV_COLUMNS, _sha256, _git_commit, _versions  # noqa: E402
+from collect_hover_vel import CSV_COLUMNS, blank_row, _sha256, _git_commit, _versions  # noqa: E402
 from flight_io import write_flight  # noqa: E402
 
 RAD2DEG = 180.0 / math.pi
@@ -156,7 +156,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         cmd = a * max_velocity
         tgt = torch.tensor(args_cli.target, device=device)
 
-        records.append({
+        row = blank_row()
+        row.update({
             "t_mono": step * dt, "t_wall": 0.0, "step": step,
             "obs_vb_x": o[0].item(), "obs_vb_y": o[1].item(), "obs_vb_z": o[2].item(),
             "obs_errb_x": o[3].item(), "obs_errb_y": o[4].item(), "obs_errb_z": o[5].item(),
@@ -172,7 +173,10 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             "vbat": 0.0,                                     # no battery model
             "varPX": 0.0, "varPY": 0.0, "varPZ": 0.0,        # true state, no estimator
             "dist_to_target": torch.linalg.norm(pos - tgt).item(),
+            # loop timing is a property of the deployment loop; sim has no radio
+            # and no wall-clock schedule, so these stay at their blank_row zeros.
         })
+        records.append(row)
 
         obs, _, terminated, truncated, _ = env.step(action)
         if bool(terminated[0].item()):
