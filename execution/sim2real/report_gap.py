@@ -34,6 +34,35 @@ METRICS = [
     ("effective_rate_hz", "control rate [Hz]", False),
 ]
 
+# CL-2 asks whether a simulator ranking survives the transfer, so only the two
+# metrics a training decision is actually made on are ranked.
+RANKED = [
+    ("mean_pos_err_m", "mean position error", True),
+    ("cmd_smoothness_mps2", "command chatter", True),
+]
+
+
+def spearman(sim, real):
+    """Spearman rank correlation, plus the concordant-pair count.
+
+    With a handful of policies the pair count is the honest summary: SRCC over
+    four points moves in steps of 0.2 and reads as more precise than it is.
+    """
+    def rank(a):
+        order = np.argsort(a)
+        r = np.empty(len(a), dtype=np.float64)
+        r[order] = np.arange(len(a))
+        return r
+
+    n = len(sim)
+    if n < 3:
+        return float("nan"), 0, 0
+    d2 = float(((rank(sim) - rank(real)) ** 2).sum())
+    srcc = 1.0 - 6.0 * d2 / (n * (n * n - 1))
+    conc = sum(1 for i in range(n) for j in range(i + 1, n)
+               if (sim[i] - sim[j]) * (real[i] - real[j]) > 0)
+    return srcc, conc, n * (n - 1) // 2
+
 
 def policy_of(run_dir, by_sha):
     meta_path = os.path.join(run_dir, "metadata.json")
@@ -112,13 +141,31 @@ def main():
         lines.append(f"| {pid} | {len(sim[pid])} / {len(real[pid])} | " + " | ".join(cells) + " |")
         report[pid] = entry
 
-    text = "\n".join(lines)
+    # CL-2: does the simulator rank policies the way hardware does?
+    rank_lines = ["", "## CL-2 rank correlation", "",
+                  "| metric | SRCC | concordant pairs | sim ranking | real ranking |",
+                  "|---|---|---|---|---|"]
+    for key, label, _ in RANKED:
+        sv = np.array([report[p][key]["sim"] for p in shared])
+        rv = np.array([report[p][key]["real"] for p in shared])
+        srcc, conc, total = spearman(sv, rv)
+        sim_order = " < ".join(shared[i] for i in np.argsort(sv))
+        real_order = " < ".join(shared[i] for i in np.argsort(rv))
+        rank_lines.append(f"| {label} | {srcc:+.2f} | {conc}/{total} | {sim_order} | {real_order} |")
+        report.setdefault("_rank_correlation", {})[key] = {
+            "srcc": srcc, "concordant": conc, "pairs": total,
+            "n_policies": len(shared)}
+
+    text = "\n".join(lines + rank_lines)
     print(text)
     print("\nRatio is real / sim. Above 1 means hardware is worse.")
+    print(f"SRCC is over {len(shared)} policies, so read it as a direction, not an estimate.")
     if args.markdown:
         with open(args.markdown, "w") as f:
             f.write("# CL-1 hover gap, per policy\n\n" + text +
-                    "\n\nRatio is real / sim. Above 1 means hardware is worse.\n")
+                    "\n\nRatio is real / sim. Above 1 means hardware is worse.\n"
+                    f"SRCC is over {len(shared)} policies, so read it as a direction, "
+                    "not an estimate.\n")
         print(f"\n[INFO] markdown -> {args.markdown}")
     if args.json_out:
         json.dump(report, open(args.json_out, "w"), indent=2)
