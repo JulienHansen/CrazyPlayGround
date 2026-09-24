@@ -153,6 +153,11 @@ def compute_metrics(flight: dict) -> dict:
         "mean_speed_mps": round(float(np.mean(_finite(speed))), 4),
         "cmd_smoothness_mps_per_step": round(cmd_smoothness, 5),
         "act_smoothness_per_step": round(act_smoothness, 5),
+        # Per-step chatter is not comparable across loop rates: a slower loop takes
+        # bigger steps along the same trajectory. The real drone runs at ~85 Hz and
+        # the simulator at 100, so the gap is reported per second as well.
+        "cmd_smoothness_mps2": round(cmd_smoothness / mean_dt, 4) if mean_dt > 0 else None,
+        "act_smoothness_per_s": round(act_smoothness / mean_dt, 4) if mean_dt > 0 else None,
         "mean_motor_pwm": round(mean_motor, 1),
         "thrust_battery_corr": None if np.isnan(thrust_bat_corr) else round(thrust_bat_corr, 3),
         "mean_vbat_v": round(float(np.mean(vbat[valid_bat])) if np.any(valid_bat) else 0.0, 3),
@@ -172,7 +177,8 @@ def aggregate(all_metrics: list) -> dict:
     numeric_keys = [
         "mean_pos_err_m", "rms_pos_err_m", "max_drift_m", "mean_horiz_err_m",
         "mean_vert_err_m", "mean_speed_mps", "cmd_smoothness_mps_per_step",
-        "act_smoothness_per_step", "mean_motor_pwm", "mean_vbat_v", "mean_max_kalman_var",
+        "act_smoothness_per_step", "cmd_smoothness_mps2", "act_smoothness_per_s",
+        "mean_motor_pwm", "mean_vbat_v", "mean_max_kalman_var",
     ]
     agg = {"n_trials": len(all_metrics),
            "success_rate": round(float(np.mean([m["success"] for m in all_metrics])), 3),

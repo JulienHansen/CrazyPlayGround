@@ -86,3 +86,29 @@ def test_non_finite_samples_do_not_poison_the_aggregate(tmp_path, columns, hover
     m = compute_metrics(load_flight(str(d)))
     assert math.isfinite(m["mean_pos_err_m"]), "a single NaN sample poisoned the mean"
     assert math.isfinite(m["cmd_smoothness_mps_per_step"])
+
+
+def test_chatter_per_second_is_rate_independent(tmp_path, columns, hover_rows):
+    """The real loop runs at ~85 Hz and the simulator at 100.
+
+    Per-step chatter therefore favours the faster loop for free. The per-second
+    figure must describe the same underlying command signal at either rate.
+    """
+    from analyze_hover import load_flight, compute_metrics
+
+    def ramp(dt, n):
+        # the same command slope, 0.5 m/s per second, sampled at two rates
+        rows = hover_rows(columns, n=n, dt=dt)
+        for i, r in enumerate(rows):
+            r["cmd_vx"] = 0.5 * i * dt
+        return rows
+
+    fast = compute_metrics(load_flight(str(
+        write_flight(tmp_path / "fast", ramp(0.010, 1000), columns, duration_s=10.0))))
+    slow = compute_metrics(load_flight(str(
+        write_flight(tmp_path / "slow", ramp(0.0118, 848), columns, duration_s=10.0))))
+
+    # per step the slower loop looks 18% worse purely from its sampling rate
+    assert slow["cmd_smoothness_mps_per_step"] > 1.1 * fast["cmd_smoothness_mps_per_step"]
+    # per second the two agree
+    assert slow["cmd_smoothness_mps2"] == pytest.approx(fast["cmd_smoothness_mps2"], rel=0.02)

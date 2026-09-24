@@ -25,7 +25,9 @@ METRICS = [
     ("mean_vert_err_m",             "vertical error [m]"),
     ("mean_speed_mps",              "mean speed [m/s]"),
     ("cmd_smoothness_mps_per_step", "command chatter [m/s/step]"),
+    ("cmd_smoothness_mps2",         "command chatter [m/s^2]"),
     ("act_smoothness_per_step",     "action chatter [1/step]"),
+    ("act_smoothness_per_s",        "action chatter [1/s]"),
 ]
 
 # Present in the CSV but meaningless in sim -> never compare these.
@@ -84,7 +86,9 @@ def main():
 
     print("\nNote: motor PWM, battery and Kalman-variance metrics are not modelled in sim "
           "and are excluded.\nRatio > 1 means sim is larger; for error/chatter metrics "
-          "ratio < 1 means the real drone is WORSE than sim.")
+          "ratio < 1 means the real drone is WORSE than sim.\nCompare chatter per second, "
+          "not per step: the real loop runs slower than the simulator,\nwhich inflates its "
+          "per-step differences on its own.")
 
     if args.json_out:
         with open(args.json_out, "w") as f:
