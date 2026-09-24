@@ -130,6 +130,23 @@ def compute_metrics(flight: dict) -> dict:
             settle_time = float(t[i] - t[0])
             break
 
+    # loop timing: where the control period actually goes. Written by collectors
+    # that instrument the loop; absent from older flights, hence the .get().
+    def _ms(col):
+        v = d.get(col)
+        if v is None or v.size == 0:
+            return None
+        v = _finite(v)
+        return None if v.size == 0 else (round(float(np.mean(v)), 3),
+                                         round(float(np.percentile(v, 95)), 3))
+    timing = {k: _ms(c) for k, c in (("infer", "dt_infer_ms"), ("send", "dt_send_ms"),
+                                     ("body", "dt_body_ms"), ("sleep", "dt_sleep_ms"))}
+    period_ms = mean_dt * 1e3
+    rate_loss_ms = None
+    if timing["body"] is not None and period_ms > 0:
+        # commanded period is 10 ms at 100 Hz; anything above it is the loss
+        rate_loss_ms = round(period_ms - 1000.0 / 100.0, 3)
+
     # estimator quality
     varp = np.stack([d["varPX"], d["varPY"], d["varPZ"]], axis=1)
     mean_max_varp = float(np.mean(np.max(varp, axis=1)))
@@ -155,6 +172,8 @@ def compute_metrics(flight: dict) -> dict:
         "settle_time_s": None if np.isnan(settle_time) else round(settle_time, 3),
         "min_z_after_grace_m": round(min_z_after_grace, 3),
         "mean_max_kalman_var": round(mean_max_varp, 5),
+        "loop_ms_mean_p95": {k: v for k, v in timing.items() if v is not None} or None,
+        "period_excess_ms": rate_loss_ms,
         "crashed": crashed,
         "ended_early": ended_early,
         "success": success,

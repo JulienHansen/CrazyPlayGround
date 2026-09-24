@@ -114,6 +114,30 @@ class Policy(GaussianMixin, Model):
         return mean, {"log_std": self.log_std_parameter}
 
 
+def wait_until(deadline: float, spin_margin: float) -> tuple[float, float, int]:
+    """Hold until `deadline` (a perf_counter value). Returns (held_until, slept_ms, overran).
+
+    time.sleep returns late -- by ~0.1 ms on Linux but 1-2 ms on macOS -- and the
+    error lands on every iteration, so a 10 ms period becomes 12 ms and a 100 Hz
+    loop runs at 85 Hz. Sleeping to `spin_margin` before the deadline and
+    busy-waiting the rest removes the overshoot, at the cost of a few percent of
+    one core.
+
+    An overrun resynchronises the schedule to now instead of running flat out to
+    catch up: a burst of back-to-back setpoints is worse for the drone than a late
+    one.
+    """
+    now = time.perf_counter()
+    if now >= deadline:
+        return now, 0.0, 1
+    t0 = now
+    if deadline - now > spin_margin:
+        time.sleep(deadline - now - spin_margin)
+    while time.perf_counter() < deadline:
+        pass
+    return deadline, (time.perf_counter() - t0) * 1e3, 0
+
+
 # ============================================================
 #                 COLLECTING CRAZYFLIE CONTROLLER
 # ============================================================
@@ -142,6 +166,10 @@ CSV_COLUMNS = [
     # estimator quality
     "varPX", "varPY", "varPZ",
     "dist_to_target",
+    # per-iteration loop timing, in ms. The control rate on hardware measures
+    # ~85 Hz, not the commanded 100 Hz, and these columns say where the missing
+    # 2 ms goes: policy inference, the blocking radio send, or the sleep itself.
+    "dt_infer_ms", "dt_send_ms", "dt_body_ms", "dt_sleep_ms",
 ]
 
 
@@ -151,7 +179,8 @@ class CollectingController:
     def __init__(self, uri: str, agent: PPO, run_dir: str, meta: dict,
                  initial_target=None, duration: Optional[float] = None,
                  roam: bool = False, fast_rate_hz: int = 100, history_len: int = 1,
-                 action_hist_len: int = 0, excite: dict | None = None):
+                 action_hist_len: int = 0, excite: dict | None = None,
+                 spin_margin_ms: float = 2.0):
         self.uri = uri
         self.excite = excite or {"mode": "none"}
         self.history_len = max(1, int(history_len))
@@ -166,6 +195,9 @@ class CollectingController:
         self.duration = duration
         self.roam = roam
         self.fast_period_ms = max(10, int(round(1000.0 / fast_rate_hz)))
+        self.spin_margin_ms = float(spin_margin_ms)
+        self._last_sleep_ms = 0.0
+        self._overruns = 0
 
         # latest telemetry snapshot (updated by log callbacks, read by control loop)
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
@@ -303,7 +335,8 @@ class CollectingController:
                 pass
 
     def _record(self, step, loop_start, obs, action, velocity_cmd, tgt, dist,
-                pos, vel, quat, gyro, acc, motor, vbat, varp, now_start=None):
+                pos, vel, quat, gyro, acc, motor, vbat, varp, now_start=None,
+                timing=None):
         """Append one time-aligned row (shared by the policy and excitation paths)."""
         now = time.time()
         self.records.append({
@@ -323,12 +356,26 @@ class CollectingController:
             "vbat": vbat,
             "varPX": varp[0].item(), "varPY": varp[1].item(), "varPZ": varp[2].item(),
             "dist_to_target": dist,
+            **(timing or {"dt_infer_ms": 0.0, "dt_send_ms": 0.0,
+                          "dt_body_ms": 0.0, "dt_sleep_ms": 0.0}),
         })
+
+    # ---------- Loop scheduling ----------
+
+    def _wait_until(self, deadline: float, spin_margin: float) -> float:
+        held, slept_ms, overran = wait_until(deadline, spin_margin)
+        self._last_sleep_ms = slept_ms
+        self._overruns += overran
+        return held
 
     # ---------- Control loop ----------
 
     def control_loop(self):
         INTERVAL = 1.0 / CONTROL_RATE_HZ
+        # time.sleep returns late -- by ~0.1 ms on Linux but 1-2 ms on macOS, which
+        # alone accounts for the 100 -> 85 Hz loss measured on hardware. Sleep to
+        # SPIN_MARGIN before the deadline, then busy-wait the remainder.
+        SPIN_MARGIN = max(0.0, self.spin_margin_ms / 1000.0)
 
         logger.info("Waiting for first position estimate...")
         while not self.position_received and self.running:
@@ -349,8 +396,10 @@ class CollectingController:
         nn_start_time = loop_start
         GRACE_PERIOD = 3.0
         step = 0
+        deadline = time.perf_counter()
         while self.cf.is_connected() and self.running:
             start_time = time.time()
+            t_body0 = time.perf_counter()
 
             # ── Safety watchdog (identical policy to exec_vel.py) ────────────
             elapsed_since_nn = time.time() - nn_start_time
@@ -403,15 +452,20 @@ class CollectingController:
                 action = torch.zeros(3, dtype=torch.float32, device=device)
                 action[self.excite["axis"]] = a_ex
                 velocity_cmd = action * MAX_VELOCITY
+                t_send0 = time.perf_counter()
                 self.cf.commander.send_velocity_world_setpoint(
                     velocity_cmd[0].item(), velocity_cmd[1].item(), velocity_cmd[2].item(), 0.0)
+                t_send1 = time.perf_counter()
                 self._record(step, now_start=start_time, loop_start=loop_start, obs=obs,
                              action=action, velocity_cmd=velocity_cmd, tgt=tgt, dist=dist,
                              pos=pos, vel=vel, quat=quat, gyro=gyro, acc=acc,
-                             motor=motor, vbat=vbat, varp=varp)
+                             motor=motor, vbat=vbat, varp=varp,
+                             timing={"dt_infer_ms": 0.0,
+                                     "dt_send_ms": (t_send1 - t_send0) * 1e3,
+                                     "dt_body_ms": (t_send1 - t_body0) * 1e3,
+                                     "dt_sleep_ms": 0.0})
                 step += 1
-                elapsed = time.time() - start_time
-                time.sleep(max(0, INTERVAL - elapsed))
+                deadline = self._wait_until(deadline + INTERVAL, SPIN_MARGIN)
                 continue
 
             # Frame stacking for policies trained with env.history_len=K>1. The
@@ -436,26 +490,35 @@ class CollectingController:
                                       for _ in range(self.action_hist_len)]
                 policy_in = torch.cat([policy_in] + self._act_hist, dim=-1)
 
+            t_infer0 = time.perf_counter()
             with torch.no_grad():
                 _, outputs = self.agent.act(policy_in.unsqueeze(0), None, timestep=0, timesteps=1)
                 action = outputs["mean_actions"].squeeze(0).clamp(-1.0, 1.0)
+            t_infer1 = time.perf_counter()
 
             if self.action_hist_len > 0:
                 self._act_hist.append(action.clone())
                 self._act_hist.pop(0)
 
             velocity_cmd = action * MAX_VELOCITY
+            # Blocking: cflib's radio out_queue has maxsize 1, so this returns only
+            # once the link thread has taken the previous packet.
+            t_send0 = time.perf_counter()
             self.cf.commander.send_velocity_world_setpoint(
                 velocity_cmd[0].item(), velocity_cmd[1].item(), velocity_cmd[2].item(), 0.0)
+            t_send1 = time.perf_counter()
 
             self._record(step, loop_start=loop_start, obs=obs, action=action,
                          velocity_cmd=velocity_cmd, tgt=tgt, dist=dist,
                          pos=pos, vel=vel, quat=quat, gyro=gyro, acc=acc,
-                         motor=motor, vbat=vbat, varp=varp)
+                         motor=motor, vbat=vbat, varp=varp,
+                         timing={"dt_infer_ms": (t_infer1 - t_infer0) * 1e3,
+                                 "dt_send_ms": (t_send1 - t_send0) * 1e3,
+                                 "dt_body_ms": (t_send1 - t_body0) * 1e3,
+                                 "dt_sleep_ms": self._last_sleep_ms})
             step += 1
 
-            elapsed = time.time() - start_time
-            time.sleep(max(0, INTERVAL - elapsed))
+            deadline = self._wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
         try:
             self.cf.commander.send_stop_setpoint()
@@ -660,6 +723,8 @@ def build_metadata(args, checkpoint_path) -> dict:
         "roam": args.roam,
         "duration_s": args.duration,
         "control_rate_hz": CONTROL_RATE_HZ,
+        "log_rate_hz": args.log_rate_hz,
+        "spin_margin_ms": args.spin_margin_ms,
         "sim_dt": SIM_DT,
         "decimation": DECIMATION,
         "max_velocity_mps": MAX_VELOCITY,
@@ -718,7 +783,14 @@ def main():
                         help="Number of past commanded actions in the observation; must match "
                              "env.action_hist_len the policy was trained with (0 = none).")
     parser.add_argument("--log-rate-hz", type=int, default=100,
-                        help="Rate for the fast log blocks (posvel/quat/imu). Lower to 50 if radio drops packets.")
+                        help="Rate for the fast log blocks (posvel/quat/imu). Every log sample costs the "
+                             "radio a round trip, which the blocking setpoint send then waits for; lower "
+                             "this to 50 to trade telemetry resolution for control rate.")
+    parser.add_argument("--spin-margin-ms", type=float, default=2.0,
+                        help="Busy-wait the last N ms of each control period instead of sleeping through "
+                             "it. The absolute deadline already holds the rate; the spin removes the "
+                             "residual phase error and jitter, and only while N covers how late sleep "
+                             "actually returns (1-2 ms on macOS). 0 disables it.")
     parser.add_argument("--outdir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
                         help="Root output directory. A per-run subfolder is created.")
@@ -754,7 +826,8 @@ def main():
     controller = CollectingController(
         uri=args.uri, agent=agent, run_dir=run_dir, meta=meta,
         initial_target=args.target, duration=duration, roam=args.roam,
-        fast_rate_hz=args.log_rate_hz, history_len=args.history_len,
+        fast_rate_hz=args.log_rate_hz, spin_margin_ms=args.spin_margin_ms,
+        history_len=args.history_len,
         action_hist_len=args.action_hist_len, excite=excite)
 
     logger.info(f"Run directory: {run_dir}")
