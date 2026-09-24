@@ -31,32 +31,24 @@ WHAT IT CAN AND CANNOT DO
 """
 
 import os
-import csv
+import sys
 import glob
 import json
 import argparse
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from flight_io import read_flight, resolve  # noqa: E402
+
 DT_NOMINAL = 0.01           # 100 Hz policy step
 AXES = ("x", "y", "z")
 
 
 def load_csv(path):
-    if os.path.isdir(path):
-        path = os.path.join(path, "flight.csv")
-    cols = {}
-    with open(path, newline="") as f:
-        r = csv.DictReader(f)
-        for n in r.fieldnames:
-            cols[n] = []
-        for row in r:
-            for n in r.fieldnames:
-                try:
-                    cols[n].append(float(row[n]))
-                except ValueError:
-                    cols[n].append(np.nan)
-    return {k: np.asarray(v, float) for k, v in cols.items()}, path
+    """Load a run in whichever format it was recorded in. Name kept for callers."""
+    resolved = resolve(path)
+    return read_flight(resolved), resolved
 
 
 # ────────────────────────────── delay ──────────────────────────────

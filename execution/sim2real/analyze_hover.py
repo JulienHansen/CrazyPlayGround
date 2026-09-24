@@ -11,12 +11,12 @@ Usage:
     # many trials -> per-trial table + aggregate mean/spread (protocol: report mean and spread)
     python analyze_hover.py execution/sim2real/data/*_vel --plot
 
-Accepts run directories (containing flight.csv) or direct paths to flight.csv.
+Accepts run directories (containing flight.parquet or flight.csv) or direct paths
+to either file.
 numpy is required; matplotlib is optional (only for --plot).
 """
 
 import os
-import csv
 import sys
 import json
 import glob
@@ -24,38 +24,25 @@ import argparse
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from flight_io import read_flight, resolve as _resolve_flight  # noqa: E402
+
 # A flight counts as successful if it never crashed and stayed close to target.
 SUCCESS_POS_ERR_M = 0.15   # mean position error below this = "good hover"
 CRASH_Z_M = 0.10           # altitude below this = crash/ground contact
 SETTLE_RADIUS_M = 0.15     # radius used for settling-time estimate
 
 
-def _resolve_csv(path: str) -> str:
-    if os.path.isdir(path):
-        return os.path.join(path, "flight.csv")
-    return path
-
-
 def load_flight(path: str) -> dict:
-    csv_path = _resolve_csv(path)
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"No flight.csv at {csv_path}")
-    cols = {}
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for name in reader.fieldnames:
-            cols[name] = []
-        for row in reader:
-            for name in reader.fieldnames:
-                cols[name].append(float(row[name]))
-    data = {k: np.asarray(v, dtype=np.float64) for k, v in cols.items()}
-
-    meta_path = os.path.join(os.path.dirname(csv_path), "metadata.json")
+    flight_path = _resolve_flight(path)
+    data = read_flight(flight_path)
+    meta_path = os.path.join(os.path.dirname(flight_path), "metadata.json")
     meta = {}
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
-    return {"data": data, "meta": meta, "name": os.path.basename(os.path.dirname(csv_path) or csv_path)}
+    return {"data": data, "meta": meta,
+            "name": os.path.basename(os.path.dirname(flight_path) or flight_path)}
 
 
 def _finite(a: np.ndarray) -> np.ndarray:
@@ -227,8 +214,9 @@ def plot_flight(flight: dict, out_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Compute sim2real hover metrics from collected flights.")
-    parser.add_argument("paths", nargs="+", help="Run directories or flight.csv paths (globs allowed).")
-    parser.add_argument("--plot", action="store_true", help="Save a per-flight plot next to each flight.csv.")
+    parser.add_argument("paths", nargs="+",
+                        help="Run directories, or flight.parquet / flight.csv paths (globs allowed).")
+    parser.add_argument("--plot", action="store_true", help="Save a per-flight plot next to each recording.")
     parser.add_argument("--json-out", type=str, default=None, help="Write the full metrics report to this JSON file.")
     args = parser.parse_args()
 
@@ -251,8 +239,7 @@ def main():
             if k != "name":
                 print(f"  {k:28s}: {v}")
         if args.plot:
-            csv_path = _resolve_csv(p)
-            plot_flight(flight, os.path.join(os.path.dirname(csv_path), "flight.png"))
+            plot_flight(flight, os.path.join(os.path.dirname(_resolve_flight(p)), "flight.png"))
 
     if not all_metrics:
         print("No flights loaded.")

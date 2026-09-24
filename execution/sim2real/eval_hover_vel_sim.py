@@ -50,7 +50,6 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import os
-import csv
 import json
 import time
 import math
@@ -72,6 +71,7 @@ import CrazyPlayGround.tasks  # noqa: F401
 # reuse the exact schema + metadata helpers the real collector writes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from collect_hover_vel import CSV_COLUMNS, _sha256, _git_commit, _versions  # noqa: E402
+from flight_io import write_flight  # noqa: E402
 
 RAD2DEG = 180.0 / math.pi
 
@@ -184,19 +184,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             break
 
     # ── write CSV / npz / metadata in the analyze_hover.py layout ─────────────
-    csv_path = os.path.join(run_dir, "flight.csv")
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        w.writeheader()
-        w.writerows(records)
-    print(f"[INFO] wrote {len(records)} rows -> {csv_path}")
-
-    try:
-        import numpy as np
-        np.savez(os.path.join(run_dir, "flight.npz"),
-                 **{c: np.array([r[c] for r in records], dtype=np.float64) for c in CSV_COLUMNS})
-    except Exception as e:
-        print(f"[WARN] npz not written: {e}")
+    path = write_flight(run_dir, records, CSV_COLUMNS)
+    print(f"[INFO] wrote {len(records)} rows -> {path}")
 
     meta = {
         "source": "sim",

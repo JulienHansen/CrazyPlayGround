@@ -9,8 +9,8 @@ records everything the sim-to-real protocol needs to a file:
     policy action and the velocity command actually sent.
 
 Output (per run, under ``--outdir``):
-    <run>/flight.csv       one row per control step (100 Hz), time-aligned
-    <run>/flight.npz       same data as numpy arrays (if numpy available)
+    <run>/flight.parquet   one row per control step (100 Hz), time-aligned
+                           (flight.csv instead, if pyarrow is missing or --csv is given)
     <run>/metadata.json    frozen config: checkpoint hash, git commit, rates,
                            frame/quaternion conventions, thresholds, versions
 
@@ -30,7 +30,7 @@ Conventions (must match vel_hovering.py):
 """
 
 import os
-import csv
+import sys
 import math
 import json
 import time
@@ -138,6 +138,10 @@ def wait_until(deadline: float, spin_margin: float) -> tuple[float, float, int]:
     return deadline, (time.perf_counter() - t0) * 1e3, 0
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from flight_io import write_flight, parquet_available  # noqa: E402
+
+
 # ============================================================
 #                 COLLECTING CRAZYFLIE CONTROLLER
 # ============================================================
@@ -180,7 +184,7 @@ class CollectingController:
                  initial_target=None, duration: Optional[float] = None,
                  roam: bool = False, fast_rate_hz: int = 100, history_len: int = 1,
                  action_hist_len: int = 0, excite: dict | None = None,
-                 spin_margin_ms: float = 2.0):
+                 spin_margin_ms: float = 2.0, also_csv: bool = False):
         self.uri = uri
         self.excite = excite or {"mode": "none"}
         self.history_len = max(1, int(history_len))
@@ -196,6 +200,7 @@ class CollectingController:
         self.roam = roam
         self.fast_period_ms = max(10, int(round(1000.0 / fast_rate_hz)))
         self.spin_margin_ms = float(spin_margin_ms)
+        self.also_csv = bool(also_csv)
         self._last_sleep_ms = 0.0
         self._overruns = 0
 
@@ -553,18 +558,11 @@ class CollectingController:
         if not self.records:
             logger.warning("No records collected — nothing written.")
             return
-        os.makedirs(self.run_dir, exist_ok=True)
-        csv_path = os.path.join(self.run_dir, "flight.csv")
-        with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            w.writeheader()
-            w.writerows(self.records)
-        logger.info(f"Wrote {len(self.records)} rows -> {csv_path}")
-
-        if np is not None:
-            arrays = {c: np.array([r[c] for r in self.records], dtype=np.float64) for c in CSV_COLUMNS}
-            np.savez(os.path.join(self.run_dir, "flight.npz"), **arrays)
-            logger.info(f"Wrote {os.path.join(self.run_dir, 'flight.npz')}")
+        path = write_flight(self.run_dir, self.records, CSV_COLUMNS, also_csv=self.also_csv)
+        logger.info(f"Wrote {len(self.records)} rows -> {path}")
+        if not parquet_available():
+            logger.warning("pyarrow not installed — wrote CSV instead of Parquet "
+                           "(4x larger). pip install pyarrow")
 
         self.meta["num_samples"] = len(self.records)
         self.meta["end_wall"] = time.time()
@@ -786,6 +784,9 @@ def main():
                         help="Rate for the fast log blocks (posvel/quat/imu). Every log sample costs the "
                              "radio a round trip, which the blocking setpoint send then waits for; lower "
                              "this to 50 to trade telemetry resolution for control rate.")
+    parser.add_argument("--csv", action="store_true",
+                        help="Also write flight.csv next to flight.parquet, for eyeballing a run "
+                             "between flights without any library installed.")
     parser.add_argument("--spin-margin-ms", type=float, default=2.0,
                         help="Busy-wait the last N ms of each control period instead of sleeping through "
                              "it. The absolute deadline already holds the rate; the spin removes the "
@@ -826,7 +827,7 @@ def main():
     controller = CollectingController(
         uri=args.uri, agent=agent, run_dir=run_dir, meta=meta,
         initial_target=args.target, duration=duration, roam=args.roam,
-        fast_rate_hz=args.log_rate_hz, spin_margin_ms=args.spin_margin_ms,
+        fast_rate_hz=args.log_rate_hz, spin_margin_ms=args.spin_margin_ms, also_csv=args.csv,
         history_len=args.history_len,
         action_hist_len=args.action_hist_len, excite=excite)
 

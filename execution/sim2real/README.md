@@ -27,10 +27,20 @@ Kalman variance. `collect_hover_vel.CSV_COLUMNS` is the single definition;
 simulator counterpart (motor PWM, battery, accelerometer, estimator variance) are
 written as zero and excluded from comparisons.
 
-Each run directory holds `flight.csv`, `flight.npz` and a `metadata.json` that pins
+Each run directory holds `flight.parquet` and a `metadata.json` that pins
 the checkpoint path and SHA-256, the git commit, the control rates and the frame
 conventions. The SHA-256 identifies which policy actually flew, independently of the
 `--tag` given on the command line.
+
+### Recording format
+
+Recordings are Parquet, written and read through `flight_io.py`. On a real
+1251-step flight that is 232 KB against 943 KB of equivalent CSV, and it reads
+about eight times faster. Every tool here loads either format, so flights recorded
+as CSV before the switch still analyse unchanged.
+
+`--csv` writes a CSV alongside, for eyeballing a run between flights. If pyarrow
+is missing the collector falls back to CSV on its own rather than losing a flight.
 
 ## Conventions
 
