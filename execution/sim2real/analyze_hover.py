@@ -56,8 +56,19 @@ def _finite(a: np.ndarray) -> np.ndarray:
     return a[np.isfinite(a)]
 
 
-def compute_metrics(flight: dict) -> dict:
+def compute_metrics(flight: dict, skip_s: float = 0.0) -> dict:
+    """Metrics for one flight, optionally ignoring the first `skip_s` seconds.
+
+    The approach transient is not part of the hover being measured, and it is not
+    matched between simulator and drone: the simulator starts 0.50 m below the goal
+    and the real drone took off to 0.36 m under a 1.00 m goal. Comparing the two
+    without trimming charges the drone for a longer climb.
+    """
     d = flight["data"]
+    if skip_s > 0.0 and "t_mono" in d and len(d["t_mono"]) > 1:
+        keep = d["t_mono"] >= d["t_mono"][0] + skip_s
+        if keep.any():
+            d = {k: v[keep] for k, v in d.items()}
     n_nonfinite = int(sum(int((~np.isfinite(v)).sum()) for v in d.values()))
     t = d["t_mono"]
     n = len(t)
@@ -140,6 +151,7 @@ def compute_metrics(flight: dict) -> dict:
 
     return {
         "name": flight["name"],
+        "skip_s": skip_s,
         "n_samples": n,
         "duration_s": round(duration, 3),
         "effective_rate_hz": round(1.0 / mean_dt, 1) if mean_dt > 0 else 0.0,
@@ -224,6 +236,9 @@ def main():
                         help="Run directories, or flight.parquet / flight.csv paths (globs allowed).")
     parser.add_argument("--plot", action="store_true", help="Save a per-flight plot next to each recording.")
     parser.add_argument("--json-out", type=str, default=None, help="Write the full metrics report to this JSON file.")
+    parser.add_argument("--skip-s", type=float, default=0.0,
+                        help="Ignore the first N seconds, so the approach transient does not enter "
+                             "the hover metrics.")
     args = parser.parse_args()
 
     expanded = []
@@ -238,7 +253,7 @@ def main():
         except FileNotFoundError as e:
             print(f"[SKIP] {e}")
             continue
-        m = compute_metrics(flight)
+        m = compute_metrics(flight, skip_s=args.skip_s)
         all_metrics.append(m)
         print(f"\n=== {m['name']} ===")
         for k, v in m.items():

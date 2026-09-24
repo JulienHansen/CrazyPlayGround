@@ -112,3 +112,30 @@ def test_chatter_per_second_is_rate_independent(tmp_path, columns, hover_rows):
     assert slow["cmd_smoothness_mps_per_step"] > 1.1 * fast["cmd_smoothness_mps_per_step"]
     # per second the two agree
     assert slow["cmd_smoothness_mps2"] == pytest.approx(fast["cmd_smoothness_mps2"], rel=0.02)
+
+
+def test_skip_s_drops_the_approach_transient(tmp_path, columns, hover_rows):
+    """The approach is not the hover, and it is not matched between sim and drone.
+
+    The simulator starts 0.50 m below the goal; the real drone took off to 0.36 m
+    under a 1.00 m goal. Charging the drone for the longer climb inflates the gap.
+    """
+    rows = hover_rows(columns, n=1000, dt=0.01)
+    for i, r in enumerate(rows):          # 2 s climb from 0.5 m, then exact hover
+        r["pos_z"] = 0.5 + 0.5 * min(1.0, i / 200.0)
+
+    d = write_flight(tmp_path / "run", rows, columns, duration_s=10.0)
+    whole = compute_metrics(load_flight(str(d)))
+    steady = compute_metrics(load_flight(str(d)), skip_s=3.0)
+
+    assert whole["mean_pos_err_m"] > 0.04, "the climb should show in the whole flight"
+    assert steady["mean_pos_err_m"] == pytest.approx(0.0, abs=1e-6)
+    assert steady["n_samples"] < whole["n_samples"]
+    assert steady["skip_s"] == 3.0
+
+
+def test_skip_s_beyond_the_flight_keeps_the_flight(tmp_path, columns, hover_rows):
+    """Trimming past the end must not silently produce an empty flight."""
+    d = write_flight(tmp_path / "run", hover_rows(columns, n=100), columns, duration_s=1.0)
+    m = compute_metrics(load_flight(str(d)), skip_s=999.0)
+    assert m["n_samples"] == 100
