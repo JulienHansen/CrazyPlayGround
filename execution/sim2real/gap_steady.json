@@ -1,0 +1,252 @@
+{
+  "A0": {
+    "note": "BASELINE (already flown 07-24)",
+    "n_sim": 2,
+    "n_real": 4,
+    "mean_pos_err_m": {
+      "sim": 0.017349999999999997,
+      "real": 0.0732,
+      "abs_gap": 0.055850000000000004,
+      "real_over_sim": 4.219020172910663
+    },
+    "rms_pos_err_m": {
+      "sim": 0.017349999999999997,
+      "real": 0.086725,
+      "abs_gap": 0.06937499999999999,
+      "real_over_sim": 4.998559077809799
+    },
+    "max_drift_m": {
+      "sim": 0.0184,
+      "real": 0.20535,
+      "abs_gap": 0.18695,
+      "real_over_sim": 11.160326086956522
+    },
+    "mean_horiz_err_m": {
+      "sim": 0.0068,
+      "real": 0.039225,
+      "abs_gap": 0.032425,
+      "real_over_sim": 5.7683823529411775
+    },
+    "mean_vert_err_m": {
+      "sim": 0.01595,
+      "real": 0.051750000000000004,
+      "abs_gap": 0.035800000000000005,
+      "real_over_sim": 3.2445141065830727
+    },
+    "cmd_smoothness_mps2": {
+      "sim": 0.1745,
+      "real": 5.523200000000001,
+      "abs_gap": 5.348700000000001,
+      "real_over_sim": 31.6515759312321
+    },
+    "cmd_smoothness_mps_per_step": {
+      "sim": 0.001745,
+      "real": 0.0656575,
+      "abs_gap": 0.0639125,
+      "real_over_sim": 37.626074498567334
+    },
+    "mean_speed_mps": {
+      "sim": 0.00575,
+      "real": 0.32735000000000003,
+      "abs_gap": 0.32160000000000005,
+      "real_over_sim": 56.9304347826087
+    },
+    "effective_rate_hz": {
+      "sim": 100.0,
+      "real": 84.025,
+      "abs_gap": -15.974999999999994,
+      "real_over_sim": 0.84025
+    }
+  },
+  "A1": {
+    "note": "K=8, noise .02, disturb",
+    "n_sim": 2,
+    "n_real": 4,
+    "mean_pos_err_m": {
+      "sim": 0.0287,
+      "real": 0.058300000000000005,
+      "abs_gap": 0.029600000000000005,
+      "real_over_sim": 2.0313588850174216
+    },
+    "rms_pos_err_m": {
+      "sim": 0.0287,
+      "real": 0.064125,
+      "abs_gap": 0.035425,
+      "real_over_sim": 2.2343205574912894
+    },
+    "max_drift_m": {
+      "sim": 0.0292,
+      "real": 0.154575,
+      "abs_gap": 0.125375,
+      "real_over_sim": 5.2936643835616435
+    },
+    "mean_horiz_err_m": {
+      "sim": 0.0056,
+      "real": 0.036175,
+      "abs_gap": 0.030574999999999998,
+      "real_over_sim": 6.459821428571429
+    },
+    "mean_vert_err_m": {
+      "sim": 0.02815,
+      "real": 0.04027499999999999,
+      "abs_gap": 0.01212499999999999,
+      "real_over_sim": 1.4307282415630547
+    },
+    "cmd_smoothness_mps2": {
+      "sim": 0.0058,
+      "real": 6.3162,
+      "abs_gap": 6.3104000000000005,
+      "real_over_sim": null
+    },
+    "cmd_smoothness_mps_per_step": {
+      "sim": 5.9999999999999995e-05,
+      "real": 0.074345,
+      "abs_gap": 0.07428499999999999,
+      "real_over_sim": null
+    },
+    "mean_speed_mps": {
+      "sim": 0.0006000000000000001,
+      "real": 0.348725,
+      "abs_gap": 0.348125,
+      "real_over_sim": null
+    },
+    "effective_rate_hz": {
+      "sim": 100.0,
+      "real": 84.95,
+      "abs_gap": -15.049999999999997,
+      "real_over_sim": 0.8495
+    }
+  },
+  "A3": {
+    "note": "K=8, latency-trained  <-- best in sim",
+    "n_sim": 2,
+    "n_real": 2,
+    "mean_pos_err_m": {
+      "sim": 0.03025,
+      "real": 0.02665,
+      "abs_gap": -0.003599999999999999,
+      "real_over_sim": 0.8809917355371901
+    },
+    "rms_pos_err_m": {
+      "sim": 0.03025,
+      "real": 0.027200000000000002,
+      "abs_gap": -0.003049999999999997,
+      "real_over_sim": 0.8991735537190083
+    },
+    "max_drift_m": {
+      "sim": 0.0307,
+      "real": 0.0485,
+      "abs_gap": 0.0178,
+      "real_over_sim": 1.5798045602605864
+    },
+    "mean_horiz_err_m": {
+      "sim": 0.0203,
+      "real": 0.0247,
+      "abs_gap": 0.004400000000000001,
+      "real_over_sim": 1.2167487684729066
+    },
+    "mean_vert_err_m": {
+      "sim": 0.022449999999999998,
+      "real": 0.008150000000000001,
+      "abs_gap": -0.014299999999999997,
+      "real_over_sim": 0.36302895322939877
+    },
+    "cmd_smoothness_mps2": {
+      "sim": 0.0023499999999999997,
+      "real": 2.47485,
+      "abs_gap": 2.4725,
+      "real_over_sim": null
+    },
+    "cmd_smoothness_mps_per_step": {
+      "sim": 2.5e-05,
+      "real": 0.029455,
+      "abs_gap": 0.029429999999999998,
+      "real_over_sim": null
+    },
+    "mean_speed_mps": {
+      "sim": 0.00045,
+      "real": 0.0822,
+      "abs_gap": 0.08174999999999999,
+      "real_over_sim": null
+    },
+    "effective_rate_hz": {
+      "sim": 100.0,
+      "real": 84.05,
+      "abs_gap": -15.950000000000003,
+      "real_over_sim": 0.8405
+    }
+  },
+  "A4": {
+    "note": "K=8 + 1 past action, latency-trained",
+    "n_sim": 2,
+    "n_real": 2,
+    "mean_pos_err_m": {
+      "sim": 0.06864999999999999,
+      "real": 0.06465,
+      "abs_gap": -0.00399999999999999,
+      "real_over_sim": 0.9417334304442827
+    },
+    "rms_pos_err_m": {
+      "sim": 0.06864999999999999,
+      "real": 0.06525,
+      "abs_gap": -0.0033999999999999864,
+      "real_over_sim": 0.9504734158776404
+    },
+    "max_drift_m": {
+      "sim": 0.0699,
+      "real": 0.08785,
+      "abs_gap": 0.017949999999999994,
+      "real_over_sim": 1.2567954220314734
+    },
+    "mean_horiz_err_m": {
+      "sim": 0.030850000000000002,
+      "real": 0.03785,
+      "abs_gap": 0.006999999999999999,
+      "real_over_sim": 1.2269043760129659
+    },
+    "mean_vert_err_m": {
+      "sim": 0.0613,
+      "real": 0.0513,
+      "abs_gap": -0.010000000000000002,
+      "real_over_sim": 0.8368678629690048
+    },
+    "cmd_smoothness_mps2": {
+      "sim": 0.033549999999999996,
+      "real": 2.5839,
+      "abs_gap": 2.55035,
+      "real_over_sim": 77.01639344262296
+    },
+    "cmd_smoothness_mps_per_step": {
+      "sim": 0.00034,
+      "real": 0.030775000000000004,
+      "abs_gap": 0.030435000000000004,
+      "real_over_sim": 90.51470588235294
+    },
+    "mean_speed_mps": {
+      "sim": 0.0066,
+      "real": 0.08074999999999999,
+      "abs_gap": 0.07415,
+      "real_over_sim": 12.234848484848483
+    },
+    "effective_rate_hz": {
+      "sim": 100.0,
+      "real": 84.05,
+      "abs_gap": -15.950000000000003,
+      "real_over_sim": 0.8405
+    }
+  },
+  "_rank_correlation": {
+    "mean_pos_err_m": {
+      "srcc": -0.3999999999999999,
+      "concordant": 2,
+      "pairs": 6,
+      "n_policies": 4
+    },
+    "cmd_smoothness_mps2": {
+      "srcc": 0.4,
+      "concordant": 4,
+      "pairs": 6,
+      "n_policies": 4
+    }
+  }
+}
