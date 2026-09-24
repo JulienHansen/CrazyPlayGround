@@ -1,0 +1,88 @@
+"""Metric correctness for analyze_hover.
+
+Each test pins a property the sim2real conclusions depend on. `cmd_smoothness`
+in particular is the headline number of the whole study, so it is checked against
+an analytically known value rather than a regression snapshot.
+"""
+
+import math
+import os
+
+import numpy as np
+import pytest
+
+from analyze_hover import compute_metrics, load_flight
+from conftest import write_flight
+
+
+def test_perfect_hover_scores_zero_error_and_zero_chatter(tmp_path, columns, hover_rows):
+    d = write_flight(tmp_path / "run", hover_rows(columns), columns, duration_s=10.0)
+    m = compute_metrics(load_flight(str(d)))
+    assert m["mean_pos_err_m"] == pytest.approx(0.0, abs=1e-9)
+    assert m["cmd_smoothness_mps_per_step"] == pytest.approx(0.0, abs=1e-9)
+    assert m["crashed"] is False
+    assert m["success"] is True
+
+
+def test_constant_offset_gives_exactly_that_position_error(tmp_path, columns, hover_rows):
+    rows = hover_rows(columns, pos=(0.3, 0.0, 1.0), tgt=(0.0, 0.0, 1.0))
+    d = write_flight(tmp_path / "run", rows, columns, duration_s=10.0)
+    m = compute_metrics(load_flight(str(d)))
+    assert m["mean_pos_err_m"] == pytest.approx(0.3, abs=1e-6)
+    assert m["max_drift_m"] == pytest.approx(0.3, abs=1e-6)
+    # a 0.3 m steady offset must not count as a success
+    assert m["success"] is False
+
+
+def test_chatter_equals_known_square_wave_amplitude(tmp_path, columns, hover_rows):
+    """A +/-A square wave alternating every step has mean |delta| = 2A."""
+    A, n = 0.25, 1000
+    rows = hover_rows(columns, n=n)
+    for i, r in enumerate(rows):
+        r["cmd_vx"] = A if i % 2 == 0 else -A
+    d = write_flight(tmp_path / "run", rows, columns, duration_s=10.0)
+    m = compute_metrics(load_flight(str(d)))
+    assert m["cmd_smoothness_mps_per_step"] == pytest.approx(2 * A, rel=1e-6)
+
+
+def test_crash_is_detected_only_after_the_grace_period(tmp_path, columns, hover_rows):
+    # dips below the crash height at t = 1 s, inside the 3 s grace window
+    early = hover_rows(columns)
+    for r in early[:50]:
+        r["pos_z"] = 0.02
+    d = write_flight(tmp_path / "early", early, columns, duration_s=10.0)
+    assert compute_metrics(load_flight(str(d)))["crashed"] is False
+
+    late = hover_rows(columns)
+    for r in late[500:]:
+        r["pos_z"] = 0.02
+    d = write_flight(tmp_path / "late", late, columns, duration_s=10.0)
+    assert compute_metrics(load_flight(str(d)))["crashed"] is True
+
+
+def test_short_run_is_flagged_as_ended_early(tmp_path, columns, hover_rows):
+    rows = hover_rows(columns, n=200)          # 2 s of a declared 10 s flight
+    d = write_flight(tmp_path / "run", rows, columns, duration_s=10.0)
+    m = compute_metrics(load_flight(str(d)))
+    assert m["ended_early"] is True
+    assert m["success"] is False
+
+
+def test_effective_rate_is_measured_not_assumed(tmp_path, columns, hover_rows):
+    """Real flights ran at ~85 Hz, not the 100 Hz the simulator assumes; the
+    analyser must report what it measures."""
+    rows = hover_rows(columns, n=500, dt=1 / 85.0)
+    d = write_flight(tmp_path / "run", rows, columns, duration_s=500 / 85.0)
+    m = compute_metrics(load_flight(str(d)))
+    assert m["effective_rate_hz"] == pytest.approx(85.0, rel=0.02)
+
+
+def test_non_finite_samples_do_not_poison_the_aggregate(tmp_path, columns, hover_rows):
+    """Regression: masking accumulators by multiplication let NaN through, because
+    nan * 0 == nan, so one diverging sample destroyed the whole average."""
+    rows = hover_rows(columns, pos=(0.1, 0.0, 1.0))
+    rows[123]["pos_x"] = float("nan")
+    d = write_flight(tmp_path / "run", rows, columns, duration_s=10.0)
+    m = compute_metrics(load_flight(str(d)))
+    assert math.isfinite(m["mean_pos_err_m"]), "a single NaN sample poisoned the mean"
+    assert math.isfinite(m["cmd_smoothness_mps_per_step"])
