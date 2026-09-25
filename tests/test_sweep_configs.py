@@ -22,7 +22,8 @@ HOVERING = os.path.join(
 ENV_SRCS = [os.path.join(HOVERING, "vel_hovering_robust.py"),
             os.path.join(HOVERING, "vel_hovering.py")]
 
-SWEEPS = [("configs", 24), ("configs_v2", 12), ("configs_v3", 12)]
+SWEEPS = [("configs", 24), ("configs_v2", 12), ("configs_v3", 12),
+          ("configs_v4", 12), ("configs_v5", 9), ("configs_v6", 4)]
 
 
 @pytest.fixture(scope="module")
@@ -51,7 +52,7 @@ def cfg_fields():
                     names.add(stmt.target.id)
                 elif isinstance(stmt, ast.Assign):
                     names.update(t.id for t in stmt.targets if isinstance(t, ast.Name))
-    assert {"history_len", "add_noise"} <= names, "parser missed config fields"
+    assert {"history_len", "add_noise", "reward_shape"} <= names, "parser missed config fields"
     return names
 
 

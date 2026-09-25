@@ -183,6 +183,10 @@ CSV_COLUMNS = [
     # ~85 Hz, not the commanded 100 Hz, and these columns say where the missing
     # 2 ms goes: policy inference, the blocking radio send, or the sleep itself.
     "dt_infer_ms", "dt_send_ms", "dt_body_ms", "dt_sleep_ms",
+    # Exogenous excitation, superimposed on the policy command. Logged apart from
+    # cmd_* because only this part is independent of the state, which is what makes
+    # a command-to-response identification valid (OL-2).
+    "exc_vx", "exc_vy", "exc_vz",
 ]
 
 
@@ -350,7 +354,7 @@ class CollectingController:
 
     def _record(self, step, loop_start, obs, action, velocity_cmd, tgt, dist,
                 pos, vel, quat, gyro, acc, motor, vbat, varp, now_start=None,
-                timing=None):
+                timing=None, excitation=None):
         """Append one time-aligned row (shared by the policy and excitation paths)."""
         now = time.time()
         self.records.append({
@@ -370,6 +374,9 @@ class CollectingController:
             "vbat": vbat,
             "varPX": varp[0].item(), "varPY": varp[1].item(), "varPZ": varp[2].item(),
             "dist_to_target": dist,
+            "exc_vx": float(excitation[0]) if excitation is not None else 0.0,
+            "exc_vy": float(excitation[1]) if excitation is not None else 0.0,
+            "exc_vz": float(excitation[2]) if excitation is not None else 0.0,
             **(timing or {"dt_infer_ms": 0.0, "dt_send_ms": 0.0,
                           "dt_body_ms": 0.0, "dt_sleep_ms": 0.0}),
         })
@@ -460,27 +467,6 @@ class CollectingController:
             # so the command->response lag is a valid estimate of the loop dead time.
             # (In closed loop the policy reacts to the state it caused, and the
             # apparent lag collapses onto the limit-cycle geometry instead.)
-            if self.excite["mode"] != "none":
-                te = time.time() - loop_start
-                a_ex = excitation_value(self.excite, te)
-                action = torch.zeros(3, dtype=torch.float32, device=device)
-                action[self.excite["axis"]] = a_ex
-                velocity_cmd = action * MAX_VELOCITY
-                t_send0 = time.perf_counter()
-                self.cf.commander.send_velocity_world_setpoint(
-                    velocity_cmd[0].item(), velocity_cmd[1].item(), velocity_cmd[2].item(), 0.0)
-                t_send1 = time.perf_counter()
-                self._record(step, now_start=start_time, loop_start=loop_start, obs=obs,
-                             action=action, velocity_cmd=velocity_cmd, tgt=tgt, dist=dist,
-                             pos=pos, vel=vel, quat=quat, gyro=gyro, acc=acc,
-                             motor=motor, vbat=vbat, varp=varp,
-                             timing={"dt_infer_ms": 0.0,
-                                     "dt_send_ms": (t_send1 - t_send0) * 1e3,
-                                     "dt_body_ms": (t_send1 - t_body0) * 1e3,
-                                     "dt_sleep_ms": 0.0})
-                step += 1
-                deadline = self._wait_until(deadline + INTERVAL, SPIN_MARGIN)
-                continue
 
             # Frame stacking for policies trained with env.history_len=K>1. The
             # window is primed with the first observation so the very first control
@@ -514,6 +500,16 @@ class CollectingController:
                 self._act_hist.append(action.clone())
                 self._act_hist.pop(0)
 
+            # Superimpose any excitation on the policy's own command. Earlier runs
+            # replaced the command outright, which left vz at zero: the drone sank
+            # and the watchdog aborted every chirp before it reached the sweep. The
+            # policy must keep flying so that the excitation perturbs a stable hover.
+            excitation = torch.zeros(3, dtype=torch.float32, device=device)
+            if self.excite["mode"] != "none":
+                excitation[self.excite["axis"]] = excitation_value(
+                    self.excite, time.time() - loop_start)
+                action = (action + excitation).clamp(-1.0, 1.0)
+
             velocity_cmd = action * MAX_VELOCITY
             # Blocking: cflib's radio out_queue has maxsize 1, so this returns only
             # once the link thread has taken the previous packet.
@@ -526,6 +522,7 @@ class CollectingController:
                          velocity_cmd=velocity_cmd, tgt=tgt, dist=dist,
                          pos=pos, vel=vel, quat=quat, gyro=gyro, acc=acc,
                          motor=motor, vbat=vbat, varp=varp,
+                         excitation=excitation * MAX_VELOCITY,
                          timing={"dt_infer_ms": (t_infer1 - t_infer0) * 1e3,
                                  "dt_send_ms": (t_send1 - t_send0) * 1e3,
                                  "dt_body_ms": (t_send1 - t_body0) * 1e3,

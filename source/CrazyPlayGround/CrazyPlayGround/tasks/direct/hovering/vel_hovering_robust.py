@@ -104,6 +104,15 @@ class RobustQuadcopterEnvCfg(_BaseQuadcopterEnvCfg):
     # Penalty on ||a_t - a_{t-1}||^2. Negative = penalty.
     action_rate_reward_scale: float = 0.0
 
+    # ── Distance reward shape ────────────────────────────────────────────────
+    # "tanh" is the base env's 1 - tanh(d/0.8). Its gradient is strongest at the
+    # goal in absolute terms, but the reward is already within 4% of its maximum at
+    # d = 5 cm, so the last few centimetres are worth almost nothing against the
+    # noise in the return. "multiscale" sums exponentials over several length
+    # scales, which keeps a usable gradient at every distance including near zero.
+    reward_shape: str = "tanh"                                  # "tanh" | "multiscale"
+    reward_scales: tuple[float, ...] = (1.0, 0.3, 0.1, 0.03)    # metres
+
     def __post_init__(self):
         parent_post = getattr(super(), "__post_init__", None)
         if callable(parent_post):
@@ -346,6 +355,20 @@ class RobustQuadcopterEnv(_BaseQuadcopterEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         reward = super()._get_rewards()
+
+        if self.cfg.reward_shape == "multiscale":
+            # Swap the base env's tanh distance term for a sum of exponentials.
+            # Both peak at the same value, so the trade against the velocity and
+            # action-rate terms is unchanged; only the shape near the goal differs.
+            d = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_pos_w, dim=1)
+            w = self.cfg.distance_to_goal_reward_scale * self.step_dt
+            tanh_term = (1.0 - torch.tanh(d / 0.8)) * w
+            scales = torch.tensor(self.cfg.reward_scales, device=self.device)
+            multi = torch.exp(-d.unsqueeze(-1) / scales).mean(dim=-1) * w
+            reward = reward - tanh_term + multi
+            # keep the logged episode sum describing the term actually used
+            self._episode_sums["distance_to_goal"] += multi - tanh_term
+
         scale = self.cfg.action_rate_reward_scale
         if scale != 0.0:
             action_rate = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)

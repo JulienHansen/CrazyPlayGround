@@ -59,3 +59,42 @@ def test_closed_loop_lag_tracks_the_oscillation_not_the_delay():
     assert lag == pytest.approx(quarter_period_steps, rel=0.15), (
         "closed-loop lag should land on the quarter period, which is why it must "
         "never be reported as a transport delay")
+
+
+def test_excitation_is_superimposed_not_substituted(columns):
+    """The excitation must perturb a flying policy, not replace it.
+
+    The 2026-09-24 chirps all aborted because the excitation branch commanded
+    zeros on the unexcited axes, so vz was zero, the drone sank and the watchdog
+    cut in before the sweep ever started.
+    """
+    import collect_hover_vel as c
+    src = open(c.__file__).read()
+    loop = src[src.index("def control_loop"):]
+    assert "action = (action + excitation).clamp(-1.0, 1.0)" in loop, (
+        "excitation must be added to the policy action"
+    )
+    assert "action = torch.zeros(3" not in loop, (
+        "the excitation branch must not replace the policy command"
+    )
+    assert {"exc_vx", "exc_vy", "exc_vz"} <= set(columns), (
+        "the exogenous part must be logged apart from the total command"
+    )
+
+
+def test_a_superimposed_excitation_is_recoverable_from_the_log(columns):
+    """cmd minus exc must return the policy's own command, so the exogenous
+    regressor can be correlated against the response independently."""
+    import numpy as np
+    from collect_hover_vel import blank_row
+    rng = np.random.default_rng(0)
+    policy = rng.normal(size=200) * 0.1
+    exc = 0.3 * np.sin(2 * np.pi * 2.0 * np.arange(200) / 100.0)
+    rows = []
+    for i in range(200):
+        r = blank_row()
+        r["exc_vx"] = exc[i]
+        r["cmd_vx"] = policy[i] + exc[i]
+        rows.append(r)
+    recovered = np.array([r["cmd_vx"] - r["exc_vx"] for r in rows])
+    np.testing.assert_allclose(recovered, policy, atol=1e-12)
