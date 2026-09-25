@@ -820,13 +820,15 @@ def main():
               "amp": args.excite_amp, "f0": args.excite_f0, "f1": args.excite_f1,
               "settle": args.excite_settle, "dur": args.duration or 20.0}
 
-    if args.excite == "none":
-        if not args.checkpoint:
-            parser.error("--checkpoint is required unless --excite is used")
-        agent = load_agent(args.checkpoint, device, args.history_len, args.action_hist_len)
-    else:
-        agent = None
-        logger.info(f"OPEN-LOOP {args.excite} on {args.excite_axis}: the policy is NOT used")
+    # The excitation is superimposed on the policy, so a checkpoint is always
+    # needed: something has to hold the hover while the excitation perturbs it.
+    if not args.checkpoint:
+        parser.error("--checkpoint is required")
+    agent = load_agent(args.checkpoint, device, args.history_len, args.action_hist_len)
+    if args.excite != "none":
+        logger.info(f"{args.excite} on {args.excite_axis} at amp={args.excite_amp}, "
+                    f"superimposed on the policy command; the exogenous part is logged "
+                    f"in exc_v{args.excite_axis}")
     meta = build_metadata(args, args.checkpoint)
     meta["excitation"] = excite
 

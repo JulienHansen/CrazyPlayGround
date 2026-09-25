@@ -98,3 +98,15 @@ def test_a_superimposed_excitation_is_recoverable_from_the_log(columns):
         rows.append(r)
     recovered = np.array([r["cmd_vx"] - r["exc_vx"] for r in rows])
     np.testing.assert_allclose(recovered, policy, atol=1e-12)
+
+
+def test_excitation_still_requires_a_policy():
+    """The excitation rides on the policy, so a checkpoint is no longer optional.
+
+    The old path set agent=None whenever --excite was given, which now leaves
+    nothing to hold the hover the excitation is meant to perturb.
+    """
+    import collect_hover_vel as c
+    src = open(c.__file__).read()
+    assert "agent = None" not in src
+    assert "is required unless --excite" not in src
