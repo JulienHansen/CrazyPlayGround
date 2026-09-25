@@ -27,9 +27,14 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 CKPT_DIR = os.path.join(HERE, "flight_checkpoints")
 EVAL = os.path.join(HERE, "eval_hover_vel_sim.py")
 
-# Matches the real flights: a frozen goal at 1 m, a short and a long trial.
-TARGET = (0.0, 0.0, 1.0)
-DURATIONS = {"short": 10.0, "long": 15.0}
+# Matches the real flights exactly. The 2026-09-24 session flew two conditions:
+# a short hold on a goal straight above the takeoff point, and a longer run to a
+# goal displaced diagonally. Both the goal AND the duration have to match, or the
+# comparison charges the drone for a traverse the simulator never made.
+TRIALS = {
+    "short": {"target": (0.0, 0.0, 1.0), "duration": 10.0},
+    "long":  {"target": (1.0, 1.0, 1.0), "duration": 15.0},
+}
 
 NOMINAL = {
     "env.add_noise": "False",
@@ -62,12 +67,13 @@ def main():
         if wanted is not None and entry["id"] not in wanted:
             continue
         ckpt = os.path.join(CKPT_DIR, entry["file"])
-        for label, duration in DURATIONS.items():
+        for label, trial in TRIALS.items():
+            target, duration = trial["target"], trial["duration"]
             tag = f"{entry['id']}_{label}"
             cmd = [sys.executable, EVAL,
                    "--checkpoint", ckpt,
                    "--task", "Vel-Hovering-Robust",
-                   "--target", *[str(v) for v in TARGET],
+                   "--target", *[str(v) for v in target],
                    "--duration", str(duration),
                    "--tag", tag,
                    "--seed", str(args.seed),
@@ -87,13 +93,14 @@ def main():
             with open(log, "w") as fh:
                 rc = subprocess.call(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT)
             runs.append({"tag": tag, "id": entry["id"], "duration_s": duration,
+                         "target": list(target),
                          "k": entry["k"], "m": entry["m"], "returncode": rc,
                          "minutes": round((time.time() - started) / 60, 2), "log": log})
             print(f"    {'ok' if rc == 0 else f'FAILED rc={rc} -> {log}'}"
                   f"  ({runs[-1]['minutes']:.1f} min)", flush=True)
 
-    index = {"created": time.strftime("%Y-%m-%dT%H:%M:%S"), "target": list(TARGET),
-             "conditions": NOMINAL, "durations_s": DURATIONS, "seed": args.seed, "runs": runs}
+    index = {"created": time.strftime("%Y-%m-%dT%H:%M:%S"), "trials": TRIALS,
+             "conditions": NOMINAL, "seed": args.seed, "runs": runs}
     with open(os.path.join(args.outdir, "sim_gap_index.json"), "w") as fh:
         json.dump(index, fh, indent=2)
     ok = sum(r["returncode"] == 0 for r in runs)

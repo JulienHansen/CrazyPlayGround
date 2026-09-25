@@ -130,8 +130,8 @@ def main():
             r, _rs = agg(real[pid], key)
             # A ratio is only informative while the simulator value is a real
             # quantity. On the steady-state window a stacked policy converges to a
-            # fixed point in the nominal simulator, so its chatter falls to ~1e-5
-            # and any ratio against it measures the division, not the gap.
+            # fixed point in the nominal simulator, so its chatter collapses toward
+            # zero and any ratio against it measures the division, not the gap.
             meaningful = np.isfinite(s) and s != 0 and abs(s) > 0.01 * abs(r)
             ratio = (r / s) if meaningful else float("nan")
             shown = f"{ratio:.2f}x" if meaningful else "sim~0"
