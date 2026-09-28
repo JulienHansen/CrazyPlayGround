@@ -7,9 +7,7 @@
 framework from **WXYZ** (scalar-first) to **XYZW** (scalar-last), to align with Warp, PhysX, and
 Newton conventions.
 
-CrazyPlayGround currently pins **IsaacLab 2.3.2** (`docker/Dockerfile`, `README.md`)and A full repo audit by ClaudeCode confirmed every quaternion site in this codebase consistently and
-correctly uses **WXYZ** today — there is no bug and nothing needs to change while pinned to 2.3.2.
-This document exists so that whoever upgrades past IsaacLab 3.0 knows exactly what to check.
+CrazyPlayGround currently pins **IsaacLab 2.3.2** (`docker/Dockerfile`, `README.md`) and a repo audit confirmed that every quaternion site in this codebase consistently and correctly uses **WXYZ** today — there is no bug and nothing needs to change while pinned to 2.3.2.
 
 ## Checklist for upgrading past IsaacLab 3.0
 
@@ -21,9 +19,9 @@ This document exists so that whoever upgrades past IsaacLab 3.0 knows exactly wh
 3. Pay special attention to the **real-drone telemetry boundary**: the Crazyflie firmware exposes
    named log fields `stateEstimate.qw/qx/qy/qz` via `cflib`. These are read by name (not by index),
    so they are unaffected by IsaacLab's convention change — but the in-memory tensor built from them
-   (`current_quat` in `common/utils.py`) is currently WXYZ to match the simulation side. If the
+   (`current_quat` in `common/flight_recorder.py`) is currently WXYZ to match the simulation side. If the
    simulation side moves to XYZW while this callback keeps building `[qw, qx, qy, qz]`, an explicit
    conversion boundary must be added between real-drone telemetry and any code shared with
-   simulation (e.g. `common/utils.py`'s `quat_apply`, `flight_logger.py`, `flight_recorder.py`).
+   simulation (e.g. `common/utils.py`'s `quat_apply`, `flight_recorder.py`).
 4. Update this document once the migration is complete, or delete it if WXYZ/XYZW tracking moves
    somewhere else.

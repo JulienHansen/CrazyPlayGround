@@ -14,11 +14,11 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
-from flight_recorder import FlightRecorder
-from flight_logger import FlightLogger, quat_to_euler_deg
-from utils import (setup_state_logging, emergency_land, quat_apply, quat_inv, wait_until,
-                   WaypointGate, add_waypoint_args)
+# Make the `common` package importable; appended so it cannot shadow installed modules.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.flight_recorder import CrazyflieStateBase
+from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, WaypointGate,
+                          add_run_args, apply_run_args)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -64,7 +64,7 @@ class Policy(GaussianMixin, Model):
         return mean, {"log_std": self.log_std_parameter}
 
 
-class CrazyflieController:
+class CrazyflieController(CrazyflieStateBase):
     """Crazyflie controller for body-rate RL agents.
 
     Uses rate mode to send body rates in deg/s + thrust percentage.
@@ -88,6 +88,7 @@ class CrazyflieController:
         self,
         uri: str,
         agent: PPO,
+        run_args,
         initial_target=None,
         mass_kg: float = 0.027,
         max_thrust_N: float = 0.638,
@@ -96,10 +97,8 @@ class CrazyflieController:
         hover_thrust_pct: Optional[float] = None,
         min_thrust_pct: float = 25.0,
         max_thrust_pct: float = 90.0,
-        record_path: Optional[str] = None,
-        record_interval_s: float = 0.1,
-        log_interval_s: float = 1.0,
     ):
+        super().__init__(device)
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
@@ -136,41 +135,16 @@ class CrazyflieController:
                 "measure the real hover thrust percentage (manually trim a stable hover "
                 "in rate mode with zero rates) and pass it via --hover-thrust-pct."
             )
-        self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
         self.current_ang_vel = torch.zeros(3, dtype=torch.float32, device=device)
-        self.position_received = False
-        self.running = True
-        self._last_pos_time: float = 0.0
-        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_motor_pwm = [0, 0, 0, 0]
-        self.lock = threading.Lock()
 
-        # Latest policy inference outputs, for the recorder thread
-        self.last_obs: Optional[torch.Tensor] = None
-        self.last_action: Optional[torch.Tensor] = None
-        self.last_cmd: Optional[torch.Tensor] = None
-        self.last_control_time: float = 0.0
-
-        # File recording (separate cadence from CF telemetry logging)
-        self.record_path = record_path
-        self.recorder: Optional[FlightRecorder] = None
-        if self.record_path:
-            self.recorder = FlightRecorder(
-                self.record_path,
-                self._sample_for_recording,
-                obs_fields=["lin_vel_b_x", "lin_vel_b_y", "lin_vel_b_z",
-                            "des_pos_b_x", "des_pos_b_y", "des_pos_b_z",
-                            "rotmat_0", "rotmat_1", "rotmat_2", "rotmat_3", "rotmat_4",
-                            "rotmat_5", "rotmat_6", "rotmat_7", "rotmat_8",
-                            "ang_vel_x", "ang_vel_y", "ang_vel_z"],
-                action_fields=["action_roll", "action_pitch", "action_yaw", "action_thrust"],
-                cmd_fields=["roll_rate_deg_s", "pitch_rate_deg_s", "yaw_rate_deg_s", "thrust_pct"],
-                record_interval_s=record_interval_s,
-            )
-
-        self.flight_logger = FlightLogger(logger, self._sample_for_status, log_interval_s=log_interval_s)
+        self.make_recorder(run_args,
+                           obs_fields=["lin_vel_b_x", "lin_vel_b_y", "lin_vel_b_z",
+                                       "des_pos_b_x", "des_pos_b_y", "des_pos_b_z",
+                                       "rotmat_0", "rotmat_1", "rotmat_2", "rotmat_3", "rotmat_4",
+                                       "rotmat_5", "rotmat_6", "rotmat_7", "rotmat_8",
+                                       "ang_vel_x", "ang_vel_y", "ang_vel_z"],
+                           action_fields=["action_roll", "action_pitch", "action_yaw", "action_thrust"],
+                           cmd_fields=["roll_rate_deg_s", "pitch_rate_deg_s", "yaw_rate_deg_s", "thrust_pct"])
 
         self._setup_callbacks()
 
@@ -193,12 +167,10 @@ class CrazyflieController:
 
     def _connected(self, uri: str):
         logger.info(f"Connected to {uri}")
-        setup_state_logging(self)
+        self.setup_state_logging()
         self._start_gyro_logging()
+        self.recorder.start()
         threading.Thread(target=self.control_loop, daemon=True).start()
-        if self.recorder:
-            self.recorder.start()
-        self.flight_logger.start()
 
     def _disconnected(self, uri: str):
         pass
@@ -233,46 +205,6 @@ class CrazyflieController:
                 data["gyro.y"] * deg2rad,
                 data["gyro.z"] * deg2rad,
             ], dtype=torch.float32, device=device)
-
-    # ---------- Flight recording ----------
-
-    def _sample_for_recording(self):
-        with self.lock:
-            if self.last_obs is None:
-                return None
-            return {
-                "control_time": self.last_control_time,
-                "pos": self.current_pos.tolist(),
-                "vel": self.current_vel.tolist(),
-                "quat": self.current_quat.tolist(),
-                "target": target_pos.tolist() if target_pos is not None else None,
-                "obs": self.last_obs.tolist(),
-                "action": self.last_action.tolist(),
-                "cmd": self.last_cmd,
-                "motor": self.current_motor_pwm,
-            }
-
-    def _sample_for_status(self):
-        with self.lock:
-            if self.last_cmd is None:
-                return None
-            px, py, pz = self.current_pos.tolist()
-            vx_m, vy_m, vz_m = self.current_vel.tolist()
-            quat = self.current_quat.tolist()
-            roll_rate, pitch_rate, yaw_rate, thrust_pct = self.last_cmd
-            motor = self.current_motor_pwm
-
-        roll, pitch, yaw = quat_to_euler_deg(quat)
-        state_line = (
-            f"State: pos=({px:+.2f}, {py:+.2f}, {pz:+.2f}) m "
-            f"vel=({vx_m:+.2f}, {vy_m:+.2f}, {vz_m:+.2f}) m/s "
-            f"rpy=({roll:+.1f}, {pitch:+.1f}, {yaw:+.1f})°"
-        )
-        cmd_line = (
-            f"Cmd: roll={roll_rate:+.1f} pitch={pitch_rate:+.1f} yaw={yaw_rate:+.1f} deg/s T={thrust_pct:5.1f}% "
-            f"| PWM: m1={motor[0]} m2={motor[1]} m3={motor[2]} m4={motor[3]}"
-        )
-        return state_line, cmd_line
 
     def control_loop(self):
         """Main control loop: attitude-controlled takeoff, then NN body-rate control."""
@@ -322,6 +254,7 @@ class CrazyflieController:
         nn_start_time = time.time()
         GRACE_PERIOD = 3.0
         deadline = time.perf_counter()
+        step = 0
         while self.cf.is_connected() and self.running:
 
             # ── Safety watchdog ──────────────────────────────────────────────
@@ -344,12 +277,14 @@ class CrazyflieController:
                 emergency_land(self)
                 break
 
-            obs = retrieve_and_create_observation(
-                self.current_vel, self.current_pos, self.current_quat, self.current_ang_vel
-            )
+            state = self.snapshot()  # one consistent read, used for the obs and its recorded row
+            with self.lock:
+                ang_vel = self.current_ang_vel.clone()  # own gyro log block, not in the snapshot
+            obs = retrieve_and_create_observation(state.vel, state.pos, state.quat, ang_vel)
             if obs is None:
                 logger.warning("No observation received, holding hover thrust...")
                 self.cf.commander.send_setpoint_manual(0, 0, 0, self.hover_thrust_pct, True)
+                step += 1
                 deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
                 continue
 
@@ -368,14 +303,12 @@ class CrazyflieController:
             # thrust percentage that actually holds altitude.
             thrust_pct = self._thrust_pct_from_action(action[3].item())
 
-            with self.lock:
-                self.last_obs = obs
-                self.last_action = action
-                self.last_cmd = [roll_rate, pitch_rate, yaw_rate, thrust_pct]
-                self.last_control_time = time.time()
+            control_time = time.time()
 
             # Rate mode (rate=True): roll/pitch/yaw in deg/s, thrust in [0, 100] %.
             self.cf.commander.send_setpoint_manual(roll_rate, pitch_rate, yaw_rate, thrust_pct, True)
+            self.record_step(step, state, control_time, target_pos, obs, action, [roll_rate, pitch_rate, yaw_rate, thrust_pct])
+            step += 1
 
             deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
@@ -389,15 +322,15 @@ class CrazyflieController:
     def stop(self):
         logger.info("Stopping controller...")
         self.running = False
-        time.sleep(0.2)
-        logger.info("Landing...")
-        self.cf.high_level_commander.land(0.0, 2.0)
-        time.sleep(2.5)
-        self.cf.close_link()
-        if self.recorder:
-            self.recorder.close()
-        self.flight_logger.close()
-        logger.info("Link closed")
+        try:
+            time.sleep(0.2)
+            logger.info("Landing...")
+            self.cf.high_level_commander.land(0.0, 2.0)
+            time.sleep(2.5)
+            self.cf.close_link()
+            logger.info("Link closed")
+        finally:
+            self.recorder.close()  # always write the Parquet footer, or the file is unreadable
 
 
 def retrieve_and_create_observation(
@@ -478,24 +411,16 @@ def main():
                         help="Thrust pct corresponding to action[3] = -1.")
     parser.add_argument("--max-thrust-pct", type=float, default=90.0,
                         help="Thrust pct corresponding to action[3] = +1.")
-    parser.add_argument("--record-path", type=str, default=None,
-                        help="Parquet file path to record flight data to. If not set, recording is disabled.")
-    parser.add_argument("--record-interval", type=float, default=0.1,
-                        help="Interval in seconds between recorded rows (independent of the 100Hz control loop).")
-    parser.add_argument("--log-interval", type=float, default=1.0,
-                        help="Interval in seconds between terminal status lines (independent of the 100Hz control loop).")
-    add_waypoint_args(parser)
+    add_run_args(parser)
     args = parser.parse_args()
-    if args.waypoint_radius < 0 or args.waypoint_hold < 0:
-        parser.error("--waypoint-radius and --waypoint-hold must be >= 0")
 
     global waypoint_gate
-    waypoint_gate = WaypointGate(args.waypoint_radius, args.waypoint_hold)
-    logger.info(f"Waypoint gate: {args.waypoint_radius:.2f} m for {args.waypoint_hold:.1f} s")
+    waypoint_gate = apply_run_args(args)
     agent = load_agent(args.checkpoint, device)
     controller = CrazyflieController(
         uri=args.uri,
         agent=agent,
+        run_args=args,
         initial_target=args.target,
         mass_kg=args.mass_kg,
         max_thrust_N=args.max_thrust_N,
@@ -504,9 +429,6 @@ def main():
         hover_thrust_pct=args.hover_thrust_pct,
         min_thrust_pct=args.min_thrust_pct,
         max_thrust_pct=args.max_thrust_pct,
-        record_path=args.record_path,
-        record_interval_s=args.record_interval,
-        log_interval_s=args.log_interval,
     )
     try:
         controller.start()

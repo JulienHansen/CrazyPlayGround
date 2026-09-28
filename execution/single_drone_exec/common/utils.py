@@ -1,99 +1,10 @@
+import argparse
 import logging
+import math
 import time
-from typing import Any, Dict, Optional
+from typing import Optional, Sequence, Tuple
 
 import torch
-from cflib.crazyflie.log import LogConfig
-
-
-def setup_state_logging(controller, log_frequency_ms: int = 10) -> None:
-    """Register the shared telemetry LogConfig blocks (position/velocity,
-    quaternion, Kalman variance, motor PWM) and their callbacks on `controller`.
-
-    Writes into the same attributes each script's CrazyflieController already
-    declares in __init__: current_pos, current_vel, _last_pos_time,
-    position_received, current_quat, _pos_variance, current_motor_pwm.
-    """
-    device = controller.current_pos.device
-
-    def _log_posvel_callback(timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with controller.lock:
-            controller.current_pos = torch.tensor([
-                data["stateEstimate.x"],
-                data["stateEstimate.y"],
-                data["stateEstimate.z"]
-            ], dtype=torch.float32, device=device)
-            controller.current_vel = torch.tensor([
-                data["stateEstimate.vx"],
-                data["stateEstimate.vy"],
-                data["stateEstimate.vz"]
-            ], dtype=torch.float32, device=device)
-            controller._last_pos_time = time.time()
-            controller.position_received = True
-
-    def _log_data_quat_callback(timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with controller.lock:
-            controller.current_quat = torch.tensor([
-                data['stateEstimate.qw'],
-                data['stateEstimate.qx'],
-                data['stateEstimate.qy'],
-                data['stateEstimate.qz'],
-            ], dtype=torch.float32, device=device)
-
-    def _log_variance_callback(timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with controller.lock:
-            controller._pos_variance = torch.tensor([
-                data["kalman.varPX"],
-                data["kalman.varPY"],
-                data["kalman.varPZ"],
-            ], dtype=torch.float32, device=device)
-
-    def _log_motor_callback(timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with controller.lock:
-            controller.current_motor_pwm = [
-                data["motor.m1"], data["motor.m2"], data["motor.m3"], data["motor.m4"],
-            ]
-
-    # Block 1: position + velocity (6 floats = 24 bytes, within 26-byte limit)
-    log_posvel = LogConfig(name="posvel", period_in_ms=log_frequency_ms)
-    log_posvel.add_variable("stateEstimate.x", "float")
-    log_posvel.add_variable("stateEstimate.y", "float")
-    log_posvel.add_variable("stateEstimate.z", "float")
-    log_posvel.add_variable("stateEstimate.vx", "float")
-    log_posvel.add_variable("stateEstimate.vy", "float")
-    log_posvel.add_variable("stateEstimate.vz", "float")
-    controller.cf.log.add_config(log_posvel)
-    log_posvel.data_received_cb.add_callback(_log_posvel_callback)
-    log_posvel.start()
-
-    # Block 2: quaternion (4 floats = 16 bytes)
-    log_quat = LogConfig(name="quat", period_in_ms=log_frequency_ms)
-    log_quat.add_variable("stateEstimate.qx", "float")
-    log_quat.add_variable("stateEstimate.qy", "float")
-    log_quat.add_variable("stateEstimate.qz", "float")
-    log_quat.add_variable("stateEstimate.qw", "float")
-    controller.cf.log.add_config(log_quat)
-    log_quat.data_received_cb.add_callback(_log_data_quat_callback)
-    log_quat.start()
-
-    # Block 3: Kalman variance (for safety watchdog)
-    log_var = LogConfig(name="quality", period_in_ms=200)
-    log_var.add_variable("kalman.varPX", "float")
-    log_var.add_variable("kalman.varPY", "float")
-    log_var.add_variable("kalman.varPZ", "float")
-    controller.cf.log.add_config(log_var)
-    log_var.data_received_cb.add_callback(_log_variance_callback)
-    log_var.start()
-
-    # Block 4: motor PWM (4 uint16 = 8 bytes, within 26-byte limit)
-    log_motor = LogConfig(name="motor", period_in_ms=log_frequency_ms)
-    log_motor.add_variable("motor.m1", "uint16_t")
-    log_motor.add_variable("motor.m2", "uint16_t")
-    log_motor.add_variable("motor.m3", "uint16_t")
-    log_motor.add_variable("motor.m4", "uint16_t")
-    controller.cf.log.add_config(log_motor)
-    log_motor.data_received_cb.add_callback(_log_motor_callback)
-    log_motor.start()
 
 
 def emergency_land(controller) -> None:
@@ -143,14 +54,41 @@ WAYPOINT_REACH_RADIUS_M = 0.15
 WAYPOINT_HOLD_TIME_S = 5.0
 
 
-def add_waypoint_args(parser) -> None:
-    """Register --waypoint-radius / --waypoint-hold on an argparse parser."""
-    parser.add_argument("--waypoint-radius", type=float, default=WAYPOINT_REACH_RADIUS_M,
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
+def nonnegative_float(text: str) -> float:
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
+    return value
+
+
+def add_run_args(parser) -> None:
+    """Register the recording, status-logging and waypoint flags shared by the hover scripts."""
+    parser.add_argument("--record-path", type=str, default=None,
+                        help="Parquet file path to record flight data to. If not set, recording is disabled.")
+    parser.add_argument("--record-every", type=positive_int, default=1,
+                        help="Record one row every N control steps (1 = every step, 100 Hz).")
+    parser.add_argument("--log-every", type=positive_int, default=100,
+                        help="Print a status line every N control steps (100 = once per second at 100 Hz).")
+    parser.add_argument("--waypoint-radius", type=nonnegative_float, default=WAYPOINT_REACH_RADIUS_M,
                         help="Distance in metres the drone must stay within to count as on the waypoint. "
                              "Depends on the policy's steady-state error. 0 keeps the target fixed.")
-    parser.add_argument("--waypoint-hold", type=float, default=WAYPOINT_HOLD_TIME_S,
+    parser.add_argument("--waypoint-hold", type=nonnegative_float, default=WAYPOINT_HOLD_TIME_S,
                         help="Seconds the drone must stay continuously within --waypoint-radius "
                              "before a new random waypoint is drawn.")
+
+
+def apply_run_args(args) -> "WaypointGate":
+    """Build the WaypointGate from the parsed flags and log its setting."""
+    logging.getLogger("CrazyflieRL").info(
+        f"Waypoint gate: {args.waypoint_radius:.2f} m for {args.waypoint_hold:.1f} s")
+    return WaypointGate(args.waypoint_radius, args.waypoint_hold)
 
 
 class WaypointGate:
@@ -193,3 +131,12 @@ def quat_conjugate(q):
 
 def quat_inv(q, eps=1e-9):
     return quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
+
+
+def quat_to_euler_deg(quat: Sequence[float]) -> Tuple[float, float, float]:
+    """Convert (qw, qx, qy, qz) to (roll, pitch, yaw) in degrees, for display only."""
+    qw, qx, qy, qz = quat
+    roll = math.atan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
+    pitch = math.asin(max(-1.0, min(1.0, 2 * (qw * qy - qz * qx))))
+    yaw = math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
