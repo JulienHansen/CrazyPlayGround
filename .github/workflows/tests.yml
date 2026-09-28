@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+jobs:
+  cpu-tests:
+    name: sim2real pipeline (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # CPU-only wheels: the gate must not need a GPU or Isaac Sim.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install "skrl>=2.1.0" "cflib>=0.1.32" "pyarrow>=14.0" numpy pytest
+
+      - name: Run tests
+        run: pytest
