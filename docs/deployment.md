@@ -17,19 +17,19 @@ Make sure you have the following available:
 
 3. Install `cfclient` via pip or from source, following [Installation of the cfclient](https://www.bitcraze.io/documentation/repository/crazyflie-clients-python/master/installation/install/).
 
-4. Install CrazyPlayGround from source with the `all` extra ([repo](https://github.com/JulienHansen/CrazyPlayGround)). The `deploy` extra alone isn't sufficient yet.
+4. Install CrazyPlayGround from source with `pip install -e "source/CrazyPlayGround[deploy]"`.
 
-   <!-- pip install -e "source/CrazyPlayGround[deploy]", radio permissions/udev -->
+5. Install the Crazyradio drivers and set up radio permissions, following the [Install drivers](https://www.bitcraze.io/documentation/tutorials/getting-started-with-crazyradio-2-0/#install-drivers) section of the Crazyradio 2.0 tutorial (Windows driver install / Linux udev permissions).
 
-5. Install and configure the Lighthouse base stations' channel, if not already done.
+6. Install and configure the Lighthouse base stations' channel, if not already done.
 
-6. Make sure the Crazyradio has the latest firmware installed, following [Getting started with the Crazyradio 2.0](https://www.bitcraze.io/documentation/tutorials/getting-started-with-crazyradio-2-0/).
+7. Make sure the Crazyradio has the latest firmware installed, following [Getting started with the Crazyradio 2.0](https://www.bitcraze.io/documentation/tutorials/getting-started-with-crazyradio-2-0/).
 
-7. If the Crazyflie isn't configured yet, plug it in over USB and configure it with the Crazyflie client: set it to 2 Mbit radio mode and note its address — you'll need this to connect to it via the Crazyradio.
+8. If the Crazyflie isn't configured yet, plug it in over USB and configure it with the Crazyflie client: set it to 2 Mbit radio mode and note its address — you'll need this to connect to it via the Crazyradio.
 
-8. Flash the firmware on the Crazyflie.
+9. Flash the firmware on the Crazyflie.
 
-9. Follow the [Getting started with Lighthouse](https://www.bitcraze.io/documentation/tutorials/getting-started-with-lighthouse/) tutorial from "Wait for calibration of the base stations" through "Take off and fly" to calibrate the Lighthouse system and make your first test flight.
+10. Follow the [Getting started with Lighthouse](https://www.bitcraze.io/documentation/tutorials/getting-started-with-lighthouse/) tutorial from "Wait for calibration of the base stations" through "Take off and fly" to calibrate the Lighthouse system and make your first test flight.
 
 ## Exporting a trained policy
 
@@ -46,12 +46,10 @@ python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/
 ```
 
 - Replace `E7E7E7E7E8` with your Crazyflie's actual radio address. Make sure `cfclient` isn't already connected to the Crazyflie before running the script — the radio link only supports one client at a time.
-- `--target x y z` sets an initial hover target in world-frame coordinates (optional — if omitted, the drone hovers above its takeoff position)
-
-If you want to record the flight data, add `--record-path path.csv` and `--record-interval 0.01` (0.01 means one record every 10 ms).
+- `--target x y z` sets an initial hover target in world-frame coordinates (optional — if omitted, the drone hovers above its takeoff position).
 
 ```bash
-python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/2M/E7E7E7E7E8 --record-path ./flight_log2.csv --record-interval 0.01
+python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/2M/E7E7E7E7E8 
 ```
 
 <!-- execution/single_drone_exec/: hover, traj_tracking -->
