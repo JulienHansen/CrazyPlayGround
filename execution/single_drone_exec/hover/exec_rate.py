@@ -17,7 +17,7 @@ from cflib.crazyflie.log import LogConfig
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from flight_recorder import FlightRecorder
 from flight_logger import FlightLogger, quat_to_euler_deg
-from utils import setup_state_logging, emergency_land, quat_apply, quat_inv
+from utils import setup_state_logging, emergency_land, quat_apply, quat_inv, wait_until
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -275,6 +275,7 @@ class CrazyflieController:
     def control_loop(self):
         """Main control loop: attitude-controlled takeoff, then NN body-rate control."""
         INTERVAL = 0.01  # 100 Hz control loop
+        SPIN_MARGIN = 0.002  # sleep to 2 ms before each deadline, busy-wait the rest (see wait_until)
         # Must match the sim: action[:3] * pi rad/s = action[:3] * 180 deg/s.
         MAX_BODY_RATE_DEG = 180.0
 
@@ -318,8 +319,8 @@ class CrazyflieController:
         logger.info("NN body-rate control active.")
         nn_start_time = time.time()
         GRACE_PERIOD = 3.0
+        deadline = time.perf_counter()
         while self.cf.is_connected() and self.running:
-            start_time = time.time()
 
             # ── Safety watchdog ──────────────────────────────────────────────
             elapsed_since_nn = time.time() - nn_start_time
@@ -347,7 +348,7 @@ class CrazyflieController:
             if obs is None:
                 logger.warning("No observation received, holding hover thrust...")
                 self.cf.commander.send_setpoint_manual(0, 0, 0, self.hover_thrust_pct, True)
-                time.sleep(INTERVAL)
+                deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
                 continue
 
             with torch.no_grad():
@@ -374,8 +375,7 @@ class CrazyflieController:
             # Rate mode (rate=True): roll/pitch/yaw in deg/s, thrust in [0, 100] %.
             self.cf.commander.send_setpoint_manual(roll_rate, pitch_rate, yaw_rate, thrust_pct, True)
 
-            elapsed = time.time() - start_time
-            time.sleep(max(0, INTERVAL - elapsed))
+            deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
         self.cf.commander.send_stop_setpoint()
         logger.info("Control loop stopped")

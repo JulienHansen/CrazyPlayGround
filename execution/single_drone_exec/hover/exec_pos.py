@@ -15,7 +15,7 @@ from cflib.crazyflie import Crazyflie
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from flight_recorder import FlightRecorder
 from flight_logger import FlightLogger, quat_to_euler_deg
-from utils import setup_state_logging, emergency_land, quat_apply, quat_inv
+from utils import setup_state_logging, emergency_land, quat_apply, quat_inv, wait_until
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -196,6 +196,7 @@ class CrazyflieController:
         (pos → vel → att → rate → mixer) handles tracking.
         """
         INTERVAL = 0.01  # 100 Hz — matches sim (dt=1/500, decimation=5)
+        SPIN_MARGIN = 0.002  # sleep to 2 ms before each deadline, busy-wait the rest (see wait_until)
         MAX_DISPLACEMENT = 0.1  # m — must match pos_hovering.py clamp(-0.1, 0.1)
 
         logger.info("Waiting for first position estimate...")
@@ -216,8 +217,8 @@ class CrazyflieController:
 
         nn_start_time = time.time()
         GRACE_PERIOD = 3.0  # seconds before enforcing z lower bound
+        deadline = time.perf_counter()
         while self.cf.is_connected() and self.running:
-            start_time = time.time()
 
             # ── Safety watchdog ──────────────────────────────────────────────
             elapsed_since_nn = time.time() - nn_start_time
@@ -242,7 +243,7 @@ class CrazyflieController:
             obs = retrieve_and_create_observation(self.current_vel, self.current_pos, self.current_quat)
             if obs is None:
                 logger.warning("No observation received, hovering...")
-                time.sleep(INTERVAL)
+                deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
                 continue
 
             with torch.no_grad():
@@ -272,8 +273,7 @@ class CrazyflieController:
                 0.0  # yaw = 0
             )
 
-            elapsed = time.time() - start_time
-            time.sleep(max(0, INTERVAL - elapsed))
+            deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
         self.cf.commander.send_stop_setpoint()
         logger.info("Control loop stopped")

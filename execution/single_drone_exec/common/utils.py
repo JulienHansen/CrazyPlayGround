@@ -110,6 +110,33 @@ def emergency_land(controller) -> None:
             pass
 
 
+def wait_until(deadline: float, spin_margin: float) -> tuple[float, float, int]:
+    """Hold until `deadline` (a perf_counter value). Returns (held_until, slept_ms, overran).
+
+    time.sleep returns late -- by ~0.1 ms on Linux but 1-2 ms on macOS -- and the
+    error lands on every iteration, so a 10 ms period becomes 12 ms and a 100 Hz
+    loop runs at 85 Hz. Sleeping to `spin_margin` before the deadline and
+    busy-waiting the rest removes the overshoot, at the cost of a few percent of
+    one core.
+
+    An overrun resynchronises the schedule to now instead of running flat out to
+    catch up: a burst of back-to-back setpoints is worse for the drone than a late
+    one.
+
+    Usage: `deadline = time.perf_counter()` before the loop, then at the end of
+    each iteration `deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)`.
+    """
+    now = time.perf_counter()
+    if now >= deadline:
+        return now, 0.0, 1
+    t0 = now
+    if deadline - now > spin_margin:
+        time.sleep(deadline - now - spin_margin)
+    while time.perf_counter() < deadline:
+        pass
+    return deadline, (time.perf_counter() - t0) * 1e3, 0
+
+
 def quat_apply(quat, vec):
     shape = vec.shape
     quat = quat.reshape(-1, 4)
