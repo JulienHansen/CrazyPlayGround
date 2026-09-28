@@ -17,7 +17,8 @@ from cflib.crazyflie.log import LogConfig
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from flight_recorder import FlightRecorder
 from flight_logger import FlightLogger, quat_to_euler_deg
-from utils import setup_state_logging, emergency_land, quat_apply, quat_inv, wait_until
+from utils import (setup_state_logging, emergency_land, quat_apply, quat_inv, wait_until,
+                   WaypointGate, add_waypoint_args)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -31,6 +32,7 @@ logging.basicConfig(format="{asctime} [{levelname}] {message}",
                         level=logging.INFO)
 logger = logging.getLogger("CrazyflieRL")
 target_pos = None  # initialized in control_loop after takeoff
+waypoint_gate = WaypointGate()  # replaced in main() from --waypoint-radius / --waypoint-hold
 
 # ── Safety thresholds ────────────────────────────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
@@ -401,10 +403,12 @@ class CrazyflieController:
 def retrieve_and_create_observation(
     current_vel, current_pos, current_quat, current_ang_vel
 ) -> Optional[torch.Tensor]:
-    # Target is fixed per run, matching the sim episode behaviour.
+    # Target advances via waypoint_gate; --waypoint-radius 0 keeps it fixed per run,
+    # matching the sim episode behaviour.
     global target_pos
     if target_pos is None:
         return None
+    target_pos = waypoint_gate.step(current_pos, target_pos)
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
     rot_mat_flat = quat_to_rotmat_flat(current_quat)
@@ -480,7 +484,14 @@ def main():
                         help="Interval in seconds between recorded rows (independent of the 100Hz control loop).")
     parser.add_argument("--log-interval", type=float, default=1.0,
                         help="Interval in seconds between terminal status lines (independent of the 100Hz control loop).")
+    add_waypoint_args(parser)
     args = parser.parse_args()
+    if args.waypoint_radius < 0 or args.waypoint_hold < 0:
+        parser.error("--waypoint-radius and --waypoint-hold must be >= 0")
+
+    global waypoint_gate
+    waypoint_gate = WaypointGate(args.waypoint_radius, args.waypoint_hold)
+    logger.info(f"Waypoint gate: {args.waypoint_radius:.2f} m for {args.waypoint_hold:.1f} s")
     agent = load_agent(args.checkpoint, device)
     controller = CrazyflieController(
         uri=args.uri,

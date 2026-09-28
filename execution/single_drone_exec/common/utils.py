@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from cflib.crazyflie.log import LogConfig
@@ -135,6 +135,45 @@ def wait_until(deadline: float, spin_margin: float) -> tuple[float, float, int]:
     while time.perf_counter() < deadline:
         pass
     return deadline, (time.perf_counter() - t0) * 1e3, 0
+
+
+# 0.10 m stalled half the baseline flights (mean pos err ~0.13 m); 0.15 m let every
+# tested policy advance. The right radius depends on the policy, hence the CLI flags.
+WAYPOINT_REACH_RADIUS_M = 0.15
+WAYPOINT_HOLD_TIME_S = 5.0
+
+
+def add_waypoint_args(parser) -> None:
+    """Register --waypoint-radius / --waypoint-hold on an argparse parser."""
+    parser.add_argument("--waypoint-radius", type=float, default=WAYPOINT_REACH_RADIUS_M,
+                        help="Distance in metres the drone must stay within to count as on the waypoint. "
+                             "Depends on the policy's steady-state error. 0 keeps the target fixed.")
+    parser.add_argument("--waypoint-hold", type=float, default=WAYPOINT_HOLD_TIME_S,
+                        help="Seconds the drone must stay continuously within --waypoint-radius "
+                             "before a new random waypoint is drawn.")
+
+
+class WaypointGate:
+    """Draw a new target (training range: XY in [-1, 1], Z in [0.5, 1.5]) once the
+    drone has stayed within `radius_m` of the current one for `hold_s`."""
+
+    def __init__(self, radius_m: float = WAYPOINT_REACH_RADIUS_M, hold_s: float = WAYPOINT_HOLD_TIME_S):
+        self.radius_m, self.hold_s = radius_m, hold_s
+        self._since: Optional[float] = None  # when the drone entered the radius
+
+    def step(self, current_pos: torch.Tensor, target_pos: torch.Tensor) -> torch.Tensor:
+        now = time.monotonic()
+        if torch.dist(current_pos, target_pos) >= self.radius_m:
+            self._since = None
+        elif self._since is None:
+            self._since = now
+        elif now - self._since >= self.hold_s:
+            self._since = None
+            target_pos = torch.empty_like(target_pos)
+            target_pos[:2].uniform_(-1.0, 1.0)
+            target_pos[2].uniform_(0.5, 1.5)
+            logging.getLogger("CrazyflieRL").info(f"/!\\ New target={target_pos}")
+        return target_pos
 
 
 def quat_apply(quat, vec):
