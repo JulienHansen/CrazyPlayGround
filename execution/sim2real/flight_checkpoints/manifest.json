@@ -1,0 +1,52 @@
+[
+  {
+    "id": "A0",
+    "file": "A0_baseline_k1_m0.pt",
+    "tag": "n0.0_k1_d0_s42",
+    "k": 1,
+    "m": 0,
+    "sha256_16": "e169bc0acfaca85a",
+    "kb": 38.1,
+    "note": "BASELINE (already flown 07-24)"
+  },
+  {
+    "id": "A1",
+    "file": "A1_noise_disturb_k8_m0.pt",
+    "tag": "n0.02_k8_d1_s42",
+    "k": 8,
+    "m": 0,
+    "sha256_16": "118e4600a2ee1345",
+    "kb": 59.9,
+    "note": "K=8, noise .02, disturb"
+  },
+  {
+    "id": "A2",
+    "file": "A2_no_latency_k8_m0.pt",
+    "tag": "m0_latoff_aroff",
+    "k": 8,
+    "m": 0,
+    "sha256_16": "fc5abe0e917e4b1a",
+    "kb": 59.9,
+    "note": "K=8, NO latency in training"
+  },
+  {
+    "id": "A3",
+    "file": "A3_latency_trained_k8_m0.pt",
+    "tag": "m0_laton_aroff",
+    "k": 8,
+    "m": 0,
+    "sha256_16": "f5878876535f011d",
+    "kb": 59.9,
+    "note": "K=8, latency-trained  <-- best in sim"
+  },
+  {
+    "id": "A4",
+    "file": "A4_latency_acthist_k8_m1.pt",
+    "tag": "m1_laton_aroff",
+    "k": 8,
+    "m": 1,
+    "sha256_16": "051eecfc3203a049",
+    "kb": 61.4,
+    "note": "K=8 + 1 past action, latency-trained"
+  }
+]
