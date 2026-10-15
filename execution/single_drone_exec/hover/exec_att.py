@@ -1,16 +1,22 @@
 import os
+import sys
 import time
 import threading
 import argparse
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
-from cflib.crazyflie.log import LogConfig
+
+# Make the `common` package importable; appended so it cannot shadow installed modules.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.flight_recorder import CrazyflieStateBase
+from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, WaypointGate,
+                          add_run_args, apply_run_args)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -28,6 +34,7 @@ logger = logging.getLogger("CrazyflieRL")
 # Your room is 3x3x1.7m with origin centered, so walls at ±1.5m — this
 # leaves 0.5m margin on each side.
 target_pos = None  # initialized in control_loop after takeoff
+waypoint_gate = WaypointGate()  # replaced in main() from --waypoint-radius / --waypoint-hold
 
 # ── Safety thresholds ────────────────────────────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
@@ -59,7 +66,7 @@ class Policy(GaussianMixin, Model):
             mean = self.value_layer(x)
         return mean, {"log_std": self.log_std_parameter}
 
-class CrazyflieController:
+class CrazyflieController(CrazyflieStateBase):
     """Crazyflie controller for attitude (angle) RL agents.
 
     Uses send_setpoint_manual with rate=False so roll/pitch are angles in
@@ -74,12 +81,14 @@ class CrazyflieController:
         self,
         uri: str,
         agent: PPO,
+        run_args,
         initial_target=None,
         mass_kg: float = 0.027,
         max_thrust_N: float = 0.638,
         min_thrust_scale: float = 0.5,
         max_thrust_scale: float = 1.8,
     ):
+        super().__init__(device)
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
@@ -94,14 +103,13 @@ class CrazyflieController:
             f"Thrust mapping: m={self.mass_kg:.4f} kg, weight={self.weight_N:.4f} N, "
             f"max_thrust={self.max_thrust_N:.4f} N, hover_pct≈{self.hover_thrust_pct:.1f}%"
         )
-        self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
-        self.position_received = False
-        self.running = True
-        self._last_pos_time: float = 0.0
-        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
-        self.lock = threading.Lock()
+
+        self.make_recorder(run_args,
+                           obs_fields=["lin_vel_b_x", "lin_vel_b_y", "lin_vel_b_z",
+                                       "des_pos_b_x", "des_pos_b_y", "des_pos_b_z"],
+                           action_fields=["action_roll", "action_pitch", "action_yaw", "action_thrust"],
+                           cmd_fields=["roll_deg", "pitch_deg", "yaw_rate_deg_s", "thrust_pct"])
+
         self._setup_callbacks()
 
     def _setup_callbacks(self):
@@ -112,7 +120,8 @@ class CrazyflieController:
 
     def _connected(self, uri: str):
         logger.info(f"Connected to {uri}")
-        self._start_logging()
+        self.setup_state_logging()
+        self.recorder.start()
         threading.Thread(target=self.control_loop, daemon=True).start()
 
     def _disconnected(self, uri: str):
@@ -126,87 +135,10 @@ class CrazyflieController:
         logger.warning(f"Connection to {uri} lost: {msg} — triggering safe landing")
         self.running = False
 
-    def _start_logging(self):
-        LOG_FREQUENCY_IN_MS = 10  # 100 Hz — matches control loop
-        # Block 1: position + velocity (6 floats = 24 bytes, within 26-byte limit)
-        log_posvel = LogConfig(name="posvel", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_posvel.add_variable("stateEstimate.x", "float")
-        log_posvel.add_variable("stateEstimate.y", "float")
-        log_posvel.add_variable("stateEstimate.z", "float")
-        log_posvel.add_variable("stateEstimate.vx", "float")
-        log_posvel.add_variable("stateEstimate.vy", "float")
-        log_posvel.add_variable("stateEstimate.vz", "float")
-        self.cf.log.add_config(log_posvel)
-        log_posvel.data_received_cb.add_callback(self._log_posvel_callback)
-        log_posvel.start()
-
-        # Block 2: quaternion (4 floats = 16 bytes)
-        log_quat = LogConfig(name="quat", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_quat.add_variable("stateEstimate.qx", "float")
-        log_quat.add_variable("stateEstimate.qy", "float")
-        log_quat.add_variable("stateEstimate.qz", "float")
-        log_quat.add_variable("stateEstimate.qw", "float")
-        self.cf.log.add_config(log_quat)
-        log_quat.data_received_cb.add_callback(self._log_data_quat_callback)
-        log_quat.start()
-
-        log_var = LogConfig(name="quality", period_in_ms=200)
-        log_var.add_variable("kalman.varPX", "float")
-        log_var.add_variable("kalman.varPY", "float")
-        log_var.add_variable("kalman.varPZ", "float")
-        self.cf.log.add_config(log_var)
-        log_var.data_received_cb.add_callback(self._log_variance_callback)
-        log_var.start()
-
-    def _log_posvel_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with self.lock:
-            self.current_pos = torch.tensor([
-                data["stateEstimate.x"],
-                data["stateEstimate.y"],
-                data["stateEstimate.z"]
-            ], dtype=torch.float32, device=device)
-            self.current_vel = torch.tensor([
-                data["stateEstimate.vx"],
-                data["stateEstimate.vy"],
-                data["stateEstimate.vz"]
-            ], dtype=torch.float32, device=device)
-            self._last_pos_time = time.time()
-            self.position_received = True
-
-    def _log_data_quat_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with self.lock:
-            self.current_quat = torch.tensor([
-                data['stateEstimate.qw'],
-                data['stateEstimate.qx'],
-                data['stateEstimate.qy'],
-                data['stateEstimate.qz'],
-            ], dtype=torch.float32, device=device)
-
-    def _log_variance_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        """Track Kalman filter position variance to detect lighthouse tracking loss."""
-        with self.lock:
-            self._pos_variance = torch.tensor([
-                data["kalman.varPX"],
-                data["kalman.varPY"],
-                data["kalman.varPZ"],
-            ], dtype=torch.float32, device=device)
-
-    def _emergency_land(self):
-        """Trigger a safe landing regardless of the current commander mode."""
-        logger.warning("EMERGENCY LANDING triggered")
-        self.running = False
-        try:
-            self.cf.high_level_commander.land(0.0, 2.0)
-        except Exception as e:
-            logger.error(f"Emergency land command failed: {e}")
-            try:
-                self.cf.commander.send_stop_setpoint()
-            except Exception:
-                pass
-
     def control_loop(self):
         """Main control loop: thrust-ramp takeoff, then NN attitude control."""
         INTERVAL = 0.01  # 100 Hz control loop
+        SPIN_MARGIN = 0.002  # sleep to 2 ms before each deadline, busy-wait the rest (see wait_until)
         MAX_ANGLE = 30.0          # degrees — must match att_hovering.py max_roll_pitch
         MAX_YAW_RATE = 90.0       # deg/s   — must match att_hovering.py max_yaw_rate
 
@@ -241,8 +173,9 @@ class CrazyflieController:
         logger.info("NN attitude control active.")
         nn_start_time = time.time()
         GRACE_PERIOD = 3.0  # seconds before enforcing z lower bound (let drone gain altitude)
+        deadline = time.perf_counter()
+        step = 0
         while self.cf.is_connected() and self.running:
-            start_time = time.time()
 
             # ── Safety watchdog ──────────────────────────────────────────────
             # Position bounds matching training termination (z<0.1 or z>2.0)
@@ -250,26 +183,28 @@ class CrazyflieController:
             z = self.current_pos[2].item()
             if (elapsed_since_nn > GRACE_PERIOD and z < 0.1) or z > 2.5:
                 logger.error(f"Position out of bounds z={self.current_pos[2].item():.2f} — emergency landing")
-                self._emergency_land()
+                emergency_land(self)
                 break
             if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
                 logger.error(
                     f"Position data stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
                 )
-                self._emergency_land()
+                emergency_land(self)
                 break
             with self.lock:
                 var = self._pos_variance.clone()
             if var.max().item() > POS_VARIANCE_THRESHOLD:
                 logger.error(f"Position variance too high {var.tolist()} — emergency landing")
-                self._emergency_land()
+                emergency_land(self)
                 break
 
-            obs = retrieve_and_create_observation(self.current_vel, self.current_pos, self.current_quat)
+            state = self.snapshot()  # one consistent read, used for the obs and its recorded row
+            obs = retrieve_and_create_observation(state.vel, state.pos, state.quat)
             if obs is None:
                 logger.warning("No observation received, holding hover thrust...")
                 self.cf.commander.send_setpoint_manual(0, 0, 0, self.hover_thrust_pct, False)
-                time.sleep(INTERVAL)
+                step += 1
+                deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
                 continue
 
             with torch.no_grad():
@@ -288,15 +223,14 @@ class CrazyflieController:
             )
             thrust_pct = max(0.0, min(100.0, 100.0 * thrust_N / self.max_thrust_N))
 
-            logger.info(
-                f"Cmd: roll={roll:+.1f}° pitch={pitch:+.1f}° yaw={yaw:+.1f}°/s  "
-                f"T={thrust_pct:5.1f}%  | pos={self.current_pos}"
-            )
+            control_time = time.time()
+
             # Angle mode (rate=False): roll/pitch in deg, yaw in deg/s, thrust in [0, 100] %.
             self.cf.commander.send_setpoint_manual(roll, pitch, yaw, thrust_pct, False)
+            self.record_step(step, state, control_time, target_pos, obs, action, [roll, pitch, yaw, thrust_pct])
+            step += 1
 
-            elapsed = time.time() - start_time
-            time.sleep(max(0, INTERVAL - elapsed))
+            deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
         self.cf.commander.send_stop_setpoint()
         logger.info("Control loop stopped")
@@ -308,40 +242,29 @@ class CrazyflieController:
     def stop(self):
         logger.info("Stopping controller...")
         self.running = False
-        time.sleep(0.2)
-        logger.info("Landing...")
-        self.cf.high_level_commander.land(0.0, 2.0)
-        time.sleep(2.5)
-        self.cf.close_link()
-        logger.info("Link closed")
+        try:
+            time.sleep(0.2)
+            logger.info("Landing...")
+            self.cf.high_level_commander.land(0.0, 2.0)
+            time.sleep(2.5)
+            self.cf.close_link()
+            logger.info("Link closed")
+        finally:
+            self.recorder.close()  # always write the Parquet footer, or the file is unreadable
 
 
 def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
-    # Target is fixed per run, matching the sim episode behaviour.
+    # Target advances via waypoint_gate; --waypoint-radius 0 keeps it fixed per run,
+    # matching the sim episode behaviour.
     global target_pos
     if target_pos is None:
         return None
+    target_pos = waypoint_gate.step(current_pos, target_pos)
     # Rotate world-frame Kalman velocity into body frame
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
     obs = torch.cat([linear_vel_b, desired_pos_b], dim=-1)
     return obs
-
-def quat_apply(quat, vec):
-    shape = vec.shape
-    quat = quat.reshape(-1, 4)
-    vec = vec.reshape(-1, 3)
-    xyz = quat[:, 1:]
-    t = xyz.cross(vec, dim=-1) * 2
-    return (vec + quat[:, 0:1] * t + xyz.cross(t, dim=-1)).view(shape)
-
-def quat_conjugate(q):
-    shape = q.shape
-    q = q.reshape(-1, 4)
-    return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1).view(shape)
-
-def quat_inv(q, eps=1e-9):
-    return quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
 
 def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
     obs_space = 6
@@ -374,11 +297,16 @@ def main():
                         help="Upper bound of thrust action, as fraction of hover weight.")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
+    add_run_args(parser)
     args = parser.parse_args()
+
+    global waypoint_gate
+    waypoint_gate = apply_run_args(args)
     agent = load_agent(args.checkpoint, device)
     controller = CrazyflieController(
         uri=args.uri,
         agent=agent,
+        run_args=args,
         initial_target=args.target,
         mass_kg=args.mass_kg,
         max_thrust_N=args.max_thrust_N,

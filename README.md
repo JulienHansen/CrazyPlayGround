@@ -70,3 +70,8 @@ Once inside the container, use the following command to verify and train (inside
 ## Documentation
 
 Full documentation (environments, controller architecture, configuration, real-drone deployment) lives in [`docs/`](docs/) and is built with MkDocs Material, an online version of the documentation will soon be available
+
+## Remarks
+
+> **Note:** this repo assumes WXYZ (scalar-first) quaternions throughout, matching IsaacLab 2.3.2. See [docs/isaaclab-3-quaternion-migration.md](docs/isaaclab-3-quaternion-migration.md) before upgrading past IsaacLab 3.0.
+

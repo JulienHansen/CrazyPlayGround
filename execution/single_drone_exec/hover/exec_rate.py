@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 import argparse
@@ -13,6 +14,12 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 
+# Make the `common` package importable; appended so it cannot shadow installed modules.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.flight_recorder import CrazyflieStateBase
+from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, WaypointGate,
+                          add_run_args, apply_run_args)
+
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_CFG
@@ -25,6 +32,7 @@ logging.basicConfig(format="{asctime} [{levelname}] {message}",
                         level=logging.INFO)
 logger = logging.getLogger("CrazyflieRL")
 target_pos = None  # initialized in control_loop after takeoff
+waypoint_gate = WaypointGate()  # replaced in main() from --waypoint-radius / --waypoint-hold
 
 # ── Safety thresholds ────────────────────────────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
@@ -56,7 +64,7 @@ class Policy(GaussianMixin, Model):
         return mean, {"log_std": self.log_std_parameter}
 
 
-class CrazyflieController:
+class CrazyflieController(CrazyflieStateBase):
     """Crazyflie controller for body-rate RL agents.
 
     Uses rate mode to send body rates in deg/s + thrust percentage.
@@ -80,6 +88,7 @@ class CrazyflieController:
         self,
         uri: str,
         agent: PPO,
+        run_args,
         initial_target=None,
         mass_kg: float = 0.027,
         max_thrust_N: float = 0.638,
@@ -89,6 +98,7 @@ class CrazyflieController:
         min_thrust_pct: float = 25.0,
         max_thrust_pct: float = 90.0,
     ):
+        super().__init__(device)
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
         self.agent = agent
@@ -125,15 +135,17 @@ class CrazyflieController:
                 "measure the real hover thrust percentage (manually trim a stable hover "
                 "in rate mode with zero rates) and pass it via --hover-thrust-pct."
             )
-        self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_vel = torch.zeros(3, dtype=torch.float32, device=device)
-        self.current_quat = torch.zeros(4, dtype=torch.float32, device=device)
         self.current_ang_vel = torch.zeros(3, dtype=torch.float32, device=device)
-        self.position_received = False
-        self.running = True
-        self._last_pos_time: float = 0.0
-        self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
-        self.lock = threading.Lock()
+
+        self.make_recorder(run_args,
+                           obs_fields=["lin_vel_b_x", "lin_vel_b_y", "lin_vel_b_z",
+                                       "des_pos_b_x", "des_pos_b_y", "des_pos_b_z",
+                                       "rotmat_0", "rotmat_1", "rotmat_2", "rotmat_3", "rotmat_4",
+                                       "rotmat_5", "rotmat_6", "rotmat_7", "rotmat_8",
+                                       "ang_vel_x", "ang_vel_y", "ang_vel_z"],
+                           action_fields=["action_roll", "action_pitch", "action_yaw", "action_thrust"],
+                           cmd_fields=["roll_rate_deg_s", "pitch_rate_deg_s", "yaw_rate_deg_s", "thrust_pct"])
+
         self._setup_callbacks()
 
     def _thrust_pct_from_action(self, action_thrust: float) -> float:
@@ -155,7 +167,9 @@ class CrazyflieController:
 
     def _connected(self, uri: str):
         logger.info(f"Connected to {uri}")
-        self._start_logging()
+        self.setup_state_logging()
+        self._start_gyro_logging()
+        self.recorder.start()
         threading.Thread(target=self.control_loop, daemon=True).start()
 
     def _disconnected(self, uri: str):
@@ -169,40 +183,11 @@ class CrazyflieController:
         logger.warning(f"Connection to {uri} lost: {msg} — triggering safe landing")
         self.running = False
 
-    def _start_logging(self):
+    def _start_gyro_logging(self):
+        """Body angular velocity (gyro, deg/s -> rad/s in callback). Specific to
+        this script's 18-dim observation — not part of the shared state-logging
+        blocks in common/utils.py."""
         LOG_FREQUENCY_IN_MS = 10  # 100 Hz
-        # Block 1: position + velocity (6 floats = 24 bytes)
-        log_posvel = LogConfig(name="posvel", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_posvel.add_variable("stateEstimate.x", "float")
-        log_posvel.add_variable("stateEstimate.y", "float")
-        log_posvel.add_variable("stateEstimate.z", "float")
-        log_posvel.add_variable("stateEstimate.vx", "float")
-        log_posvel.add_variable("stateEstimate.vy", "float")
-        log_posvel.add_variable("stateEstimate.vz", "float")
-        self.cf.log.add_config(log_posvel)
-        log_posvel.data_received_cb.add_callback(self._log_posvel_callback)
-        log_posvel.start()
-
-        # Block 2: quaternion (4 floats = 16 bytes)
-        log_quat = LogConfig(name="quat", period_in_ms=LOG_FREQUENCY_IN_MS)
-        log_quat.add_variable("stateEstimate.qx", "float")
-        log_quat.add_variable("stateEstimate.qy", "float")
-        log_quat.add_variable("stateEstimate.qz", "float")
-        log_quat.add_variable("stateEstimate.qw", "float")
-        self.cf.log.add_config(log_quat)
-        log_quat.data_received_cb.add_callback(self._log_data_quat_callback)
-        log_quat.start()
-
-        # Block 3: Kalman variance (for safety watchdog)
-        log_var = LogConfig(name="quality", period_in_ms=200)
-        log_var.add_variable("kalman.varPX", "float")
-        log_var.add_variable("kalman.varPY", "float")
-        log_var.add_variable("kalman.varPZ", "float")
-        self.cf.log.add_config(log_var)
-        log_var.data_received_cb.add_callback(self._log_variance_callback)
-        log_var.start()
-
-        # Block 4: body angular velocity (gyro, deg/s -> rad/s in callback).
         log_gyro = LogConfig(name="gyro", period_in_ms=LOG_FREQUENCY_IN_MS)
         log_gyro.add_variable("gyro.x", "float")
         log_gyro.add_variable("gyro.y", "float")
@@ -210,38 +195,6 @@ class CrazyflieController:
         self.cf.log.add_config(log_gyro)
         log_gyro.data_received_cb.add_callback(self._log_gyro_callback)
         log_gyro.start()
-
-    def _log_posvel_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with self.lock:
-            self.current_pos = torch.tensor([
-                data["stateEstimate.x"],
-                data["stateEstimate.y"],
-                data["stateEstimate.z"]
-            ], dtype=torch.float32, device=device)
-            self.current_vel = torch.tensor([
-                data["stateEstimate.vx"],
-                data["stateEstimate.vy"],
-                data["stateEstimate.vz"]
-            ], dtype=torch.float32, device=device)
-            self._last_pos_time = time.time()
-            self.position_received = True
-
-    def _log_data_quat_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with self.lock:
-            self.current_quat = torch.tensor([
-                data['stateEstimate.qw'],
-                data['stateEstimate.qx'],
-                data['stateEstimate.qy'],
-                data['stateEstimate.qz'],
-            ], dtype=torch.float32, device=device)
-
-    def _log_variance_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
-        with self.lock:
-            self._pos_variance = torch.tensor([
-                data["kalman.varPX"],
-                data["kalman.varPY"],
-                data["kalman.varPZ"],
-            ], dtype=torch.float32, device=device)
 
     def _log_gyro_callback(self, timestamp: float, data: Dict[str, Any], logconf: LogConfig):
         # Crazyflie gyro is in deg/s, body frame. Sim's root_ang_vel_b is rad/s.
@@ -253,21 +206,10 @@ class CrazyflieController:
                 data["gyro.z"] * deg2rad,
             ], dtype=torch.float32, device=device)
 
-    def _emergency_land(self):
-        logger.warning("EMERGENCY LANDING triggered")
-        self.running = False
-        try:
-            self.cf.high_level_commander.land(0.0, 2.0)
-        except Exception as e:
-            logger.error(f"Emergency land command failed: {e}")
-            try:
-                self.cf.commander.send_stop_setpoint()
-            except Exception:
-                pass
-
     def control_loop(self):
         """Main control loop: attitude-controlled takeoff, then NN body-rate control."""
         INTERVAL = 0.01  # 100 Hz control loop
+        SPIN_MARGIN = 0.002  # sleep to 2 ms before each deadline, busy-wait the rest (see wait_until)
         # Must match the sim: action[:3] * pi rad/s = action[:3] * 180 deg/s.
         MAX_BODY_RATE_DEG = 180.0
 
@@ -311,36 +253,39 @@ class CrazyflieController:
         logger.info("NN body-rate control active.")
         nn_start_time = time.time()
         GRACE_PERIOD = 3.0
+        deadline = time.perf_counter()
+        step = 0
         while self.cf.is_connected() and self.running:
-            start_time = time.time()
 
             # ── Safety watchdog ──────────────────────────────────────────────
             elapsed_since_nn = time.time() - nn_start_time
             z = self.current_pos[2].item()
             if (elapsed_since_nn > GRACE_PERIOD and z < 0.1) or z > 2.5:
                 logger.error(f"Position out of bounds z={z:.2f} — emergency landing")
-                self._emergency_land()
+                emergency_land(self)
                 break
             if self._last_pos_time > 0 and time.time() - self._last_pos_time > POS_STALE_TIMEOUT_S:
                 logger.error(
                     f"Position data stale ({time.time() - self._last_pos_time:.2f} s) — emergency landing"
                 )
-                self._emergency_land()
+                emergency_land(self)
                 break
             with self.lock:
                 var = self._pos_variance.clone()
             if var.max().item() > POS_VARIANCE_THRESHOLD:
                 logger.error(f"Position variance too high {var.tolist()} — emergency landing")
-                self._emergency_land()
+                emergency_land(self)
                 break
 
-            obs = retrieve_and_create_observation(
-                self.current_vel, self.current_pos, self.current_quat, self.current_ang_vel
-            )
+            state = self.snapshot()  # one consistent read, used for the obs and its recorded row
+            with self.lock:
+                ang_vel = self.current_ang_vel.clone()  # own gyro log block, not in the snapshot
+            obs = retrieve_and_create_observation(state.vel, state.pos, state.quat, ang_vel)
             if obs is None:
                 logger.warning("No observation received, holding hover thrust...")
                 self.cf.commander.send_setpoint_manual(0, 0, 0, self.hover_thrust_pct, True)
-                time.sleep(INTERVAL)
+                step += 1
+                deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
                 continue
 
             with torch.no_grad():
@@ -358,15 +303,14 @@ class CrazyflieController:
             # thrust percentage that actually holds altitude.
             thrust_pct = self._thrust_pct_from_action(action[3].item())
 
-            logger.info(
-                f"Cmd: roll={roll_rate:+.1f} pitch={pitch_rate:+.1f} yaw={yaw_rate:+.1f} deg/s  "
-                f"T={thrust_pct:5.1f}%  | pos={self.current_pos}"
-            )
+            control_time = time.time()
+
             # Rate mode (rate=True): roll/pitch/yaw in deg/s, thrust in [0, 100] %.
             self.cf.commander.send_setpoint_manual(roll_rate, pitch_rate, yaw_rate, thrust_pct, True)
+            self.record_step(step, state, control_time, target_pos, obs, action, [roll_rate, pitch_rate, yaw_rate, thrust_pct])
+            step += 1
 
-            elapsed = time.time() - start_time
-            time.sleep(max(0, INTERVAL - elapsed))
+            deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
         self.cf.commander.send_stop_setpoint()
         logger.info("Control loop stopped")
@@ -378,21 +322,26 @@ class CrazyflieController:
     def stop(self):
         logger.info("Stopping controller...")
         self.running = False
-        time.sleep(0.2)
-        logger.info("Landing...")
-        self.cf.high_level_commander.land(0.0, 2.0)
-        time.sleep(2.5)
-        self.cf.close_link()
-        logger.info("Link closed")
+        try:
+            time.sleep(0.2)
+            logger.info("Landing...")
+            self.cf.high_level_commander.land(0.0, 2.0)
+            time.sleep(2.5)
+            self.cf.close_link()
+            logger.info("Link closed")
+        finally:
+            self.recorder.close()  # always write the Parquet footer, or the file is unreadable
 
 
 def retrieve_and_create_observation(
     current_vel, current_pos, current_quat, current_ang_vel
 ) -> Optional[torch.Tensor]:
-    # Target is fixed per run, matching the sim episode behaviour.
+    # Target advances via waypoint_gate; --waypoint-radius 0 keeps it fixed per run,
+    # matching the sim episode behaviour.
     global target_pos
     if target_pos is None:
         return None
+    target_pos = waypoint_gate.step(current_pos, target_pos)
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
     rot_mat_flat = quat_to_rotmat_flat(current_quat)
@@ -420,25 +369,6 @@ def quat_to_rotmat_flat(quat: torch.Tensor) -> torch.Tensor:
         two_s * (qy * qz + qx * qw),
         1 - two_s * (qx * qx + qy * qy),
     ])
-
-
-def quat_apply(quat, vec):
-    shape = vec.shape
-    quat = quat.reshape(-1, 4)
-    vec = vec.reshape(-1, 3)
-    xyz = quat[:, 1:]
-    t = xyz.cross(vec, dim=-1) * 2
-    return (vec + quat[:, 0:1] * t + xyz.cross(t, dim=-1)).view(shape)
-
-
-def quat_conjugate(q):
-    shape = q.shape
-    q = q.reshape(-1, 4)
-    return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1).view(shape)
-
-
-def quat_inv(q, eps=1e-9):
-    return quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
 
 
 def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
@@ -481,11 +411,16 @@ def main():
                         help="Thrust pct corresponding to action[3] = -1.")
     parser.add_argument("--max-thrust-pct", type=float, default=90.0,
                         help="Thrust pct corresponding to action[3] = +1.")
+    add_run_args(parser)
     args = parser.parse_args()
+
+    global waypoint_gate
+    waypoint_gate = apply_run_args(args)
     agent = load_agent(args.checkpoint, device)
     controller = CrazyflieController(
         uri=args.uri,
         agent=agent,
+        run_args=args,
         initial_target=args.target,
         mass_kg=args.mass_kg,
         max_thrust_N=args.max_thrust_N,
