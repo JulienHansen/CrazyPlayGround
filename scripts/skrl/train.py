@@ -130,6 +130,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
+    # skrl's wandb_config (built from agent/trainer/model dataclasses in Agent.init())
+    # never includes num_envs, since it's an Isaac Lab env_cfg field, not an agent
+    # field -- pre-seed it into wandb_kwargs["config"] here so it's still logged.
+    agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {}).setdefault("config", {})[
+        "num_envs"
+    ] = env_cfg.scene.num_envs
+
     # multi-gpu training config
     if args_cli.distributed:
         env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"

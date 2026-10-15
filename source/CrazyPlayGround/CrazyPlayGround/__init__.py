@@ -7,6 +7,9 @@
 Python module serving as a project/extension template.
 """
 
+# Patch skrl's TensorBoard writer to also forward scalars to Weights & Biases.
+from . import wandb_tb_patch  # noqa: F401
+
 # Register Gym environments.
 from .tasks import *
 
