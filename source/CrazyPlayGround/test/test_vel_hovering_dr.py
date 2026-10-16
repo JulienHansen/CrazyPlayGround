@@ -12,21 +12,27 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 import omni.usd  # noqa: E402
-from isaaclab.utils.math import subtract_frame_transforms  # noqa: E402
+from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms  # noqa: E402
 
 from CrazyPlayGround.tasks.direct.hovering.vel_hovering_dr import DRQuadcopterEnv, DRQuadcopterEnvCfg  # noqa: E402
 
 N, K, M = 4, 3, 2
 
 
-def make_env(**knobs) -> DRQuadcopterEnv:
+def make_env(num_envs: int = N, **knobs) -> DRQuadcopterEnv:
     omni.usd.get_context().new_stage()
     cfg = DRQuadcopterEnvCfg()
-    cfg.scene.num_envs = N
+    cfg.scene.num_envs = num_envs
     cfg.debug_vis = False
     for key, value in knobs.items():  # set after the cfg is built, as Hydra does
         setattr(cfg, key, value)
-    return DRQuadcopterEnv(cfg)
+    env = DRQuadcopterEnv(cfg)
+    # Drones spawn up to 2.0 m, the base env's kill height, so a random command can reset an env
+    # mid-test. Keep only the timeout, which the tests use to force resets on purpose.
+    env._get_dones = lambda: (
+        torch.zeros_like(env.reset_terminated), env.episode_length_buf >= env.max_episode_length - 1
+    )
+    return env
 
 
 def frame(env) -> torch.Tensor:
@@ -59,6 +65,10 @@ def rand_cmd(env):
         {"action_input_hist": -1},
         {"action_latency_steps": -1},
         {"action_latency_steps": 3, "action_latency_max_steps": 2},
+        {"noise_corr": 1.0},
+        {"noise_bias_std": -0.1},
+        {"wind_force_range": (-0.01, 0.02)},
+        {"wind_force_range": (0.03, 0.02)},
     ],
 )
 def test_invalid_knobs_raise(knobs):
@@ -72,8 +82,12 @@ def test_default_is_vel_hovering():
         assert env.single_observation_space["policy"].shape == (6,)
         obs, _ = env.reset()
         torch.testing.assert_close(obs["policy"], frame(env))
+        torch.testing.assert_close(env.true_state, frame(env))
         obs, *_ = env.step(torch.full((N, 3), 0.3, device=env.device))
         torch.testing.assert_close(obs["policy"], frame(env))
+        torch.testing.assert_close(env.true_state, frame(env))
+        env._apply_action()
+        assert not env._robot.instantaneous_wrench_composer.active  # no wind by default
     finally:
         env.close()
 
@@ -159,12 +173,12 @@ def test_latency_randomised_per_episode():
         seen = set()
         for _ in range(20):  # 80 draws: P(some value never drawn) < 1e-9
             env.reset()
-            assert ((env._delay_steps >= lo) & (env._delay_steps <= hi)).all()
-            seen |= set(env._delay_steps.tolist())
+            assert ((env.delay_steps >= lo) & (env.delay_steps <= hi)).all()
+            seen |= set(env.delay_steps.tolist())
         assert seen == set(range(lo, hi + 1))
 
         env.episode_length_buf[:] = 0
-        delay = env._delay_steps.tolist()
+        delay = env.delay_steps.tolist()
         A = [torch.zeros(N, 3, device=env.device)]
         for t in range(1, 7):
             A.append(rand_cmd(env))
@@ -197,5 +211,97 @@ def test_action_rate_penalises_commanded_action():
         torch.testing.assert_close(
             env._episode_sums["action_rate"][0], scale * c[0].square().sum() * env.step_dt
         )
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("rho", [0.0, 0.9])
+def test_noise_std_and_correlation(rho):
+    n_envs, std = 256, 0.1
+    env = make_env(num_envs=n_envs, add_noise=True, noise_std=std, noise_corr=rho)
+    try:
+        obs, _ = env.reset()
+        env.episode_length_buf[:] = 0
+        noise = [obs["policy"] - frame(env)]               # measured noise = obs - true state
+        hover = torch.zeros(n_envs, 3, device=env.device)
+        for _ in range(20):
+            obs, *_ = env.step(hover)
+            noise.append(obs["policy"] - frame(env))
+        noise = torch.stack(noise) / std                   # [21 steps, envs, 6]; unit std if correct
+        assert abs(noise[0].std().item() - 1.0) < 0.1      # full strength right after reset
+        # regression of n_t+1 on n_t: slope = rho, residual = the fresh part, std sqrt(1 - rho^2).
+        # Residuals are independent, so ~30k samples give a standard error of ~0.005 on both.
+        rho_hat = ((noise[1:] * noise[:-1]).sum() / noise[:-1].square().sum()).item()
+        assert abs(rho_hat - rho) < 0.03
+        innovation = noise[1:] - rho * noise[:-1]
+        assert abs(innovation.std().item() - (1.0 - rho * rho) ** 0.5) < 0.03
+    finally:
+        env.close()
+
+
+def test_noise_bias_per_episode():
+    env = make_env(add_noise=True, noise_std=0.01, noise_bias_std=0.05)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        bias = env.obs_noise_bias.clone()
+        assert bias.abs().max() > 0
+        for _ in range(5):
+            obs, *_ = env.step(torch.zeros(N, 3, device=env.device))
+            # obs - true state = bias + white noise of std 0.01; 0.05 is 5 sigma
+            torch.testing.assert_close(obs["policy"] - frame(env), bias, atol=0.05, rtol=0)
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(torch.zeros(N, 3, device=env.device))
+        assert not torch.equal(env.obs_noise_bias[0], bias[0])
+        torch.testing.assert_close(env.obs_noise_bias[1:], bias[1:])
+    finally:
+        env.close()
+
+
+def test_noise_knobs_need_add_noise(caplog):
+    env = make_env(noise_corr=0.5, noise_bias_std=0.1)
+    try:
+        assert "no effect without add_noise" in caplog.text
+        obs, _ = env.reset()
+        torch.testing.assert_close(obs["policy"], frame(env))
+    finally:
+        env.close()
+
+
+def test_wind_strength_direction_frame_and_reset():
+    n_envs, lo, hi = 256, 0.01, 0.03
+    env = make_env(num_envs=n_envs, wind_force_range=(lo, hi))
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        wind = env.wind_force_world.clone()
+        strength = wind.norm(dim=1)
+        assert ((strength >= lo - 1e-6) & (strength <= hi + 1e-6)).all()
+        direction = wind / strength[:, None]
+        # uniform over the sphere: mean direction ~ 0, and z (vertical) spread over [-1, 1]
+        assert direction.mean(0).abs().max() < 0.2
+        assert direction[:, 2].min() < -0.5 and direction[:, 2].max() > 0.5   # wind can push down and up
+        assert abs(direction[:, 2].abs().mean().item() - 0.5) < 0.1          # E|z| = 1/2 if uniform
+
+        cmd = torch.empty(n_envs, 3, device=env.device)
+        for _ in range(3):
+            env.step(cmd.uniform_(-1.0, 1.0))              # random commands tilt the drones
+        torch.testing.assert_close(env.wind_force_world, wind)   # constant within the episode
+
+        # what Isaac Lab will apply on the next physics step, in the body frame
+        env._apply_action()
+        wrench = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        expected_body = quat_apply_inverse(env._robot.data.body_link_quat_w[:, b], wind)
+        assert not torch.allclose(expected_body, wind)     # tilt makes the frame matter
+        torch.testing.assert_close(wrench.composed_force_as_torch[:, b], expected_body)
+        assert not wrench.composed_torque_as_torch.any()   # wind adds no torque
+        wrench.reset()                                     # undo the manual call
+
+        # env 0 resets: new wind; the others keep theirs
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(cmd.uniform_(-1.0, 1.0))
+        assert not torch.equal(env.wind_force_world[0], wind[0])
+        torch.testing.assert_close(env.wind_force_world[1:], wind[1:])
     finally:
         env.close()
