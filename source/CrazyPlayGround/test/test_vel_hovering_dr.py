@@ -69,6 +69,8 @@ def rand_cmd(env):
         {"noise_bias_std": -0.1},
         {"wind_force_range": (-0.01, 0.02)},
         {"wind_force_range": (0.03, 0.02)},
+        {"thrust_scale_range": (0.0, 1.2)},
+        {"torque_scale_range": (1.2, 1.1)},
     ],
 )
 def test_invalid_knobs_raise(knobs):
@@ -87,7 +89,7 @@ def test_default_is_vel_hovering():
         torch.testing.assert_close(obs["policy"], frame(env))
         torch.testing.assert_close(env.true_state, frame(env))
         env._apply_action()
-        assert not env._robot.instantaneous_wrench_composer.active  # no wind by default
+        assert not env._robot.instantaneous_wrench_composer.active  # no wind, no actuation scaling by default
     finally:
         env.close()
 
@@ -303,5 +305,38 @@ def test_wind_strength_direction_frame_and_reset():
         env.step(cmd.uniform_(-1.0, 1.0))
         assert not torch.equal(env.wind_force_world[0], wind[0])
         torch.testing.assert_close(env.wind_force_world[1:], wind[1:])
+    finally:
+        env.close()
+
+
+def test_thrust_torque_scaling():
+    lo, hi = 0.8, 1.2
+    env = make_env(thrust_scale_range=(lo, hi), torque_scale_range=(lo, hi))
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        for s in (env.thrust_scale, env.torque_scale):          # drawn in range, and really drawn
+            assert ((s >= lo) & (s <= hi)).all() and not torch.allclose(s, torch.ones_like(s))
+        env.step(rand_cmd(env))
+
+        # what the next physics step adds on top of the controller output T (permanent composer)
+        env._apply_action()
+        composer = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        thrust, moment = env._thrust[:, 0], env._moment[:, 0]
+        extra_force, extra_torque = composer.composed_force_as_torch[:, b], composer.composed_torque_as_torch[:, b]
+        torch.testing.assert_close(extra_force, (env.thrust_scale[:, None] - 1) * thrust)
+        torch.testing.assert_close(extra_torque, (env.torque_scale[:, None] - 1) * moment)
+        # so the body feels scale x T in total
+        torch.testing.assert_close(thrust + extra_force, env.thrust_scale[:, None] * thrust)
+        composer.reset()                                          # undo the manual call
+
+        # env 0 resets: new scales; the others keep theirs for the whole episode
+        thrust_scale, torque_scale = env.thrust_scale.clone(), env.torque_scale.clone()
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(rand_cmd(env))
+        assert env.thrust_scale[0] != thrust_scale[0] and env.torque_scale[0] != torque_scale[0]
+        torch.testing.assert_close(env.thrust_scale[1:], thrust_scale[1:])
+        torch.testing.assert_close(env.torque_scale[1:], torque_scale[1:])
     finally:
         env.close()

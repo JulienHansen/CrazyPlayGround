@@ -16,6 +16,10 @@ Observation noise (``add_noise=True``): AR(1) noise of std ``noise_std`` and cor
 
 Wind: a constant world-frame force per episode, with random strength and 3-D direction,
 added on top of the controller's thrust.
+
+Actuation randomisation: per episode, the thrust and moment that reach the body are the
+controller's output times random factors; the cascade PID still assumes nominal motors, so
+the policy has to absorb the mismatch.
 """
 
 from __future__ import annotations
@@ -49,11 +53,17 @@ class DRQuadcopterEnvCfg(QuadcopterEnvCfg):
     # wind: strength [N] drawn uniformly from this range at each reset, direction uniform in 3-D,
     # constant in the world frame for the whole episode. (0, 0) = no wind; weight is ~0.265 N.
     wind_force_range: tuple[float, float] = (0.0, 0.0)
+    # actuation effectiveness, drawn uniformly per episode; (1, 1) = off. The body gets
+    # scale x the controller output (battery sag, worn props, build differences).
+    thrust_scale_range: tuple[float, float] = (1.0, 1.0)
+    torque_scale_range: tuple[float, float] = (1.0, 1.0)
 
 
 def check_cfg(cfg: DRQuadcopterEnvCfg):
     """Reject knob values that can't work. Called by the env constructor, after Hydra overrides."""
     wind_lo, wind_hi = cfg.wind_force_range
+    thrust_lo, thrust_hi = cfg.thrust_scale_range
+    torque_lo, torque_hi = cfg.torque_scale_range
     checks = [
         (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
         (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
@@ -66,6 +76,9 @@ def check_cfg(cfg: DRQuadcopterEnvCfg):
         (0.0 <= cfg.noise_corr < 1.0, f"noise_corr must be in [0, 1), got {cfg.noise_corr}"),
         (cfg.noise_bias_std >= 0.0, f"noise_bias_std must be >= 0, got {cfg.noise_bias_std}"),
         (0.0 <= wind_lo <= wind_hi, f"wind_force_range must satisfy 0 <= min <= max, got {cfg.wind_force_range}"),
+        # 0 would mean no thrust / no moment at all: the drone can't fly
+        (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
+        (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
     ]
     for ok, msg in checks:
         if not ok:
@@ -103,6 +116,11 @@ class DRQuadcopterEnv(QuadcopterEnv):
         self.obs_noise_state = torch.randn(n, BASE_OBS_DIM, device=dev)
         self.obs_noise_bias = torch.zeros(n, BASE_OBS_DIM, device=dev)
         self.wind_force_world = torch.zeros(n, 3, device=dev)  # drawn per episode in _reset_idx
+        # actuation scales, drawn per episode in _reset_idx (stay 1 when the ranges are (1, 1))
+        self.thrust_scale = torch.ones(n, device=dev)
+        self.torque_scale = torch.ones(n, device=dev)
+        # skip the extra composer call entirely when nothing is randomised (tuple: Hydra may give a list)
+        self.randomize_actuation = (tuple(cfg.thrust_scale_range), tuple(cfg.torque_scale_range)) != ((1.0, 1.0),) * 2
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Record the commanded action, then hand the controller the one sent ``delay_steps``
@@ -115,12 +133,25 @@ class DRQuadcopterEnv(QuadcopterEnv):
         super()._pre_physics_step(applied)
 
     def _apply_action(self):
-        """The controller's thrust and moment (base env), plus the wind for this physics step."""
+        """The controller's thrust and moment (base env), scaled by the episode's actuation
+        effectiveness, plus the wind for this physics step.
+
+        Both extras go into Isaac Lab's instantaneous wrench composer, which Isaac Lab adds to
+        the base env's thrust (permanent composer) and clears after each physics step.
+        """
         super()._apply_action()
+        composer = self._robot.instantaneous_wrench_composer
+        if self.randomize_actuation:
+            # the base thrust T is already applied and the composers add up, so adding
+            # (scale - 1) x T makes the body feel scale x T in total (body frame, like T)
+            composer.add_forces_and_torques(
+                forces=(self.thrust_scale - 1.0).view(-1, 1, 1) * self._thrust,
+                torques=(self.torque_scale - 1.0).view(-1, 1, 1) * self._moment,
+                body_ids=self._body_id,
+            )
         if self.cfg.wind_force_range[1] > 0.0:
-            # Isaac Lab adds this to the base env's thrust and clears it after each physics step;
-            # with is_global=True it rotates the world-frame force into the body frame.
-            self._robot.instantaneous_wrench_composer.add_forces_and_torques(
+            # with is_global=True, Isaac Lab rotates the world-frame force into the body frame
+            composer.add_forces_and_torques(
                 forces=self.wind_force_world.unsqueeze(1), body_ids=self._body_id, is_global=True
             )
 
@@ -164,7 +195,7 @@ class DRQuadcopterEnv(QuadcopterEnv):
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         """Reset the base env, clear the command history, draw the episode's latency, noise
-        offset and wind, and flag the observation window for a refill."""
+        offset, wind and actuation scales, and flag the observation window for a refill."""
         super()._reset_idx(env_ids)
         n, dev = len(env_ids), self.device
         self.cmd_history[env_ids] = 0.0
@@ -177,4 +208,7 @@ class DRQuadcopterEnv(QuadcopterEnv):
         direction = direction / direction.norm(dim=1, keepdim=True)
         strength = torch.empty(n, 1, device=dev).uniform_(*self.cfg.wind_force_range)
         self.wind_force_world[env_ids] = strength * direction
+        # actuation scales (uniform_(1, 1) gives exactly 1, so the defaults need no branch)
+        self.thrust_scale[env_ids] = torch.empty(n, device=dev).uniform_(*self.cfg.thrust_scale_range)
+        self.torque_scale[env_ids] = torch.empty(n, device=dev).uniform_(*self.cfg.torque_scale_range)
         self.obs_window_fresh[env_ids] = True
