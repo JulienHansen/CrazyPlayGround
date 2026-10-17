@@ -58,6 +58,13 @@ def rand_cmd(env):
     return torch.empty(N, 3, device=env.device).uniform_(-1.0, 1.0)
 
 
+def step_terms(env, cmd):
+    """Step once and return (reward, {key: how much that episode sum grew this step})."""
+    before = {k: v.clone() for k, v in env._episode_sums.items()}
+    _, reward, *_ = env.step(cmd)
+    return reward, {k: env._episode_sums[k] - before[k] for k in before}
+
+
 @pytest.mark.parametrize(
     "knobs",
     [
@@ -71,6 +78,8 @@ def rand_cmd(env):
         {"wind_force_range": (0.03, 0.02)},
         {"thrust_scale_range": (0.0, 1.2)},
         {"torque_scale_range": (1.2, 1.1)},
+        {"distance_reward_shape": "gauss"},
+        {"distance_reward_length": 0.0},
     ],
 )
 def test_invalid_knobs_raise(knobs):
@@ -338,5 +347,30 @@ def test_thrust_torque_scaling():
         assert env.thrust_scale[0] != thrust_scale[0] and env.torque_scale[0] != torque_scale[0]
         torch.testing.assert_close(env.thrust_scale[1:], thrust_scale[1:])
         torch.testing.assert_close(env.torque_scale[1:], torque_scale[1:])
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("shape", ["tanh", "exp"])
+def test_reward_terms(shape):
+    length = 0.2                                    # not the default, so a hard-coded 0.3 would fail
+    env = make_env(distance_reward_shape=shape, distance_reward_length=length, action_rate_reward_scale=-0.5)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        cfg, data, dt = env.cfg, env._robot.data, env.step_dt
+        for _ in range(3):
+            reward, terms = step_terms(env, rand_cmd(env))
+            # the reward is exactly the sum of the logged terms (nothing added off the books)
+            torch.testing.assert_close(reward, sum(terms.values()))
+            # each term recomputed from the sim state (no env reset in between, so same state)
+            d = torch.linalg.norm(env._desired_pos_w - data.root_pos_w, dim=1)
+            mapped = 1 - torch.tanh(d / 0.8) if shape == "tanh" else torch.exp(-d / length)
+            torch.testing.assert_close(terms["distance_to_goal"], mapped * cfg.distance_to_goal_reward_scale * dt)
+            torch.testing.assert_close(terms["lin_vel"], data.root_lin_vel_b.square().sum(1) * cfg.lin_vel_reward_scale * dt)
+            torch.testing.assert_close(terms["ang_vel"], data.root_ang_vel_b.square().sum(1) * cfg.ang_vel_reward_scale * dt)
+        # both shapes are 1 at the goal: same maximum, only the slope around it differs
+        zero = torch.zeros(1, device=env.device)
+        torch.testing.assert_close(env._distance_reward(zero), torch.ones(1, device=env.device))
     finally:
         env.close()

@@ -20,6 +20,9 @@ added on top of the controller's thrust.
 Actuation randomisation: per episode, the thrust and moment that reach the body are the
 controller's output times random factors; the cascade PID still assumes nominal motors, so
 the policy has to absorb the mismatch.
+
+Distance reward shape: ``"tanh"`` (the base env's, almost flat near the goal) or ``"exp"``,
+a single exponential that is steeper near the goal.
 """
 
 from __future__ import annotations
@@ -57,6 +60,11 @@ class DRQuadcopterEnvCfg(QuadcopterEnvCfg):
     # scale x the controller output (battery sag, worn props, build differences).
     thrust_scale_range: tuple[float, float] = (1.0, 1.0)
     torque_scale_range: tuple[float, float] = (1.0, 1.0)
+    # distance-to-goal reward shape; both are 1 at the goal, so the term's weight keeps its meaning:
+    # "tanh" = base env's 1 - tanh(d / 0.8), almost flat near the goal (94 % of max at 5 cm);
+    # "exp"  = exp(-d / distance_reward_length), steeper near the goal (slope 1 / length at d = 0)
+    distance_reward_shape: str = "tanh"
+    distance_reward_length: float = 0.3  # metres, "exp" only: the reward is 1/e (37 %) at this distance
 
 
 def check_cfg(cfg: DRQuadcopterEnvCfg):
@@ -79,6 +87,11 @@ def check_cfg(cfg: DRQuadcopterEnvCfg):
         # 0 would mean no thrust / no moment at all: the drone can't fly
         (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
         (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
+        (
+            cfg.distance_reward_shape in ("tanh", "exp"),
+            f"distance_reward_shape must be 'tanh' or 'exp', got {cfg.distance_reward_shape!r}",
+        ),
+        (cfg.distance_reward_length > 0.0, f"distance_reward_length must be > 0, got {cfg.distance_reward_length}"),
     ]
     for ok, msg in checks:
         if not ok:
@@ -192,6 +205,12 @@ class DRQuadcopterEnv(QuadcopterEnv):
         action_rate = rate * self.cfg.action_rate_reward_scale * self.step_dt
         self._episode_sums["action_rate"] += action_rate
         return super()._get_rewards() + action_rate
+
+    def _distance_reward(self, distance: torch.Tensor) -> torch.Tensor:
+        """Distance term used by the base _get_rewards, which weights and logs it."""
+        if self.cfg.distance_reward_shape == "exp":
+            return torch.exp(-distance / self.cfg.distance_reward_length)
+        return super()._distance_reward(distance)
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         """Reset the base env, clear the command history, draw the episode's latency, noise
