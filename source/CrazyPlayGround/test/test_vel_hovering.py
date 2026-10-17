@@ -1,7 +1,8 @@
-"""Checks for Vel-Hovering-DR: observation/action stacking order and timestep indexing.
+"""Checks for Vel-Hovering and its sim-to-real knobs: stacking order, timestep indexing,
+latency, noise, wind, actuation scaling, the reward terms, and the knobs-off defaults.
 
 Run (conda env DragonFly, from CrazyPlayGround/):
-    python -m pytest source/CrazyPlayGround/test/test_vel_hovering_dr.py -v
+    python -m pytest source/CrazyPlayGround/test/test_vel_hovering.py -v
 """
 
 from isaaclab.app import AppLauncher
@@ -14,20 +15,20 @@ import torch  # noqa: E402
 import omni.usd  # noqa: E402
 from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms  # noqa: E402
 
-from CrazyPlayGround.tasks.direct.hovering.vel_hovering_dr import DRQuadcopterEnv, DRQuadcopterEnvCfg  # noqa: E402
+from CrazyPlayGround.tasks.direct.hovering.vel_hovering import QuadcopterEnv, QuadcopterEnvCfg  # noqa: E402
 
 N, K, M = 4, 3, 2
 
 
-def make_env(num_envs: int = N, **knobs) -> DRQuadcopterEnv:
+def make_env(num_envs: int = N, **knobs) -> QuadcopterEnv:
     omni.usd.get_context().new_stage()
-    cfg = DRQuadcopterEnvCfg()
+    cfg = QuadcopterEnvCfg()
     cfg.scene.num_envs = num_envs
     cfg.debug_vis = False
     for key, value in knobs.items():  # set after the cfg is built, as Hydra does
         setattr(cfg, key, value)
-    env = DRQuadcopterEnv(cfg)
-    # Drones spawn up to 2.0 m, the base env's kill height, so a random command can reset an env
+    env = QuadcopterEnv(cfg)
+    # Drones spawn up to 2.0 m, the env's kill height, so a random command can reset an env
     # mid-test. Keep only the timeout, which the tests use to force resets on purpose.
     env._get_dones = lambda: (
         torch.zeros_like(env.reset_terminated), env.episode_length_buf >= env.max_episode_length - 1
@@ -87,7 +88,7 @@ def test_invalid_knobs_raise(knobs):
         make_env(**knobs)
 
 
-def test_default_is_vel_hovering():
+def test_defaults_are_plain_hovering():
     env = make_env()
     try:
         assert env.single_observation_space["policy"].shape == (6,)
@@ -372,5 +373,25 @@ def test_reward_terms(shape):
         # both shapes are 1 at the goal: same maximum, only the slope around it differs
         zero = torch.zeros(1, device=env.device)
         torch.testing.assert_close(env._distance_reward(zero), torch.ones(1, device=env.device))
+    finally:
+        env.close()
+
+
+def test_knobs_off_no_extra_wrench_no_delay():
+    env = make_env()
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        b = env._body_id[0]
+        for _ in range(3):
+            a = rand_cmd(env) * 1.5                        # some out of range
+            env.step(a)
+            # the controller tracks this step's clamped command: no delay, no scaling
+            torch.testing.assert_close(env._ref_vel, a.clamp(-1.0, 1.0) * env.cfg.max_velocity)
+            env._apply_action()
+            # the body gets exactly the controller output, nothing on top
+            assert not env._robot.instantaneous_wrench_composer.active
+            torch.testing.assert_close(env._robot.permanent_wrench_composer.composed_force_as_torch[:, b], env._thrust[:, 0])
+            torch.testing.assert_close(env._robot.permanent_wrench_composer.composed_torque_as_torch[:, b], env._moment[:, 0])
     finally:
         env.close()
