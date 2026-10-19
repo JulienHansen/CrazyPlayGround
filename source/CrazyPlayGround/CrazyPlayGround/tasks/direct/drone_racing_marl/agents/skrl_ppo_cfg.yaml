@@ -74,8 +74,8 @@ agent:
 
     wandb: True
     wandb_kwargs:
-      project: "KTHxUlg"
-      entity: "hansenjulienpro-univesity-of-liege"
+      project: "drone_racing_marl"   # W&B project = task folder name
+      entity: "crazyplayground"   # team W&B entity
 
 
 # Sequential trainer
