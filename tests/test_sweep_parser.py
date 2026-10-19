@@ -12,8 +12,8 @@ import sys
 
 import pytest
 
-REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-sys.path.insert(0, REPO)
+EXPERIMENTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experiments")
+sys.path.insert(0, EXPERIMENTS)
 from parser import SweepError, expand, load_sweep  # noqa: E402
 
 
@@ -118,6 +118,6 @@ def test_duplicate_json_keys_are_refused(tmp_path):
         load_sweep(str(path))
 
 
-@pytest.mark.parametrize("path", glob.glob(os.path.join(REPO, "config", "sweep", "**", "*.json"), recursive=True))
+@pytest.mark.parametrize("path", glob.glob(os.path.join(EXPERIMENTS, "config", "sweep", "**", "*.json"), recursive=True))
 def test_committed_sweep_files_parse(path):
     assert load_sweep(path).runs

@@ -14,8 +14,8 @@ last update, so a run that crashes after training (during simulator shutdown,
 say) is not trained again.
 
 Usage (from the repo root, after ``wandb login``):
-    python wandb_check.py config/sweep/hovering/test_01.json          # per-experiment counts
-    python wandb_check.py config/sweep/hovering/test_01.json --runs   # one line per run
+    python experiments/wandb_check.py experiments/config/sweep/hovering/test_01.json          # per-experiment counts
+    python experiments/wandb_check.py experiments/config/sweep/hovering/test_01.json --runs   # one line per run
 """
 
 from __future__ import annotations

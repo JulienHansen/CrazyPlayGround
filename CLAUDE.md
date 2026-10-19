@@ -20,8 +20,8 @@ and experiment results are centralised in one W&B team, `crazyplayground`.
 | `source/CrazyPlayGround/CrazyPlayGround/wandb_tb_patch.py` | Forwards skrl's TensorBoard scalars to W&B; imported by the package |
 | `scripts/<trainer>/train.py`, `play.py` | Isaac Lab entry points; skrl is the trainer the team uses |
 | `execution/` | Deployment on real Crazyflies over radio (cflib); see **Real hardware** |
-| `config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
-| `parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
+| `experiments/config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
+| `experiments/parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
 | `tests/` | pytest. Hardware tests drive the real scripts against a fake Crazyflie |
 | `docs/` | MkDocs: environments, controller, configuration, deployment |
 
@@ -34,8 +34,8 @@ to the PID: `Pos`, `Vel`, `Att` or `Rate` (e.g. `Vel-Hovering`). List them with
 - **Isaac Lab 2.3.2** (Docker base image `nvcr.io/nvidia/isaac-lab:2.3.2`),
   Python 3.10/3.11. Isaac Sim needs Linux and an NVIDIA GPU, so training,
   playback and anything importing `isaaclab` run only on the training machine or
-  in Docker. On a Mac, only the pure-Python tools run: `parser.py`,
-  `wandb_check.py` and their tests.
+  in Docker. On a Mac, only the pure-Python tools in `experiments/` run, with
+  their tests.
 - **skrl >= 2.1.** Its API differs from skrl 1.x, which most examples online
   use. Check the installed source before writing skrl code.
 - **Quaternions are WXYZ** (Isaac Lab 2.x). An upgrade to Isaac Lab 3 (XYZW,
@@ -51,8 +51,8 @@ python scripts/skrl/train.py --task=Vel-Hovering --num_envs=4096 --headless
 python scripts/skrl/play.py --task=Vel-Hovering --checkpoint logs/skrl/<dir>/<run>/checkpoints/best_agent.pt
 # inside Docker, prefix Isaac Lab scripts with: /workspace/isaaclab/isaaclab.sh -p
 
-python parser.py config/sweep/hovering/test_01.json        # add --runs or --json
-python wandb_check.py config/sweep/hovering/test_01.json   # add --runs; needs `wandb login`
+python experiments/parser.py experiments/config/sweep/hovering/test_01.json        # add --runs or --json
+python experiments/wandb_check.py experiments/config/sweep/hovering/test_01.json   # add --runs; needs `wandb login`
 
 python -m pytest tests/test_sweep_parser.py tests/test_wandb_check.py   # needs only pytest
 python -m pytest tests/                                                 # also torch, pyarrow, cflib
@@ -73,8 +73,8 @@ sweep file. Ad-hoc `train.py` runs are for debugging only; run them with
 
 ### Sweep files
 
-`config/sweep/<task>/<name>.json`. The full rules are in the `parser.py`
-docstring; in short:
+`experiments/config/sweep/<task>/<name>.json`. The full rules are in the
+`experiments/parser.py` docstring; in short:
 
 ```json
 {
@@ -110,8 +110,8 @@ docstring; in short:
 
 1. Write or extend a sweep file. Keep the baseline in the same file, vary one
    factor per experiment, and give every config you compare the same seeds.
-2. `python parser.py <file>`: check the run count and the duplicates it drops.
-3. `python wandb_check.py <file>`: only `failed` and `missing` runs get trained.
+2. `python experiments/parser.py <file>`: check the run count and the duplicates it drops.
+3. `python experiments/wandb_check.py <file>`: only `failed` and `missing` runs get trained.
 4. Launch with the trainer script (see **Status**). Launching is the user's
    decision: it spends shared GPU hours and writes to the team W&B. Ask first.
 5. Compare on W&B by group. A group is one config, and W&B plots the mean and
@@ -121,9 +121,9 @@ docstring; in short:
 ## W&B conventions
 
 - Entity `crazyplayground` (the team). One project per task, named after the
-  task's folder: `tasks/direct/<task>/` for the YAMLs, `config/sweep/<task>/` for
-  sweep files (`hovering`, `track`, `drone_racing`, ...). A new task or sweep
-  folder follows the same rule.
+  task's folder: `tasks/direct/<task>/` for the YAMLs,
+  `experiments/config/sweep/<task>/` for sweep files (`hovering`, `track`,
+  `drone_racing`, ...). A new task or sweep folder follows the same rule.
 - A run is named `<label>/s<seed>`; the label is the experiment name plus its
   sweep values (`lr-scan/lr=0.0005`). Its group is `<label> [<config_key>]`,
   shared by all seeds of one config. The key keeps two sweep files that reuse a
@@ -164,14 +164,14 @@ Test against the fake Crazyflie (`tests/test_hover_scripts.py`).
 
 ## Status and open decisions (2026-10-19)
 
-- **Not written yet:** `experiment/train_skrl.py`, the launcher. It will:
+- **Not written yet:** `experiments/train_skrl.py`, the launcher. It will:
   - translate sweep keys into skrl/Hydra overrides;
   - re-check W&B just before each run;
   - add `run_key`, `config_key` and `exp` to the W&B config;
   - set `summary["completed"]`.
 
   Until it exists, don't hand-roll comparison runs; ask.
-- **Planned:** `experiment/train_orcax.py` (Orcax, a JAX RL library), after the
+- **Planned:** `experiments/train_orcax.py` (Orcax, a JAX RL library), after the
   Isaac Lab 3 / Python 3.12 upgrade. `"orcax"` is not an accepted `trainer` yet.
 - **Undecided by the team. Ask, don't assume:**
   - the reference hover env (`Vel-Hovering-Robust` and `Vel-Hovering-DR` are on

@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experiments"))
 from parser import expand  # noqa: E402
 from wandb_check import check_sweep  # noqa: E402
 

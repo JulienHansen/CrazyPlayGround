@@ -1,6 +1,6 @@
 """Expand a sweep file into the training runs it describes.
 
-A sweep file lives in ``config/sweep/<task>/`` and has four top-level keys:
+A sweep file lives in ``experiments/config/sweep/<task>/`` and has four top-level keys:
 
     version      int; bump it when an env or a trainer changes meaning, so runs
                  logged under an older version no longer count as done
@@ -33,9 +33,9 @@ When two experiments resolve to the same run (a scan that passes through the
 defaults, say), the run is produced once and the summary says so.
 
 Usage (from the repo root):
-    python parser.py config/sweep/hovering/test_01.json          # per-experiment summary
-    python parser.py config/sweep/hovering/test_01.json --runs   # one line per run
-    python parser.py config/sweep/hovering/test_01.json --json   # resolved runs, for scripts
+    python experiments/parser.py experiments/config/sweep/hovering/test_01.json          # per-experiment summary
+    python experiments/parser.py experiments/config/sweep/hovering/test_01.json --runs   # one line per run
+    python experiments/parser.py experiments/config/sweep/hovering/test_01.json --json   # resolved runs, for scripts
 """
 
 from __future__ import annotations
