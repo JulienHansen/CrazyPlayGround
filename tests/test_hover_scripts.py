@@ -26,7 +26,6 @@ HERE = os.path.dirname(__file__)
 sys.path.append(os.path.join(HERE, "..", "execution", "single_drone_exec"))
 sys.path.append(os.path.join(HERE, "..", "execution", "single_drone_exec", "hover"))
 from cflib.crazyflie.log import LogConfig  # noqa: E402
-from common.utils import WaypointGate  # noqa: E402
 
 COMMON_DIR = os.path.realpath(os.path.join(HERE, "..", "execution", "single_drone_exec", "common"))
 
@@ -76,7 +75,7 @@ class FakeCf:
         self.configs[logconf.name] = logconf
 
     def packet(self, name):
-        x, y, z = self.pos
+        x, y, z = self.pos(self.calls) if callable(self.pos) else self.pos
         return {
             "posvel": {"stateEstimate.x": x, "stateEstimate.y": y, "stateEstimate.z": z,
                        "stateEstimate.vx": VEL[0], "stateEstimate.vy": VEL[1], "stateEstimate.vz": VEL[2]},
@@ -119,7 +118,6 @@ def load_script(name, monkeypatch):
     mod = importlib.import_module(name)
     fast_time = types.SimpleNamespace(time=time.time, perf_counter=time.perf_counter, sleep=lambda s: None)
     monkeypatch.setattr(mod, "time", fast_time)
-    monkeypatch.setattr(mod, "waypoint_gate", WaypointGate(0.0, 5.0))   # radius 0: fixed target
     monkeypatch.setattr(LogConfig, "start", lambda logconf: logconf.fake_cf.fire(logconf))
     return mod
 
@@ -129,7 +127,7 @@ def script(request, monkeypatch):
     return load_script(request.param, monkeypatch)
 
 
-def fly(mod, tmp_path, steps, record=True, log_every=100, **cf_kwargs):
+def fly(mod, tmp_path, steps, record=True, log_every=100, controller_kwargs=None, **cf_kwargs):
     """Connect, run the control loop for `steps` steps, stop. Returns (controller, cf, agent, rows)."""
     n_act = SCRIPTS[mod.__name__][0]
     cf = FakeCf(steps, **cf_kwargs)
@@ -138,7 +136,7 @@ def fly(mod, tmp_path, steps, record=True, log_every=100, **cf_kwargs):
     run_args = argparse.Namespace(record_path=path, record_every=1, log_every=log_every)
     agent = FakeAgent(n_act)
     controller = mod.CrazyflieController(uri="fake", agent=agent, run_args=run_args,
-                                         initial_target=[0.0, 0.0, 1.0])
+                                         initial_target=[0.0, 0.0, 1.0], **(controller_kwargs or {}))
     controller._connected("fake")
     assert cf.loop_done.wait(timeout=30), "control loop did not finish"
     try:
@@ -232,6 +230,19 @@ def test_exec_rate_uses_gyro_and_enables_rate_mode(tmp_path, monkeypatch):
     assert ("flightmode.stabModeRoll", "0") in cf.calls_to("set_value")
 
 
+def test_exec_vel_feeds_window_and_action_history(tmp_path, monkeypatch):
+    """K=3, M=1, as vel_hovering._get_observations: frames oldest first, primed with copies
+    of the first one, then the previous clamped command (zeros before the first)."""
+    controller, _, agent, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=20,
+                                     pos=lambda n: (0.2, -0.1, 1.0 + 0.01 * n),   # every frame differs
+                                     controller_kwargs=dict(obs_input_hist=3, action_input_hist=1))
+    frames = list(zip(*(rows[f] for f in controller.recorder.obs_fields)))
+    assert len(agent.seen) == len(frames) == 20 and frames[0] != frames[1]
+    for i, seen in enumerate(agent.seen):
+        window = [frames[max(j, 0)] for j in (i - 2, i - 1, i)]
+        assert seen == pytest.approx(_flat(window) + (ACTION[:3] if i else [0.0] * 3))
+
+
 def test_default_quaternion_is_identity(script):
     """Until the first quat packet, the obs must stay finite (exec_rate divides by |q|²)."""
     controller = script.CrazyflieController(
@@ -263,10 +274,96 @@ def _run_main(mod, monkeypatch, argv):
 
 def test_cli_shared_flags(script, monkeypatch):
     with pytest.raises(_StopBeforeFlight):
-        _run_main(script, monkeypatch, ["--waypoint-radius", "0.3", "--waypoint-hold", "2",
-                                        "--record-every", "10", "--log-every", "50"])
-    assert (script.waypoint_gate.radius_m, script.waypoint_gate.hold_s) == (0.3, 2.0)
-    for bad in (["--record-every", "0"], ["--log-every", "0"], ["--waypoint-radius", "-1"],
+        _run_main(script, monkeypatch, ["--record-every", "10", "--log-every", "50"])
+    # the waypoint gate was removed: the target stays fixed, as within a sim episode
+    for bad in (["--record-every", "0"], ["--log-every", "0"], ["--waypoint-radius", "0.3"],
                 ["--record-interval", "0.1"], ["--log-interval", "1"]):
         with pytest.raises(SystemExit):
             _run_main(script, monkeypatch, bad)
+
+
+# ── Policy input width: K frames + M past actions ────────────────────────────
+
+def _save_checkpoint(mod, path, obs_space):
+    """A checkpoint saved the way training saves one, with a non-trivial observation scaler."""
+    policy = mod.Policy(observation_space=obs_space, action_space=3, device="cpu")
+    cfg = mod.PPO_CFG(observation_preprocessor=mod.RunningStandardScaler,
+                      observation_preprocessor_kwargs={"size": obs_space, "device": "cpu"})
+    agent = mod.PPO(models={"policy": policy}, memory=None, cfg=cfg,
+                    observation_space=obs_space, action_space=3, device="cpu")
+    agent._observation_preprocessor.running_mean.fill_(0.3)
+    agent.enable_training_mode(False)
+    agent.save(str(path))
+    return agent
+
+
+def _mean_action(agent, obs):
+    with torch.no_grad():
+        return agent.act(obs, None, timestep=0, timesteps=1)[1]["mean_actions"]
+
+
+def test_load_agent_roundtrip_and_wrong_width_fails(tmp_path, monkeypatch):
+    mod = load_script("exec_vel", monkeypatch)
+    monkeypatch.setattr(mod, "device", torch.device("cpu"))
+    path = tmp_path / "best_agent.pt"
+    saved = _save_checkpoint(mod, path, obs_space=6 * 8 + 3 * 1)
+    loaded = mod.load_agent(str(path), torch.device("cpu"), 6 * 8 + 3 * 1)
+    obs = torch.randn(4, 51)
+    assert torch.equal(_mean_action(loaded, obs), _mean_action(saved, obs))
+    for wrong in (6, 48, 54):
+        with pytest.raises(RuntimeError, match="size mismatch"):
+            mod.load_agent(str(path), torch.device("cpu"), wrong)
+
+
+def _run_dir(tmp_path, name, env_yaml):
+    run = tmp_path / name
+    (run / "params").mkdir(parents=True)
+    (run / "params" / "env.yaml").write_text(env_yaml)
+    return str(run / "checkpoints" / "best_agent.pt")
+
+
+ENV_YAML = """viewer:
+  eye: !!python/tuple
+  - 7.5
+observation_space: 6
+obs_input_hist: {k}
+action_input_hist: {m}
+sim:
+  obs_input_hist: 99
+"""
+
+
+def test_obs_hist_comes_from_the_training_run(tmp_path, monkeypatch):
+    """Width 12 is K=1, M=2 or K=2, M=0: only the run's env.yaml tells them apart."""
+    mod = load_script("exec_vel", monkeypatch)
+    k1m2 = _run_dir(tmp_path, "k1m2", ENV_YAML.format(k=1, m=2))
+    k2m0 = _run_dir(tmp_path, "k2m0", ENV_YAML.format(k=2, m=0))
+    assert mod.resolve_obs_hist(k1m2, None, None) == (1, 2)
+    assert mod.resolve_obs_hist(k2m0, None, None) == (2, 0)
+    assert mod.resolve_obs_hist(k2m0, 2, 0) == (2, 0)
+    with pytest.raises(ValueError, match="--obs-input-hist 1 disagrees"):
+        mod.resolve_obs_hist(k2m0, 1, None)
+    with pytest.raises(ValueError, match="--action-input-hist 2 disagrees"):
+        mod.resolve_obs_hist(k2m0, None, 2)
+    # no env.yaml, or one written before WP1 (no knobs): the flags, then K=1, M=0
+    pre_wp1 = _run_dir(tmp_path, "pre_wp1", "observation_space: 6\nhistory_len: 8\n")
+    loose = str(tmp_path / "loose.pt")
+    assert mod.resolve_obs_hist(pre_wp1, None, None) == (1, 0)
+    assert mod.resolve_obs_hist(loose, 8, 1) == (8, 1)
+    assert mod.resolve_obs_hist(None, None, None) == (1, 0)
+
+
+def test_cli_sizes_the_policy_from_env_yaml_and_rejects_a_conflict(tmp_path, monkeypatch):
+    mod = load_script("exec_vel", monkeypatch)
+    ckpt = _run_dir(tmp_path, "run", ENV_YAML.format(k=8, m=1))
+    seen = []
+    monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt])
+    monkeypatch.setattr(mod, "load_agent", lambda *a: seen.append(a) or (_ for _ in ()).throw(_StopBeforeFlight()))
+    with pytest.raises(_StopBeforeFlight):
+        mod.main()
+    assert seen[0][2] == 6 * 8 + 3 * 1
+    for bad in (["--obs-input-hist", "4"], ["--obs-input-hist", "0"], ["--action-input-hist", "-1"]):
+        monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt] + bad)
+        with pytest.raises(SystemExit):     # before load_agent, so before the radio
+            mod.main()
+    assert len(seen) == 1

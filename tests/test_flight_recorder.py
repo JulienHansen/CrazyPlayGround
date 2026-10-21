@@ -221,7 +221,7 @@ def test_run_args_reject_invalid_values():
     parser = argparse.ArgumentParser()
     add_run_args(parser)
     assert parser.parse_args([]).log_every == 100
-    for bad in (["--log-every", "0"], ["--record-every", "0"], ["--waypoint-radius", "-1"]):
+    for bad in (["--log-every", "0"], ["--record-every", "0"]):
         with pytest.raises(SystemExit):
             parser.parse_args(bad)
 

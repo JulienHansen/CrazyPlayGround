@@ -15,8 +15,7 @@ from cflib.crazyflie import Crazyflie
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.flight_recorder import CrazyflieStateBase
-from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, WaypointGate,
-                          add_run_args, apply_run_args)
+from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, add_run_args)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -34,7 +33,6 @@ logger = logging.getLogger("CrazyflieRL")
 # Your room is 3x3x1.7m with origin centered, so walls at ±1.5m — this
 # leaves 0.5m margin on each side.
 target_pos = None  # initialized in control_loop after takeoff
-waypoint_gate = WaypointGate()  # replaced in main() from --waypoint-radius / --waypoint-hold
 
 # ── Safety thresholds ────────────────────────────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
@@ -254,12 +252,9 @@ class CrazyflieController(CrazyflieStateBase):
 
 
 def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
-    # Target advances via waypoint_gate; --waypoint-radius 0 keeps it fixed per run,
-    # matching the sim episode behaviour.
-    global target_pos
+    # The target stays fixed for the whole flight, as the goal does within a sim episode.
     if target_pos is None:
         return None
-    target_pos = waypoint_gate.step(current_pos, target_pos)
     # Rotate world-frame Kalman velocity into body frame
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
     desired_pos_b = quat_apply(quat_inv(current_quat), target_pos - current_pos)
@@ -300,8 +295,6 @@ def main():
     add_run_args(parser)
     args = parser.parse_args()
 
-    global waypoint_gate
-    waypoint_gate = apply_run_args(args)
     agent = load_agent(args.checkpoint, device)
     controller = CrazyflieController(
         uri=args.uri,
