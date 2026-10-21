@@ -156,19 +156,20 @@ class FlightRecorder:
             "quat_w": quat[0], "quat_x": quat[1], "quat_y": quat[2], "quat_z": quat[3],
             "target_x": target[0], "target_y": target[1], "target_z": target[2],
         }
-        row.update(zip(self.obs_fields, sample["obs"]))
-        row.update(zip(self.action_fields, sample["action"]))
-        row.update(zip(self.cmd_fields, sample["cmd"]))
-        row.update(zip(self.motor_fields, sample["motor"]))
+        # strict: a sample of the wrong length fails here, on its own row, not later in the batch
+        row.update(zip(self.obs_fields, sample["obs"], strict=True))
+        row.update(zip(self.action_fields, sample["action"], strict=True))
+        row.update(zip(self.cmd_fields, sample["cmd"], strict=True))
+        row.update(zip(self.motor_fields, sample["motor"], strict=True))
         return row
 
     def _flush_buffer(self) -> None:
-        if not self._buffer:
+        rows, self._buffer = self._buffer, []  # a batch that fails to write is dropped, not retried on every flush
+        if not rows:
             return
-        columns = {name: [row[name] for row in self._buffer] for name in self._fieldnames}
+        columns = {name: [row[name] for row in rows] for name in self._fieldnames}
         table = pa.Table.from_pydict(columns, schema=self._schema)
         self._writer.write_table(table)
-        self._buffer.clear()
 
     def close(self) -> None:
         if self._thread is not None:

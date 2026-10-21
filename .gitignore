@@ -36,6 +36,7 @@ wandb/
 
 execution/**/cache/
 site/
+.pytest_cache/
 # IDE
 .vscode/settings.json
 .vscode/.python.env
