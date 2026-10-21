@@ -149,6 +149,28 @@ sweep file. Ad-hoc `train.py` runs are for debugging only; run them with
 - **Branch names in lowercase** (`feature/...`, never `Feature/...`): macOS is
   case-insensitive, so mixed case makes `git fetch` delete and recreate refs.
 
+## Code conventions
+
+Generic style (PEP 8, formatting) belongs in tooling, not in this file. These
+are the rules a tool cannot check:
+
+- **Frames in names**, as Isaac Lab does: `_w` world, `_b` body (`root_pos_w`,
+  `lin_vel_b`).
+- **Units in names unless SI.** SI units (m, s, rad, N) need no suffix; anything
+  else carries one: `roll_deg`, `yaw_rate_deg_s`, `thrust_pct`, `thrust_pwm`.
+  cflib takes degrees and percent, so this matters most in `execution/`.
+- **A name says what the value is:** a yaw rate is `yaw_rate`, not `yaw`; a
+  policy output in [-1, 1] is `action` or `*_norm`, not the physical quantity
+  it is later scaled to.
+- **Quaternion order in the name at library boundaries** (cflib, scipy, ROS):
+  `quat_xyzw` or `quat_wxyz`. Inside Isaac Lab code, `quat` follows Isaac Lab's
+  order.
+- **Docstrings in Google style** (`Args:`, `Returns:`) for public functions and
+  classes. For tensors, give shape, frame and units (`(num_envs, 3)`, body
+  frame, m/s). Skip docstrings that only repeat the name.
+- Apply these to new and touched code. Renames across existing files go in their
+  own PR.
+
 ## Real hardware
 
 Scripts in `execution/` fly real drones. Never run them. Don't change control
@@ -173,6 +195,8 @@ Test against the fake Crazyflie (`tests/test_hover_scripts.py`).
   Until it exists, don't hand-roll comparison runs; ask.
 - **Planned:** `experiments/train_orcax.py` (Orcax, a JAX RL library), after the
   Isaac Lab 3 / Python 3.12 upgrade. `"orcax"` is not an accepted `trainer` yet.
+- **Planned:** a ruff config (format and lint) with a pre-commit hook, in its
+  own PR. Until then the repo enforces no formatter or linter.
 - **Undecided by the team. Ask, don't assume:**
   - the reference hover env (`Vel-Hovering-Robust` and `Vel-Hovering-DR` are on
     unmerged branches);
