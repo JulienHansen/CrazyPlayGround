@@ -79,7 +79,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     decimation = 5
 
     action_space = 3
-    observation_space = 6  # recomputed from obs_input_hist / action_input_hist in the env constructor
+    observation_space = 6
     state_space = 0
     debug_vis = True
 
@@ -167,7 +167,6 @@ def check_cfg(cfg: QuadcopterEnvCfg):
         (0.0 <= cfg.noise_corr < 1.0, f"noise_corr must be in [0, 1), got {cfg.noise_corr}"),
         (cfg.noise_bias_std >= 0.0, f"noise_bias_std must be >= 0, got {cfg.noise_bias_std}"),
         (0.0 <= wind_lo <= wind_hi, f"wind_force_range must satisfy 0 <= min <= max, got {cfg.wind_force_range}"),
-        # 0 would mean no thrust / no moment at all: the drone can't fly
         (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
         (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
         (
@@ -219,7 +218,6 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._ref_vel = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # ── sim-to-real knob state (all inert with the default cfg) ──
         self.delay_min_steps = cfg.action_latency_steps
         self.delay_max_steps = max(cfg.action_latency_steps, cfg.action_latency_max_steps)
         self.obs_window = torch.zeros(n, cfg.obs_input_hist, BASE_OBS_DIM, device=dev)
@@ -231,13 +229,11 @@ class QuadcopterEnv(DirectRLEnv):
         self.cmd_history = torch.zeros(n, buf_len, ACTION_DIM, device=dev)
         self.delay_steps = torch.full((n,), self.delay_min_steps, dtype=torch.long, device=dev)
         self.env_idx = torch.arange(n, device=dev)
-        # noise-free 6-D state of the last observation, before noise
         self.true_state = torch.zeros(n, BASE_OBS_DIM, device=dev)
         # AR(1) noise state with unit variance, carried between steps; redrawn at every reset
         self.obs_noise_state = torch.randn(n, BASE_OBS_DIM, device=dev)
         self.obs_noise_bias = torch.zeros(n, BASE_OBS_DIM, device=dev)
-        self.wind_force_world = torch.zeros(n, 3, device=dev)  # drawn per episode in _reset_idx
-        # actuation scales, drawn per episode in _reset_idx (stay 1 when the ranges are (1, 1))
+        self.wind_force_world = torch.zeros(n, 3, device=dev)
         self.thrust_scale = torch.ones(n, device=dev)
         self.torque_scale = torch.ones(n, device=dev)
         # skip the extra composer call entirely when nothing is randomised (tuple: Hydra may give a list)
@@ -264,7 +260,6 @@ class QuadcopterEnv(DirectRLEnv):
         steps ago (zero until the episode is that old)."""
         commanded = actions.clamp(-1.0, 1.0)
         self.cmd_history = torch.cat([self.cmd_history[:, 1:], commanded.unsqueeze(1)], dim=1)
-        # each env reads its own slot: newest is the last one, d steps back is d slots earlier
         slot = self.cmd_history.shape[1] - 1 - self.delay_steps  # [N]
         self._actions = self.cmd_history[self.env_idx, slot]     # [N, 3]: env i, slot[i]
 

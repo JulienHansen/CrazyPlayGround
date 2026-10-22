@@ -173,7 +173,6 @@ def load_config(path: str | Path) -> DroneConfig:
     >>> cfg = load_config("configs/crazyflie.yaml")
     >>> att_ctrl = AttController_Vectorized.from_drone_config(cfg, num_envs=4, device="cpu")
     """
-    # explicit utf-8: the yaml has non-ASCII comments and the locale may be C/ASCII (Isaac Sim, Docker)
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
