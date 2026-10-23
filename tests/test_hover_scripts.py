@@ -25,6 +25,8 @@ import torch
 HERE = os.path.dirname(__file__)
 sys.path.append(os.path.join(HERE, "..", "execution", "single_drone_exec"))
 sys.path.append(os.path.join(HERE, "..", "execution", "single_drone_exec", "hover"))
+sys.path.append(os.path.join(HERE, "..", "sim2real", "single_drone_exec", "hover"))
+from analyze_vel import compute_metrics, load_flight  # noqa: E402
 from cflib.crazyflie.log import LogConfig  # noqa: E402
 from common.utils import WaypointGate  # noqa: E402
 
@@ -198,6 +200,16 @@ def test_stop_writes_the_file_even_if_close_link_fails(script, tmp_path):
     with pytest.raises(RuntimeError, match="radio gone"):
         fly(script, tmp_path, steps=20, close_link_error=RuntimeError("radio gone"))
     assert pq.read_table(tmp_path / "flight.parquet").to_pydict()["step"] == list(range(20))
+
+
+def test_analyser_reads_exec_vel_recording(tmp_path, monkeypatch):
+    """analyze_vel reads the columns exec_vel really records, so the two cannot drift apart."""
+    fly(load_script("exec_vel", monkeypatch), tmp_path, steps=50)
+    m = compute_metrics(load_flight(str(tmp_path / "flight.parquet")))
+    assert m["mean_pos_err_m"] == pytest.approx(math.dist(POS, (0.0, 0.0, 1.0)), abs=1e-3)
+    assert m["effective_rate_hz"] == pytest.approx(100.0, rel=0.1)
+    assert m["mean_motor_pwm"] == pytest.approx(sum(MOTOR) / 4)
+    assert m["cmd_smoothness_mps_per_step"] is not None and m["n_nonfinite_samples"] == 0
 
 
 # ── Safety watchdog ──────────────────────────────────────────────────────────
