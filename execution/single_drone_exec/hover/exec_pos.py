@@ -15,8 +15,7 @@ from cflib.crazyflie import Crazyflie
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.flight_recorder import CrazyflieStateBase
-from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, WaypointGate,
-                          add_run_args, apply_run_args)
+from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, add_run_args)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -30,7 +29,6 @@ logging.basicConfig(format="{asctime} [{levelname}] {message}",
                         level=logging.INFO)
 logger = logging.getLogger("CrazyflieRL")
 target_pos = None  # initialized in control_loop after takeoff
-waypoint_gate = WaypointGate()  # replaced in main() from --waypoint-radius / --waypoint-hold
 
 # ── Safety thresholds ────────────────────────────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
@@ -235,10 +233,8 @@ class CrazyflieController(CrazyflieStateBase):
 
 def retrieve_and_create_observation(current_vel, current_pos, current_quat) -> Optional[torch.Tensor]:
     """Build obs tensor matching pos_hovering.py: [lin_vel_b(3), desired_pos_b(3)]."""
-    global target_pos
     if target_pos is None:
         return None
-    target_pos = waypoint_gate.step(current_pos, target_pos)
 
     # Rotate world-frame Kalman velocity into body frame
     linear_vel_b = quat_apply(quat_inv(current_quat), current_vel)
@@ -283,9 +279,6 @@ def main():
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
     add_run_args(parser)
     args = parser.parse_args()
-
-    global waypoint_gate
-    waypoint_gate = apply_run_args(args)
 
     agent = load_agent(args.checkpoint, device)
 

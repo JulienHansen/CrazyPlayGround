@@ -2,7 +2,7 @@ import argparse
 import logging
 import math
 import time
-from typing import Optional, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import torch
 
@@ -48,12 +48,6 @@ def wait_until(deadline: float, spin_margin: float) -> tuple[float, float, int]:
     return deadline, (time.perf_counter() - t0) * 1e3, 0
 
 
-# 0.10 m stalled half the baseline flights (mean pos err ~0.13 m); 0.15 m let every
-# tested policy advance. The right radius depends on the policy, hence the CLI flags.
-WAYPOINT_REACH_RADIUS_M = 0.15
-WAYPOINT_HOLD_TIME_S = 5.0
-
-
 def positive_int(text: str) -> int:
     value = int(text)
     if value < 1:
@@ -61,57 +55,21 @@ def positive_int(text: str) -> int:
     return value
 
 
-def nonnegative_float(text: str) -> float:
-    value = float(text)
+def nonnegative_int(text: str) -> int:
+    value = int(text)
     if value < 0:
         raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
     return value
 
 
 def add_run_args(parser) -> None:
-    """Register the recording, status-logging and waypoint flags shared by the hover scripts."""
+    """Register the recording and status-logging flags shared by the hover scripts."""
     parser.add_argument("--record-path", type=str, default=None,
                         help="Parquet file path to record flight data to. If not set, recording is disabled.")
     parser.add_argument("--record-every", type=positive_int, default=1,
                         help="Record one row every N control steps (1 = every step, 100 Hz).")
     parser.add_argument("--log-every", type=positive_int, default=100,
                         help="Print a status line every N control steps (100 = once per second at 100 Hz).")
-    parser.add_argument("--waypoint-radius", type=nonnegative_float, default=WAYPOINT_REACH_RADIUS_M,
-                        help="Distance in metres the drone must stay within to count as on the waypoint. "
-                             "Depends on the policy's steady-state error. 0 keeps the target fixed.")
-    parser.add_argument("--waypoint-hold", type=nonnegative_float, default=WAYPOINT_HOLD_TIME_S,
-                        help="Seconds the drone must stay continuously within --waypoint-radius "
-                             "before a new random waypoint is drawn.")
-
-
-def apply_run_args(args) -> "WaypointGate":
-    """Build the WaypointGate from the parsed flags and log its setting."""
-    logging.getLogger("CrazyflieRL").info(
-        f"Waypoint gate: {args.waypoint_radius:.2f} m for {args.waypoint_hold:.1f} s")
-    return WaypointGate(args.waypoint_radius, args.waypoint_hold)
-
-
-class WaypointGate:
-    """Draw a new target (training range: XY in [-1, 1], Z in [0.5, 1.5]) once the
-    drone has stayed within `radius_m` of the current one for `hold_s`."""
-
-    def __init__(self, radius_m: float = WAYPOINT_REACH_RADIUS_M, hold_s: float = WAYPOINT_HOLD_TIME_S):
-        self.radius_m, self.hold_s = radius_m, hold_s
-        self._since: Optional[float] = None  # when the drone entered the radius
-
-    def step(self, current_pos: torch.Tensor, target_pos: torch.Tensor) -> torch.Tensor:
-        now = time.monotonic()
-        if torch.dist(current_pos, target_pos) >= self.radius_m:
-            self._since = None
-        elif self._since is None:
-            self._since = now
-        elif now - self._since >= self.hold_s:
-            self._since = None
-            target_pos = torch.empty_like(target_pos)
-            target_pos[:2].uniform_(-1.0, 1.0)
-            target_pos[2].uniform_(0.5, 1.5)
-            logging.getLogger("CrazyflieRL").info(f"/!\\ New target={target_pos}")
-        return target_pos
 
 
 def quat_apply(quat, vec):

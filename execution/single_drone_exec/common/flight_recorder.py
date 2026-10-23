@@ -51,6 +51,8 @@ class FlightRecorder:
         action_fields: Sequence[str] = (),
         cmd_fields: Sequence[str] = (),
         motor_fields: Sequence[str] = DEFAULT_MOTOR_FIELDS,
+        extra_fields: Sequence[str] = (),
+        metadata: Optional[Dict[str, str]] = None,
         record_every: int = 1,
         log_every: int = 100,
         batch_size: int = 50,
@@ -71,10 +73,15 @@ class FlightRecorder:
                 actually sent to the drone, whatever control mode)
             "motor": Sequence[int]    (len == len(motor_fields); raw PWM
                 ticks sent to each motor, as reported by the firmware)
+            "extra": Sequence[float]  (len == len(extra_fields); optional,
+                script-specific columns such as IMU or loop timing)
         record_path: Parquet file to write, or None to only log.
         record_every: keep one step in N in the file (1 = every step).
         log_every: print a status line every N steps (100 = 1 s at 100 Hz).
         batch_size: number of buffered rows per Parquet row-group flush.
+        metadata: str -> str pairs stored in the Parquet footer (read back with
+            pq.read_schema(path).metadata). Read at start(), so it can be filled
+            in after construction.
         """
         if record_every < 1 or log_every < 1:
             raise ValueError("record_every and log_every must be >= 1")
@@ -83,6 +90,8 @@ class FlightRecorder:
         self.action_fields = list(action_fields)
         self.cmd_fields = list(cmd_fields)
         self.motor_fields = list(motor_fields)
+        self.extra_fields = list(extra_fields)
+        self.metadata = dict(metadata or {})
         self.record_every = record_every
         self.log_every = log_every
         self.batch_size = batch_size
@@ -90,7 +99,7 @@ class FlightRecorder:
 
         self._fieldnames = (
             self.BASE_FIELDS + self.obs_fields + self.action_fields
-            + self.cmd_fields + self.motor_fields
+            + self.cmd_fields + self.motor_fields + self.extra_fields
         )
         int_fields = set(self.motor_fields) | {"step"}
         self._schema = pa.schema([
@@ -107,6 +116,7 @@ class FlightRecorder:
     def start(self) -> None:
         """Open the Parquet writer (if recording) and launch the recorder thread."""
         if self.record_path:
+            self._schema = self._schema.with_metadata({str(k): str(v) for k, v in self.metadata.items()})
             self._writer = pq.ParquetWriter(self.record_path, self._schema)
         self._thread = threading.Thread(target=self._drain_loop, daemon=True)
         self._thread.start()
@@ -209,16 +219,17 @@ class CrazyflieStateBase:
         self.current_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)  # identity until the first packet
         self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_motor_pwm = [0, 0, 0, 0]
+        self.vbat = float("nan")
 
     def make_recorder(self, args, obs_fields: Sequence[str], action_fields: Sequence[str],
-                      cmd_fields: Sequence[str]) -> None:
+                      cmd_fields: Sequence[str], extra_fields: Sequence[str] = ()) -> None:
         """Create `self.recorder` from the flags registered by utils.add_run_args."""
         self.recorder = FlightRecorder(args.record_path, obs_fields=obs_fields,
                                        action_fields=action_fields, cmd_fields=cmd_fields,
-                                       record_every=args.record_every, log_every=args.log_every)
+                                       extra_fields=extra_fields, record_every=args.record_every, log_every=args.log_every)
 
     def record_step(self, step: int, state: StateSnapshot, control_time: float,
-                    target, obs, action, cmd) -> None:
+                    target, obs, action, cmd, extra=()) -> None:
         """Push this control step's row: the state behind `obs`, and what was sent."""
         self.recorder.record({
             "step": step, "control_time": control_time,
@@ -226,6 +237,7 @@ class CrazyflieStateBase:
             "pos": state.pos.tolist(), "vel": state.vel.tolist(), "quat": state.quat.tolist(),
             "target": target.tolist(), "obs": obs.tolist(), "action": action.tolist(),
             "cmd": cmd.tolist() if torch.is_tensor(cmd) else list(cmd), "motor": state.motor,
+            "extra": list(extra),
         })
 
     def snapshot(self) -> StateSnapshot:
@@ -271,6 +283,7 @@ class CrazyflieStateBase:
                     data["kalman.varPY"],
                     data["kalman.varPZ"],
                 ], dtype=torch.float32, device=device)
+                self.vbat = data["pm.vbat"]
 
         def _log_motor_callback(timestamp: float, data: Dict[str, Any], logconf: LogConfig):
             with self.lock:
@@ -300,11 +313,12 @@ class CrazyflieStateBase:
         log_quat.data_received_cb.add_callback(_log_data_quat_callback)
         log_quat.start()
 
-        # Block 3: Kalman variance (for safety watchdog)
+        # Block 3: Kalman variance (for safety watchdog) + battery voltage
         log_var = LogConfig(name="quality", period_in_ms=200)
         log_var.add_variable("kalman.varPX", "float")
         log_var.add_variable("kalman.varPY", "float")
         log_var.add_variable("kalman.varPZ", "float")
+        log_var.add_variable("pm.vbat", "float")
         self.cf.log.add_config(log_var)
         log_var.data_received_cb.add_callback(_log_variance_callback)
         log_var.start()
