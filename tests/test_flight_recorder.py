@@ -227,7 +227,12 @@ def test_run_args_reject_invalid_values():
             parser.parse_args(bad)
 
 
-def test_a_bad_row_is_skipped_not_fatal(tmp_path, caplog):
+@pytest.mark.parametrize("corrupt", [
+    lambda s: s.pop("pos"),
+    lambda s: s.update(obs=[0.1]),             # shorter than obs_fields
+    lambda s: s.update(obs=[0.1, 0.2, 0.3]),   # longer than obs_fields
+], ids=["missing_key", "short_obs", "long_obs"])
+def test_a_bad_row_is_skipped_not_fatal(tmp_path, caplog, corrupt):
     """A row that raises must not stop recording and status lines for the rest of the flight."""
     caplog.set_level("INFO", logger="CrazyflieRL")
     path = tmp_path / "flight.parquet"
@@ -236,10 +241,24 @@ def test_a_bad_row_is_skipped_not_fatal(tmp_path, caplog):
     for step in range(10):
         sample = _sample(step)
         if step in (3, 6):
-            del sample["pos"]
+            corrupt(sample)
         rec.record(sample)
     rec.close()
     assert _read(path)["step"] == [0, 1, 2, 4, 5, 7, 8, 9]
     assert rec.skipped == 2
     assert sum("Recorder failed at step 3" in m for m in caplog.messages) == 1   # first error only
     assert "Recorder skipped 2 row(s), see the first error above" in caplog.messages
+
+
+def test_a_batch_that_fails_to_write_is_dropped_once(tmp_path):
+    """A value pyarrow cannot write loses its row-group batch, not every later one."""
+    path = tmp_path / "flight.parquet"
+    rec = FlightRecorder(str(path), batch_size=5, **FIELDS)
+    rec.start()
+    for step in range(30):
+        sample = _sample(step)
+        if step == 7:
+            sample["obs"] = ["x", "y"]
+        rec.record(sample)
+    rec.close()
+    assert _read(path)["step"] == list(range(5)) + list(range(10, 30))
