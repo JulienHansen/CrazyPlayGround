@@ -338,7 +338,7 @@ def _run_main(mod, monkeypatch, argv):
 
 def test_cli_shared_flags(script, monkeypatch):
     with pytest.raises(_StopBeforeFlight):
-        _run_main(script, monkeypatch, ["--record-every", "10", "--log-every", "50"])
+        _run_main(script, monkeypatch, ["--checkpoint", "x.pt", "--record-every", "10", "--log-every", "50"])
     # the waypoint gate was removed: the target stays fixed, as within a sim episode
     for bad in (["--record-every", "0"], ["--log-every", "0"], ["--waypoint-radius", "0.3"],
                 ["--record-interval", "0.1"], ["--log-interval", "1"]):
@@ -444,7 +444,7 @@ def test_cli_pid_needs_no_checkpoint_and_rejects_one(monkeypatch):
         mod.main()
     assert (seen[0]["controller"], seen[0]["agent"], seen[0]["duration"]) == ("pid", None, 5.0)
     assert "checkpoint" not in seen[0]["metadata"]
-    for bad in (["--controller", "pid", "--checkpoint", "x.pt"], ["--duration", "-1"], ["--controller", "lqr"]):
+    for bad in ([], ["--controller", "pid", "--checkpoint", "x.pt"], ["--duration", "-1"], ["--controller", "lqr"]):
         monkeypatch.setattr(sys, "argv", ["exec_vel"] + bad)
         with pytest.raises(SystemExit):
             mod.main()

@@ -109,7 +109,7 @@ class CrazyflieController(CrazyflieStateBase):
     controller="pid", send_position_setpoint to fly the firmware position PID instead.
     Sim equivalent: vel_hovering.py (command_level="velocity", max_velocity=1.0 m/s).
     """
-    def __init__(self, uri: str, agent: Optional[PPO], run_args, initial_target=None,
+    def __init__(self, uri: str, agent, run_args, initial_target=None,
                  obs_input_hist: int = 1, action_input_hist: int = 0,
                  controller: str = "rl", duration: float = 0.0, metadata=None):
         super().__init__(device)
@@ -438,7 +438,8 @@ def main():
                              "--target, as the baseline for the policy (no checkpoint).")
     parser.add_argument("--duration", type=float, default=0.0,
                         help="Seconds of controlled flight before landing; 0 flies until Ctrl-C.")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to the model checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to the policy checkpoint; required with --controller rl (the default)")
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8", help="URI of the Crazyflie")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
@@ -452,16 +453,20 @@ def main():
     if args.duration < 0:
         parser.error("--duration must be >= 0")
 
-    if args.controller == "pid":
-        if args.checkpoint:
-            parser.error("--checkpoint is for --controller rl; pid flies the firmware position PID")
-        agent, k, m = None, None, None
-    else:
+    if args.controller == "rl":
+        if not args.checkpoint:
+            parser.error("--controller rl needs --checkpoint, the trained policy to fly")
         try:
             k, m = resolve_obs_hist(args.checkpoint, args.obs_input_hist, args.action_input_hist)
         except ValueError as e:
             parser.error(str(e))
         agent = load_agent(args.checkpoint, device, 6 * k + 3 * m)
+    elif args.controller == "pid":
+        if args.checkpoint:
+            parser.error("--checkpoint is for --controller rl; pid flies the firmware position PID")
+        agent, k, m = None, None, None
+    else:
+        parser.error(f"unknown controller {args.controller!r}")
 
     controller = CrazyflieController(uri=args.uri, agent=agent, run_args=args, initial_target=args.target,
                                      obs_input_hist=k or 1, action_input_hist=m or 0,
