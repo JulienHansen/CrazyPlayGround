@@ -179,7 +179,7 @@ def test_callbacks_update_the_declared_fields(controller):
                                  "stateEstimate.vx": 0.1, "stateEstimate.vy": 0.2, "stateEstimate.vz": 0.3})
     _fire(controller, "quat", {"stateEstimate.qw": 1.0, "stateEstimate.qx": 0.0,
                                "stateEstimate.qy": 0.0, "stateEstimate.qz": 0.0})
-    _fire(controller, "quality", {"kalman.varPX": 0.01, "kalman.varPY": 0.02, "kalman.varPZ": 0.03})
+    _fire(controller, "quality", {"kalman.varPX": 0.01, "kalman.varPY": 0.02, "kalman.varPZ": 0.03, "pm.vbat": 3.9})
     _fire(controller, "motor", {"motor.m1": 10, "motor.m2": 20, "motor.m3": 30, "motor.m4": 40})
 
     assert controller.position_received
@@ -187,6 +187,7 @@ def test_callbacks_update_the_declared_fields(controller):
     assert controller.current_vel.tolist() == pytest.approx([0.1, 0.2, 0.3])
     assert controller.current_quat.tolist() == [1.0, 0.0, 0.0, 0.0]
     assert controller._pos_variance.tolist() == pytest.approx([0.01, 0.02, 0.03])
+    assert controller.vbat == pytest.approx(3.9)
     assert controller.current_motor_pwm == [10, 20, 30, 40]
     assert controller._last_pos_time == pytest.approx(time.time(), abs=1.0)
 

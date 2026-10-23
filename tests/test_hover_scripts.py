@@ -9,6 +9,7 @@ do not slow the tests down; `wait_until` keeps real time.
 """
 
 import argparse
+import hashlib
 import importlib
 import importlib.util
 import math
@@ -39,6 +40,9 @@ SCRIPTS = {
 ACTION = [0.1, -0.2, 0.3, -0.23]
 POS, VEL, GYRO_DEG = (0.2, -0.1, 1.0), (0.05, 0.0, -0.02), (10.0, -20.0, 5.0)
 MOTOR = [30000, 30100, 30200, 30300]
+IMU = (10.0, -20.0, 5.0, 0.01, -0.02, 1.0)   # gyro deg/s, acc g
+FW_VEL = (0.3, -0.4, 0.05)                    # posCtl.targetV*: the firmware PID's velocity command
+VBAT = 3.9
 
 
 class _Commands:
@@ -81,9 +85,11 @@ class FakeCf:
                        "stateEstimate.vx": VEL[0], "stateEstimate.vy": VEL[1], "stateEstimate.vz": VEL[2]},
             "quat": {"stateEstimate.qw": 1.0, "stateEstimate.qx": 0.0,
                      "stateEstimate.qy": 0.0, "stateEstimate.qz": 0.0},
-            "quality": {"kalman.varPX": 1e-3, "kalman.varPY": 1e-3, "kalman.varPZ": 1e-3},
+            "quality": {"kalman.varPX": 1e-3, "kalman.varPY": 1e-3, "kalman.varPZ": 1e-3, "pm.vbat": VBAT},
             "motor": {f"motor.m{i + 1}": v for i, v in enumerate(MOTOR)},
             "gyro": {"gyro.x": GYRO_DEG[0], "gyro.y": GYRO_DEG[1], "gyro.z": GYRO_DEG[2]},
+            "imu": dict(zip(["gyro.x", "gyro.y", "gyro.z", "acc.x", "acc.y", "acc.z"], IMU)),
+            "posCtl": dict(zip(["posCtl.targetVX", "posCtl.targetVY", "posCtl.targetVZ"], FW_VEL)),
         }[name]
 
     def fire(self, logconf):
@@ -243,6 +249,64 @@ def test_exec_vel_feeds_window_and_action_history(tmp_path, monkeypatch):
         assert seen == pytest.approx(_flat(window) + (ACTION[:3] if i else [0.0] * 3))
 
 
+def test_exec_vel_pid_flies_the_firmware_position_pid(tmp_path, monkeypatch):
+    """No policy: the target goes to the onboard position PID, and the recorded command is
+    the velocity that PID asked for, so it compares column for column with an RL flight."""
+    controller, cf, agent, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=20,
+                                      controller_kwargs=dict(controller="pid"))
+    assert cf.calls_to("send_position_setpoint") == [(0.0, 0.0, 1.0, 0.0)] * 20
+    assert cf.calls_to("send_velocity_world_setpoint") == [] and agent.seen == []
+    assert _columns(rows, controller.recorder.cmd_fields) == pytest.approx(list(FW_VEL) * 20)
+    assert all(math.isnan(v) for f in controller.recorder.action_fields for v in rows[f])
+    meta = pq.read_schema(tmp_path / "flight.parquet").metadata
+    assert meta[b"controller"] == b"pid"
+    assert {b"stabilizer.controller", b"posCtlPid.xKp", b"posCtlPid.zVelMax"} <= set(meta)
+
+
+def test_exec_vel_records_telemetry_and_loop_timing(tmp_path, monkeypatch):
+    controller, cf, _, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=20)
+    imu = ["gyro_x", "gyro_y", "gyro_z", "acc_x", "acc_y", "acc_z"]
+    assert _columns(rows, imu) == pytest.approx(list(IMU) * 20)
+    assert rows["vbat"] == pytest.approx([VBAT] * 20) and rows["var_pz"] == pytest.approx([1e-3] * 20)
+    assert all(0.0 <= ms <= 10.5 for ms in rows["slept_ms"]) and set(rows["overran"]) <= {0.0, 1.0}
+    assert all(ms >= 0.0 for ms in rows["dt_infer_ms"] + rows["dt_send_ms"])
+    meta = pq.read_schema(tmp_path / "flight.parquet").metadata
+    assert meta[b"controller"] == b"rl" and b"posCtlPid.xKp" not in meta
+    assert "posCtl" not in cf.configs   # the extra 100 Hz block is only paid for in pid mode
+
+
+def test_exec_vel_lands_after_duration(tmp_path, monkeypatch):
+    controller, _, _, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=1000,
+                                 controller_kwargs=dict(duration=0.2))
+    assert 15 <= len(rows["step"]) <= 25 and not controller.running
+
+
+def test_exec_vel_missing_log_variable_leaves_nan(tmp_path, monkeypatch):
+    """A firmware without posCtl.* must still fly the baseline, with NaN commands, not abort."""
+    mod = load_script("exec_vel", monkeypatch)
+    real_add = FakeCf._add_config
+
+    def add_config(self, logconf):
+        if logconf.name == "posCtl":
+            raise KeyError("Variable posCtl.targetVX not in TOC")
+        real_add(self, logconf)
+    monkeypatch.setattr(FakeCf, "_add_config", add_config)
+    controller, cf, _, rows = fly(mod, tmp_path, steps=5, controller_kwargs=dict(controller="pid"))
+    assert len(cf.calls_to("send_position_setpoint")) == 5
+    assert all(math.isnan(v) for v in rows["vx"])
+
+
+def test_run_metadata_names_the_checkpoint(tmp_path, monkeypatch):
+    mod = load_script("exec_vel", monkeypatch)
+    ckpt = tmp_path / "best_agent.pt"
+    ckpt.write_bytes(b"weights")
+    args = argparse.Namespace(uri="fake", target=[0.0, 0.0, 1.0], duration=0.0, checkpoint=str(ckpt))
+    meta = mod.run_metadata(args, 2, 1)
+    assert meta["checkpoint_sha256"] == hashlib.sha256(b"weights").hexdigest()
+    assert (meta["obs_input_hist"], meta["action_input_hist"]) == ("2", "1") and meta["git_commit"]
+    assert all(isinstance(v, str) for v in meta.values())
+
+
 def test_default_quaternion_is_identity(script):
     """Until the first quat packet, the obs must stay finite (exec_rate divides by |q|²)."""
     controller = script.CrazyflieController(
@@ -365,5 +429,23 @@ def test_cli_sizes_the_policy_from_env_yaml_and_rejects_a_conflict(tmp_path, mon
     for bad in (["--obs-input-hist", "4"], ["--obs-input-hist", "0"], ["--action-input-hist", "-1"]):
         monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt] + bad)
         with pytest.raises(SystemExit):     # before load_agent, so before the radio
+            mod.main()
+    assert len(seen) == 1
+
+
+def test_cli_pid_needs_no_checkpoint_and_rejects_one(monkeypatch):
+    mod = load_script("exec_vel", monkeypatch)
+    seen = []
+    monkeypatch.setattr(mod, "load_agent", lambda *a: pytest.fail("pid must not load a policy"))
+    monkeypatch.setattr(mod, "CrazyflieController",
+                        lambda **kw: seen.append(kw) or (_ for _ in ()).throw(_StopBeforeFlight()))
+    monkeypatch.setattr(sys, "argv", ["exec_vel", "--controller", "pid", "--duration", "5", "--target", "0", "0", "1"])
+    with pytest.raises(_StopBeforeFlight):
+        mod.main()
+    assert (seen[0]["controller"], seen[0]["agent"], seen[0]["duration"]) == ("pid", None, 5.0)
+    assert "checkpoint" not in seen[0]["metadata"]
+    for bad in (["--controller", "pid", "--checkpoint", "x.pt"], ["--duration", "-1"], ["--controller", "lqr"]):
+        monkeypatch.setattr(sys, "argv", ["exec_vel"] + bad)
+        with pytest.raises(SystemExit):
             mod.main()
     assert len(seen) == 1
