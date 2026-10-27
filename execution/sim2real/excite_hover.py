@@ -1,10 +1,11 @@
-"""Excitation flight for measure_delay_noise.py: a hover held from the host, pushed by a known signal.
+"""Step-excitation flight for measure_delay_noise.py: a hover held from the host, pushed by a velocity step.
 
 A position P loop on the host holds the hover and sends world velocities at 100 Hz through
-send_velocity_world_setpoint, the radio and firmware path the velocity policy flies through,
-so the loop delay and sensor noise measured here are the ones the policy meets. From
-EXC_START_S on, a step (square wave) or chirp is added on one axis, and every row records
-the sent command (vx/vy/vz), the excitation alone (exc_v*) and the measured velocity (vel_*).
+send_velocity_world_setpoint, the radio and firmware path the velocity policy flies through.
+From EXC_START_S on, a square-wave velocity step (±amp) is sent on the excited axis while the P
+hold stays active only on the two unexcited axes. Every row records the sent command (vx/vy/vz),
+the step excitation (exc_v*), the setpoint echoed back by the firmware (echo_v* = ctrltarget.v*),
+and the measured velocity (vel_*).
 
     python execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 30
     python execution/sim2real/measure_delay_noise.py flight.parquet
@@ -24,6 +25,7 @@ import torch
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
 
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "single_drone_exec"))
@@ -43,45 +45,45 @@ GRACE_PERIOD           = 3.0   # seconds before enforcing the z lower bound
 INTERVAL = 0.01      # 100 Hz, the policy step (sim dt=1/500, decimation=5)
 SPIN_MARGIN = 0.002  # sleep to 2 ms before each deadline, busy-wait the rest (see wait_until)
 MAX_VEL = 1.0        # m/s, vel_hovering.py max_velocity
-KP, HOLD_MAX = 1.0, 0.3  # 1/s, m/s: a gentle hold, so the excitation dominates the command
+KP, HOLD_MAX = 1.0, 0.3  # 1/s, m/s: holds the unexcited axes on target
 
-# ── Excitation ───────────────────────────────────────────────────────────────
+# ── Step Excitation ──────────────────────────────────────────────────────────
 EXC_START_S = GRACE_PERIOD  # the z-floor watchdog is armed before the drone is pushed
 EXC_MAX_AMP = 0.5           # m/s
-CHIRP_F0, CHIRP_F1, CHIRP_S = 0.2, 5.0, 20.0  # Hz, Hz, s: the sweep repeats; dead time needs content up to ~4 Hz
+CTRLTARGET_VARS = ["ctrltarget.vx", "ctrltarget.vy", "ctrltarget.vz"]
 
 
-def excitation_signal(kind: str, axis: int, amp: float, freq: float, t: float) -> list:
-    """World velocity [m/s] added on `axis` to the hold command, `t` s into the flight.
+def step_signal(axis: int, amp: float, freq: float, t: float) -> list:
+    """Square-wave world velocity [m/s] on `axis` at `freq` Hz, `t` s into the flight.
 
-    step is a square wave at `freq` (steps alternate, so the drone does not drift); chirp
-    sweeps CHIRP_F0 -> CHIRP_F1 every CHIRP_S s and ignores `freq`. No sine: one frequency
-    cannot separate the dead time from the lag. Zero before EXC_START_S.
+    Steps alternate +amp / -amp so the drone oscillates around the hover point without drifting.
+    Zero before EXC_START_S.
     """
     exc = [0.0, 0.0, 0.0]
     s = t - EXC_START_S
-    if s < 0:
-        return exc
-    if kind == "step":
+    if s >= 0:
         exc[axis] = math.copysign(amp, math.sin(2 * math.pi * freq * s))
-    else:  # chirp
-        s %= CHIRP_S
-        exc[axis] = amp * math.sin(2 * math.pi * (CHIRP_F0 * s + (CHIRP_F1 - CHIRP_F0) * s * s / (2 * CHIRP_S)))
     return exc
 
 
 class ExciteHover(CrazyflieStateBase):
-    def __init__(self, uri: str, run_args, kind: str, axis: int, amp: float, freq: float,
+    def __init__(self, uri: str, run_args, axis: int, amp: float, freq: float,
                  duration: float, target=None, metadata=None):
         super().__init__(device)
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
-        self.kind, self.axis, self.amp, self.freq = kind, axis, amp, freq
+        self.axis, self.amp, self.freq = axis, amp, freq
         self.duration = duration
         self.initial_target = target
-        self.make_recorder(run_args, obs_fields=["err_x", "err_y", "err_z"],
-                           action_fields=["hold_vx", "hold_vy", "hold_vz"], cmd_fields=["vx", "vy", "vz"],
-                           extra_fields=["exc_vx", "exc_vy", "exc_vz", "dt_body_ms", "slept_ms", "overran"])
+        self.echo_vel = [float("nan")] * 3
+        self.make_recorder(
+            run_args,
+            obs_fields=["err_x", "err_y", "err_z"],
+            action_fields=["hold_vx", "hold_vy", "hold_vz"],
+            cmd_fields=["vx", "vy", "vz"],
+            extra_fields=["exc_vx", "exc_vy", "exc_vz", "echo_vx", "echo_vy", "echo_vz",
+                          "dt_body_ms", "slept_ms", "overran"],
+        )
         self.recorder.metadata.update(metadata or {})
         self.cf.connected.add_callback(self._connected)
         self.cf.connection_failed.add_callback(self._connection_lost)
@@ -92,7 +94,26 @@ class ExciteHover(CrazyflieStateBase):
         self.cf.high_level_commander.takeoff(0.5, 1)
         time.sleep(1.5)
         self.setup_state_logging()
+        self._setup_target_logging()
         threading.Thread(target=self.control_loop, daemon=True).start()
+
+    def _setup_target_logging(self):
+        """Log ctrltarget.vx/vy/vz at 100 Hz so measure_delay_noise.py sees when each step reached the drone."""
+        logconf = LogConfig(name="ctrltarget", period_in_ms=10)
+        for var in CTRLTARGET_VARS:
+            logconf.add_variable(var, "float")
+        try:
+            self.cf.log.add_config(logconf)
+        except (KeyError, AttributeError) as e:
+            logger.warning(f"Log block ctrltarget unavailable ({e}); echo_v* columns stay NaN")
+            return
+
+        def _callback(timestamp, data, logconf):
+            with self.lock:
+                self.echo_vel = [data[var] for var in CTRLTARGET_VARS]
+
+        logconf.data_received_cb.add_callback(_callback)
+        logconf.start()
 
     def _connection_lost(self, uri: str, msg: str):
         logger.warning(f"Connection to {uri} lost or failed: {msg} — triggering safe landing")
@@ -110,7 +131,7 @@ class ExciteHover(CrazyflieStateBase):
         else:
             target = self.current_pos.clone()
             target[2] = max(0.5, min(1.5, target[2].item()))
-        logger.info(f"Holding {target.tolist()}, {self.kind} excitation on axis {'xyz'[self.axis]} from {EXC_START_S:g} s")
+        logger.info(f"Holding {target.tolist()}, step excitation on axis {'xyz'[self.axis]} from {EXC_START_S:g} s")
 
         start = time.time()
         deadline = time.perf_counter()
@@ -135,6 +156,7 @@ class ExciteHover(CrazyflieStateBase):
                 break
             with self.lock:
                 var = self._pos_variance.clone()
+                echo = list(self.echo_vel)
             if var.max().item() > POS_VARIANCE_THRESHOLD:
                 logger.error(f"Position variance too high {var.tolist()} — emergency landing")
                 emergency_land(self)
@@ -143,7 +165,11 @@ class ExciteHover(CrazyflieStateBase):
             state = self.snapshot()  # one consistent read, used for the command and its recorded row
             err = target - state.pos
             hold = (KP * err).clamp(-HOLD_MAX, HOLD_MAX)
-            exc = excitation_signal(self.kind, self.axis, self.amp, self.freq, elapsed)
+            exc = step_signal(self.axis, self.amp, self.freq, elapsed)
+            # Keep the position P-hold on the two unexcited axes so the drone stays in place,
+            # but zero it on the excited axis so the sent velocity is a pure flat step (±amp).
+            if elapsed >= EXC_START_S:
+                hold[self.axis] = 0.0
             cmd = (hold + torch.tensor(exc)).clamp(-MAX_VEL, MAX_VEL)
             control_time = time.time()
             self.cf.commander.send_velocity_world_setpoint(*cmd.tolist(), 0.0)  # yaw_rate = 0
@@ -151,7 +177,7 @@ class ExciteHover(CrazyflieStateBase):
 
             deadline, slept_ms, overran = wait_until(deadline + INTERVAL, SPIN_MARGIN)
             self.record_step(step, state, control_time, target, err, hold, cmd,
-                             exc + [(t_sent - t_body) * 1e3, slept_ms, overran])
+                             exc + echo + [(t_sent - t_body) * 1e3, slept_ms, overran])
             step += 1
 
         self.cf.commander.send_stop_setpoint()
@@ -177,7 +203,7 @@ class ExciteHover(CrazyflieStateBase):
 def run_metadata(args) -> dict:
     """What flew, stored in the recording's Parquet footer."""
     meta = {"uri": args.uri, "argv": " ".join(sys.argv), "target": str(args.target),
-            "duration_s": str(args.duration), "excitation": args.excitation, "exc_axis": args.exc_axis,
+            "duration_s": str(args.duration), "excitation": "step", "exc_axis": args.exc_axis,
             "exc_amp": str(args.exc_amp), "exc_freq": str(args.exc_freq), "kp": str(KP)}
     for package in ("torch", "cflib"):  # cflib has no __version__
         try:
@@ -193,16 +219,15 @@ def run_metadata(args) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Hover from the host and add a known velocity excitation, "
+    parser = argparse.ArgumentParser(description="Hover from the host and add a square-wave velocity step, "
                                                  "recorded for measure_delay_noise.py.")
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8", help="URI of the Crazyflie")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Hover target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
-    parser.add_argument("--excitation", choices=["step", "chirp"], default="step")
     parser.add_argument("--exc-axis", choices=["x", "y", "z"], default="x",
                         help="World axis to excite. Prefer x/y: z from a 0.5 m hover nears the 0.1 m floor cut-out.")
-    parser.add_argument("--exc-amp", type=float, default=0.2, help=f"Excitation amplitude [m/s], at most {EXC_MAX_AMP}.")
-    parser.add_argument("--exc-freq", type=float, default=0.5, help="Square-wave frequency [Hz] for step, at most 10.")
+    parser.add_argument("--exc-amp", type=float, default=0.2, help=f"Step amplitude [m/s], at most {EXC_MAX_AMP}.")
+    parser.add_argument("--exc-freq", type=float, default=0.5, help="Square-wave frequency [Hz], at most 10.")
     parser.add_argument("--duration", type=float, default=30.0, help="Seconds of flight before landing.")
     add_run_args(parser)
     args = parser.parse_args()
@@ -215,7 +240,7 @@ def main():
     if not 0 < args.exc_amp <= EXC_MAX_AMP or not 0 < args.exc_freq <= 10:
         parser.error(f"--exc-amp must be in (0, {EXC_MAX_AMP}] m/s and --exc-freq in (0, 10] Hz")
 
-    flight = ExciteHover(uri=args.uri, run_args=args, kind=args.excitation, axis="xyz".index(args.exc_axis),
+    flight = ExciteHover(uri=args.uri, run_args=args, axis="xyz".index(args.exc_axis),
                          amp=args.exc_amp, freq=args.exc_freq, duration=args.duration, target=args.target,
                          metadata=run_metadata(args))
     try:
@@ -237,3 +262,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

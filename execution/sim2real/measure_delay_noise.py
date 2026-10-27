@@ -1,19 +1,22 @@
-"""Loop delay and sensor noise of hover flights, as Vel-Hovering config values.
+"""Step-response delay, dead time, time constant and sensor noise of hover flights.
 
     python execution/sim2real/excite_hover.py --record-path flight.parquet --duration 30
     python execution/sim2real/measure_delay_noise.py flight.parquet [more.parquet ...]
 
-Input: any Parquet recording with one row per 10 ms control step holding `step`,
-`control_time`, the sent world velocity command `vx, vy, vz`, the measured velocity
-`vel_x, vel_y, vel_z`, and optionally the excitation added to the command `exc_vx, exc_vy,
-exc_vz` (zeros if absent). excite_hover.py writes exactly this; exec_vel.py too, minus exc_v*.
+Input: any Parquet recording from excite_hover.py with one row per 10 ms control step holding
+`step`, `control_time`, the step excitation `exc_vx, exc_vy, exc_vz`, the firmware-echoed
+velocity setpoint `echo_vx, echo_vy, echo_vz` (`ctrltarget.v*`), and the measured velocity
+`vel_x, vel_y, vel_z`.
 
-Per excited axis, the sent command -> measured velocity is fitted as a first-order lag plus
-dead time by output error: fitting the model's simulated, noise-free response, unlike
-regressing on the noisy measured velocity, is not biased by the sensor noise or by the hold
-loop's feedback. The fit's residual is what the command does not explain, the sensor noise,
-and its AR(1) gives noise_std and noise_corr as vel_hovering defines them (stationary std,
-lag-1 correlation per policy step).
+Because the step transitions in `exc_v*` are known, each step window is aligned at its command
+transition and normalized by the sent step amplitude Δu:
+  - Radio delay (`d` steps, `radio_ms`): steps from sending the step command until `echo_v*`
+    reflects the new setpoint on the drone.
+  - Dead time (`dead_ms`): time from when the command reaches the drone (`d`) until measured
+    velocity reaches 5% of the sent command.
+  - Time constant (`tau_ms`): time from 5% to 63.2% (1 - 1/e) of the sent command.
+  - Sensor noise (`noise_std`, `noise_corr`): stationary std and lag-1 correlation (AR(1)) of
+    the step-to-step velocity residuals around the mean step response.
 """
 
 import argparse
@@ -22,13 +25,13 @@ import sys
 import numpy as np
 import pyarrow.parquet as pq
 
-MAX_DELAY = 20                       # policy steps searched by the fit and the cross-correlation
-TAUS = np.geomspace(0.02, 1.0, 30)   # s, first-order time constants tried by the fit
 AXES = "xyz"
+STEP_ONSET = 0.05                    # 5% of sent command: end of mechanical/tilt dead time
+STEP_TAU = 1.0 - float(np.exp(-1))   # 63.2% (1 - 1/e) of sent command: one time constant
 
 
 def load(path):
-    """Columns as float arrays. Exits on a file the fits cannot use."""
+    """Columns as float arrays. Exits on a file the step analysis cannot use."""
     table = pq.read_table(path)
     cols = {name: np.asarray(table.column(name).to_numpy(), dtype=float) for name in table.column_names}
     if len(cols["step"]) < 2 or np.any(np.diff(cols["step"]) != 1):
@@ -37,25 +40,8 @@ def load(path):
         if not (np.isfinite(cols[f"v{ax}"]).all() and np.isfinite(cols[f"vel_{ax}"]).all()):
             sys.exit(f"{path}: non-finite v{ax} or vel_{ax}")
         cols.setdefault(f"exc_v{ax}", np.zeros(len(cols["step"])))
+        cols.setdefault(f"echo_v{ax}", np.full(len(cols["step"]), np.nan))
     return cols
-
-
-def xcorr_lag(u, y, max_lag):
-    """Lag (in samples) maximising correlation between input u and response y."""
-    u = u - u.mean()
-    y = y - y.mean()
-    if u.std() < 1e-9 or y.std() < 1e-9:
-        return np.nan, np.nan
-    best, best_lag = -np.inf, 0
-    for L in range(0, max_lag + 1):
-        a, b = u[:len(u) - L] if L else u, y[L:]
-        n = min(len(a), len(b))
-        if n < 20:
-            break
-        c = float(np.corrcoef(a[:n], b[:n])[0, 1])
-        if c > best:
-            best, best_lag = c, L
-    return best_lag, best
 
 
 def ar1(x):
@@ -64,90 +50,98 @@ def ar1(x):
     return float(x.std()), float(x[1:] @ x[:-1] / (x[:-1] @ x[:-1]))
 
 
-def dominant_freq(x, dt):
-    """Strongest oscillation of x [Hz], ignoring drift below 0.2 Hz."""
-    x = x - x.mean()
-    if len(x) < 16 or x.std() < 1e-9:
-        return np.nan
-    power = np.abs(np.fft.rfft(x * np.hanning(len(x))))
-    f = np.fft.rfftfreq(len(x), dt)
-    power[f < 0.2] = 0
-    return float(f[np.argmax(power)])
+def _crossing_step(response_curve, threshold, start_step=0):
+    """First step index >= `start_step` where `response_curve` reaches `threshold`."""
+    steps_above = np.flatnonzero(response_curve[start_step:] >= threshold)
+    if len(steps_above) == 0:
+        return float("nan")
+    return int(steps_above[0]) + start_step
 
 
-def fit_fopdt(u, y, dt, max_d=MAX_DELAY, rho=None):
-    """(dead time d [steps], tau [s], gain K, residual) of y[t] = K * lag_tau(u)[t - 1 - d].
+def step_response(exc, echo, vel, dt):
+    """Extract (d, radio_ms, dead_ms, tau_ms, noise_std, noise_corr) from known step edges in `exc`."""
+    step_edges = np.flatnonzero(np.diff(exc) != 0) + 1
+    if len(step_edges) < 2:
+        return None
+    window_steps = int(np.min(np.diff(step_edges)))
+    step_edges = [t for t in step_edges if t + window_steps <= len(vel)]
+    if not step_edges:
+        return None
 
-    d = 0 is the sim's action_latency_steps = 0: row t holds the state read before command t
-    is sent, so command t first shows in row t + 1. Correlated noise makes one more step of
-    delay with a faster lag fit nearly as well, so a second pass minimises the residual
-    whitened with its own AR(1) correlation `rho`.
-    """
-    if rho is None:
-        rho = float(np.clip(ar1(fit_fopdt(u, y, dt, max_d, rho=0.0)[3])[1], 0.0, 0.99))
-    u, y = u - u.mean(), y - y.mean()
-    yw = y[1:] - rho * y[:-1]
-    best = (np.inf,)
-    for tau in TAUS:
-        a = np.exp(-dt / tau)
-        f = np.zeros_like(u)
-        for i in range(1, len(u)):
-            f[i] = a * f[i - 1] + (1 - a) * u[i - 1]
-        for d in range(max_d + 1):
-            g = np.concatenate([np.zeros(d), f[:len(f) - d]])
-            gw = g[1:] - rho * g[:-1]
-            k = gw @ yw / (gw @ gw)
-            rw = yw - k * gw
-            if rw @ rw < best[0]:
-                best = (rw @ rw, d, float(tau), float(k), y - k * g)
-    return best[1:]
+    norm_vel_windows, echo_delays = [], []
+    for t in step_edges:
+        v_start, v_target = exc[t - 1], exc[t]
+        norm_vel_windows.append((vel[t:t + window_steps] - v_start) / (v_target - v_start))
+        # First step k in the window where the drone's echoed target matches the sent target v_target
+        matched = np.flatnonzero(np.isclose(echo[t:t + window_steps], v_target))
+        if len(matched):
+            echo_delays.append(int(matched[0]))
+
+    mean_vel_response = np.mean(norm_vel_windows, axis=0)
+    radio_delay_steps = int(np.median(echo_delays)) if echo_delays else 0
+
+    step_at_5pct = _crossing_step(mean_vel_response, STEP_ONSET, start_step=radio_delay_steps)
+    start_63pct = step_at_5pct if isinstance(step_at_5pct, int) else radio_delay_steps
+    step_at_63pct = _crossing_step(mean_vel_response, STEP_TAU, start_step=start_63pct)
+
+    radio_ms = radio_delay_steps * dt * 1e3
+    dead_ms = max(0.0, (step_at_5pct - radio_delay_steps) * dt * 1e3)
+    tau_ms = (step_at_63pct - step_at_5pct) * dt * 1e3
+
+    # Step-to-step velocity residuals around the mean step response (Bessel-corrected for num_windows).
+    num_windows = len(step_edges)
+    bessel_correction = np.sqrt(num_windows / max(num_windows - 1, 1))
+    residuals = [
+        (vel[t:t + window_steps] - (exc[t - 1] + (exc[t] - exc[t - 1]) * mean_vel_response)) * bessel_correction
+        for t in step_edges
+    ]
+    noise_std, noise_corr = ar1(np.concatenate(residuals))
+    return dict(
+        d=radio_delay_steps,
+        radio_ms=radio_ms,
+        dead_ms=dead_ms,
+        tau_ms=tau_ms,
+        noise_std=noise_std,
+        noise_corr=noise_corr,
+    )
 
 
 def analyse(path):
-    """Per axis: the delay and noise fit if it was excited, else its dominant oscillation."""
+    """Per excited axis: radio delay, plant dead time, time constant and sensor noise."""
     cols = load(path)
     dt = float(np.median(np.diff(cols["control_time"])))
     axes = {}
     for ax in AXES:
-        u, y, exc = cols[f"v{ax}"], cols[f"vel_{ax}"], cols[f"exc_v{ax}"]
+        exc, echo, y = cols[f"exc_v{ax}"], cols[f"echo_v{ax}"], cols[f"vel_{ax}"]
         if np.any(exc != 0):
-            start = int(np.argmax(exc != 0))
-            d, tau, k, resid = fit_fopdt(u[start:], y[start:], dt)
-            std, rho = ar1(resid)
-            axes[ax] = dict(xcorr_ms=xcorr_lag(exc[start:], y[start:], MAX_DELAY)[0] * dt * 1e3,
-                            d=d, tau_ms=tau * 1e3, gain=k, noise_std=std, noise_corr=rho)
-        else:  # the command only reacts to noise here: delay and noise are not identifiable
-            axes[ax] = dict(osc_hz=dominant_freq(y, dt))
+            res = step_response(exc, echo, y, dt)
+            if res is not None:
+                axes[ax] = res
     return axes
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Estimate loop delay and sensor noise from flight "
-                                                 "recordings and print the matching Vel-Hovering values.")
-    parser.add_argument("paths", nargs="+", help="flight.parquet files, e.g. from excite_hover.py")
+    parser = argparse.ArgumentParser(description="Characterise step response (radio delay, dead time, tau, "
+                                                 "sensor noise) from excite_hover.py recordings.")
+    parser.add_argument("paths", nargs="+", help="flight.parquet files from excite_hover.py")
     args = parser.parse_args(argv)
 
     fits = []
-    print(f"{'run':<32} ax {'xcorr ms':>8} {'d':>3} {'tau ms':>7} {'gain':>5} {'noise':>7} {'rho':>5} {'osc Hz':>6}")
+    print(f"{'run':<32} ax {'d':>3} {'radio ms':>8} {'dead ms':>7} {'tau ms':>7} {'noise':>7} {'rho':>5}")
     for path in args.paths:
         for ax, r in analyse(path).items():
-            if "d" in r:
-                fits.append(r)
-            g = lambda key: r.get(key, np.nan)  # noqa: E731
-            print(f"{path[-32:]:<32} {ax:>2} {g('xcorr_ms'):8.0f} {g('d'):3.0f} {g('tau_ms'):7.0f} "
-                  f"{g('gain'):5.2f} {g('noise_std'):7.4f} {g('noise_corr'):5.2f} {g('osc_hz'):6.2f}")
+            fits.append(r)
+            print(f"{path[-32:]:<32} {ax:>2} {r['d']:3d} {r['radio_ms']:8.0f} {r['dead_ms']:7.0f} "
+                  f"{r['tau_ms']:7.0f} {r['noise_std']:7.4f} {r['noise_corr']:5.2f}")
 
     if not fits:
         print("delay and noise: NOT REPORTED, no excited axis. Fly for example\n"
               "  execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 30")
         return
     ds = [r["d"] for r in fits]
-    # shortcut: d also absorbs the attitude loop's lag (the drone tilts before it accelerates), so it
-    # overstates the delay the sim is missing; subtract the sim's own d once WP7 records sim flights.
     print(f"env.action_latency_steps={min(ds)} env.action_latency_max_steps={max(ds) if max(ds) > min(ds) else 0} "
           f"env.add_noise=True env.noise_std={np.median([r['noise_std'] for r in fits]):.4f} "
           f"env.noise_corr={np.clip(np.median([r['noise_corr'] for r in fits]), 0, 0.99):.2f}")
-    print("Upper bounds: d includes the attitude lag, the noise any motion the model does not explain.")
 
 
 if __name__ == "__main__":
