@@ -22,6 +22,7 @@ and experiment results are centralised in one W&B team, `crazyplayground`.
 | `execution/` | Deployment on real Crazyflies over radio (cflib); see **Real hardware** |
 | `experiments/config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
 | `experiments/parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
+| `experiments/run_skrl.sh`, `skrl_args.py` | Launch a sweep's pending runs, N `train.py` processes at a time; map sweep keys to `train.py` args |
 | `tests/` | pytest. Hardware tests drive the real scripts against a fake Crazyflie |
 | `docs/` | MkDocs: environments, controller, configuration, deployment |
 
@@ -53,8 +54,9 @@ python scripts/skrl/play.py --task=Vel-Hovering --checkpoint logs/skrl/<dir>/<ru
 
 python experiments/parser.py experiments/config/sweep/hovering/test_01.json        # add --runs or --json
 python experiments/wandb_check.py experiments/config/sweep/hovering/test_01.json   # add --runs; needs `wandb login`
+experiments/run_skrl.sh experiments/config/sweep/hovering/test_01.json -j 2 --dry-run   # drop --dry-run to train; -- <train.py flags>
 
-python -m pytest tests/test_sweep_parser.py tests/test_wandb_check.py   # needs only pytest
+python -m pytest tests/test_sweep_parser.py tests/test_wandb_check.py tests/test_skrl_args.py   # needs only pytest
 python -m pytest tests/                                                 # also torch, pyarrow, cflib
 ```
 
@@ -97,7 +99,8 @@ sweep file. Ad-hoc `train.py` runs are for debugging only; run them with
 - `trainer`, `env_name` and `seed` are required. `env_kwargs.<field>` must be a
   field of the task's env config class. Agent keys (`lr`, `lambda_coef`,
   `entropy_coef`, `rollout_length`, `num_envs`, `total_timesteps` = env steps
-  summed over all envs) are translated by the trainer script.
+  summed over all envs, rounded up to whole steps per env) are translated by
+  the trainer script.
 - Values reach the trainer exactly as written. Write floats as floats (`0.0`,
   not `0`): Isaac Lab refuses an int for a float field.
 - A run is identified by `run_key`, a hash of its resolved settings plus
@@ -112,7 +115,7 @@ sweep file. Ad-hoc `train.py` runs are for debugging only; run them with
    factor per experiment, and give every config you compare the same seeds.
 2. `python experiments/parser.py <file>`: check the run count and the duplicates it drops.
 3. `python experiments/wandb_check.py <file>`: only `failed` and `missing` runs get trained.
-4. Launch with the trainer script (see **Status**). Launching is the user's
+4. Launch with `experiments/run_skrl.sh <file> -j N`. Launching is the user's
    decision: it spends shared GPU hours and writes to the team W&B. Ask first.
 5. Compare on W&B by group. A group is one config, and W&B plots the mean and
    spread over its seeds. Only compare runs with the same `total_timesteps`.
@@ -186,13 +189,10 @@ Test against the fake Crazyflie (`tests/test_hover_scripts.py`).
 
 ## Status and open decisions (2026-10-19)
 
-- **Not written yet:** `experiments/train_skrl.py`, the launcher. It will:
-  - translate sweep keys into skrl/Hydra overrides;
-  - re-check W&B just before each run;
-  - add `run_key`, `config_key` and `exp` to the W&B config;
-  - set `summary["completed"]`.
-
-  Until it exists, don't hand-roll comparison runs; ask.
+- **Launcher:** `experiments/run_skrl.sh` (keys translated by
+  `experiments/skrl_args.py`, `summary["completed"]` set by
+  `scripts/skrl/train.py`). It checks W&B once at start, not before each run,
+  so two machines launching the same sweep at once can duplicate runs.
 - **Planned:** `experiments/train_orcax.py` (Orcax, a JAX RL library), after the
   Isaac Lab 3 / Python 3.12 upgrade. `"orcax"` is not an accepted `trainer` yet.
 - **Planned:** a ruff config (format and lint) with a pre-commit hook, in its

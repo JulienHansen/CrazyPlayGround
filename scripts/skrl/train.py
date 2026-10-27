@@ -224,6 +224,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # run training
     runner.run()
+    # the "done" mark experiments/wandb_check.py reads, so a crash during shutdown is not retrained
+    import wandb
+
+    if wandb.run is not None:
+        wandb.run.summary["completed"] = True
+        # simulation_app.close() ends the process without wandb's exit hook: sync now
+        wandb.finish()
 
     # close the simulator
     env.close()
