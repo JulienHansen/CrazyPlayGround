@@ -1,0 +1,45 @@
+# Orcax PPO configuration, read by scripts/orcax/train.py.
+# `agent` maps 1:1 onto orcax PPO_CFG fields; `models` and `trainer` are
+# interpreted by the script.
+seed: 42
+
+models:
+  policy:
+    hidden: [256, 256, 128]
+    activation: elu
+    log_std_init: 0.0
+  value:
+    # Reads critic_inputs below: actor obs + privileged 26-D state (asymmetric actor-critic).
+    hidden: [256, 256, 128]
+    activation: elu
+
+agent:
+  rollout_steps: 32           # per env
+  learning_epochs: 5
+  mini_batches: 4
+  discount_factor: 0.99
+  lambda_coefficient: 0.95
+  learning_rate: 3.0e-4
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: false
+  entropy_loss_scale: 0.001
+  value_loss_scale: 1.0
+  grad_norm_clip: 1.0
+  grad_norm_clip_mode: per_network
+  norm_adv: true
+  kl_threshold: 0.0
+  # The reward depends on detection memory and the last action, which are in the obs but not the state.
+  critic_inputs: [obs, state]
+
+trainer:
+  timesteps: 200000000        # total transitions, summed over all envs
+  write_interval: 32          # in env steps per env (multiplied by num_envs in the script)
+  checkpoint_interval: 1000
+
+experiment:
+  directory: logs/orcax/pursuit_evasion
+  wandb: false
+  wandb_kwargs:
+    project: pursuit_evasion  # W&B project = task folder name
+    entity: crazyplayground
