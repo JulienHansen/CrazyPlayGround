@@ -2,19 +2,25 @@
 
 A position P loop on the host holds the hover and sends world velocities at 100 Hz through
 send_velocity_world_setpoint, the radio and firmware path the velocity policy flies through.
-From EXC_START_S on, a square-wave velocity step (±amp) is sent on the excited axis while the P
-hold stays active only on the two unexcited axes. Every row records the sent command (vx/vy/vz),
-the step excitation (exc_v*), the setpoint echoed back by the firmware (echo_v* = ctrltarget.v*),
-and the measured velocity (vel_*).
+From EXC_START_S on, the excited axis repeats a cycle of three phases (see step_signal):
 
-    python execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 30
+    REST     step_s     exc 0      P hold off: the drone settles at rest under a zero command
+    PUSH     step_s     exc amp    P hold off: the step, from rest, always in the sign of amp
+    RECOVER  recover_s  exc 0      P hold on: the drone brakes and flies back to its hover target
+
+so every step starts from rest and goes the same way: the response is not averaged over two
+directions that may not be symmetric. The P hold stays active on the two unexcited axes.
+Every row records the sent command (vx/vy/vz), the step excitation (exc_v*), the setpoint echoed
+back by the firmware (echo_v* = ctrltarget.v*), and the measured velocity (vel_*).
+
+    python execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90
     python execution/sim2real/measure_delay_noise.py flight.parquet
+    python execution/sim2real/plot_step_response.py flight.parquet --out flight.png
 """
 
 import os
 import sys
 import time
-import math
 import importlib.metadata
 import subprocess
 import threading
@@ -49,30 +55,35 @@ KP, HOLD_MAX = 1.0, 0.3  # 1/s, m/s: holds the unexcited axes on target
 
 # ── Step Excitation ──────────────────────────────────────────────────────────
 EXC_START_S = GRACE_PERIOD  # the z-floor watchdog is armed before the drone is pushed
-EXC_MAX_AMP = 0.5           # m/s
+EXC_MAX_AMP = 1.0           # m/s, MAX_VEL: the command is clamped there anyway
 CTRLTARGET_VARS = ["ctrltarget.vx", "ctrltarget.vy", "ctrltarget.vz"]
 
 
-def step_signal(axis: int, amp: float, freq: float, t: float) -> list:
-    """Square-wave world velocity [m/s] on `axis` at `freq` Hz, `t` s into the flight.
+def step_signal(axis: int, amp: float, step_s: float, recover_s: float, t: float) -> tuple:
+    """(world velocity step [m/s], hold_on) on `axis`, `t` s into the flight.
 
-    Steps alternate +amp / -amp so the drone oscillates around the hover point without drifting.
-    Zero before EXC_START_S.
+    Cycles REST / PUSH (step_s each, P hold off on `axis`) then RECOVER (recover_s, P hold on).
+    The PUSH is always `amp`, so every step is in one direction. Before EXC_START_S: no step and
+    the P hold is on.
     """
     exc = [0.0, 0.0, 0.0]
     s = t - EXC_START_S
-    if s >= 0:
-        exc[axis] = math.copysign(amp, math.sin(2 * math.pi * freq * s))
-    return exc
+    if s < 0:
+        return exc, True
+    phase_t = s % (2 * step_s + recover_s)
+    if step_s <= phase_t < 2 * step_s:
+        exc[axis] = amp
+    return exc, phase_t >= 2 * step_s
 
 
 class ExciteHover(CrazyflieStateBase):
-    def __init__(self, uri: str, run_args, axis: int, amp: float, freq: float,
+    def __init__(self, uri: str, run_args, axis: int, amp: float, step_s: float, recover_s: float,
                  duration: float, target=None, metadata=None):
         super().__init__(device)
         self.uri = uri
         self.cf = Crazyflie(rw_cache='./cache')
-        self.axis, self.amp, self.freq = axis, amp, freq
+        self.axis, self.amp = axis, amp
+        self.step_s, self.recover_s = step_s, recover_s
         self.duration = duration
         self.initial_target = target
         self.echo_vel = [float("nan")] * 3
@@ -165,10 +176,10 @@ class ExciteHover(CrazyflieStateBase):
             state = self.snapshot()  # one consistent read, used for the command and its recorded row
             err = target - state.pos
             hold = (KP * err).clamp(-HOLD_MAX, HOLD_MAX)
-            exc = step_signal(self.axis, self.amp, self.freq, elapsed)
+            exc, hold_on = step_signal(self.axis, self.amp, self.step_s, self.recover_s, elapsed)
             # Keep the position P-hold on the two unexcited axes so the drone stays in place,
-            # but zero it on the excited axis so the sent velocity is a pure flat step (±amp).
-            if elapsed >= EXC_START_S:
+            # but zero it on the excited axis outside RECOVER so the sent velocity is a pure step.
+            if not hold_on:
                 hold[self.axis] = 0.0
             cmd = (hold + torch.tensor(exc)).clamp(-MAX_VEL, MAX_VEL)
             control_time = time.time()
@@ -203,8 +214,9 @@ class ExciteHover(CrazyflieStateBase):
 def run_metadata(args) -> dict:
     """What flew, stored in the recording's Parquet footer."""
     meta = {"uri": args.uri, "argv": " ".join(sys.argv), "target": str(args.target),
-            "duration_s": str(args.duration), "excitation": "step", "exc_axis": args.exc_axis,
-            "exc_amp": str(args.exc_amp), "exc_freq": str(args.exc_freq), "kp": str(KP)}
+            "duration_s": str(args.duration), "excitation": "push_recover", "exc_axis": args.exc_axis,
+            "exc_amp": str(args.exc_amp), "exc_step_s": str(args.exc_step),
+            "exc_recover_s": str(args.exc_recover), "kp": str(KP)}
     for package in ("torch", "cflib"):  # cflib has no __version__
         try:
             meta[f"{package}_version"] = importlib.metadata.version(package)
@@ -219,16 +231,19 @@ def run_metadata(args) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Hover from the host and add a square-wave velocity step, "
+    parser = argparse.ArgumentParser(description="Hover from the host and push it with one-direction velocity steps, "
                                                  "recorded for measure_delay_noise.py.")
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8", help="URI of the Crazyflie")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Hover target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
     parser.add_argument("--exc-axis", choices=["x", "y", "z"], default="x",
                         help="World axis to excite. Prefer x/y: z from a 0.5 m hover nears the 0.1 m floor cut-out.")
-    parser.add_argument("--exc-amp", type=float, default=0.2, help=f"Step amplitude [m/s], at most {EXC_MAX_AMP}.")
-    parser.add_argument("--exc-freq", type=float, default=0.5, help="Square-wave frequency [Hz], at most 10.")
-    parser.add_argument("--duration", type=float, default=30.0, help="Seconds of flight before landing.")
+    parser.add_argument("--exc-amp", type=float, default=0.2, help=f"Step amplitude [m/s], |amp| at most {EXC_MAX_AMP}. Its sign is the push direction.")
+    parser.add_argument("--exc-step", type=float, default=1.0,
+                        help="Seconds of each REST and PUSH phase, in [0.1, 5]. Longer than the step's t90.")
+    parser.add_argument("--exc-recover", type=float, default=4.0,
+                        help="Seconds of P hold back to the target between steps. ~6 s at --exc-amp 1.")
+    parser.add_argument("--duration", type=float, default=90.0, help="Seconds of flight before landing.")
     add_run_args(parser)
     args = parser.parse_args()
     if not args.record_path:
@@ -237,12 +252,13 @@ def main():
         parser.error("--record-every must be 1: the noise correlation is per control step")
     if args.duration <= EXC_START_S:
         parser.error(f"--duration must be above {EXC_START_S:g} s, when the excitation starts")
-    if not 0 < args.exc_amp <= EXC_MAX_AMP or not 0 < args.exc_freq <= 10:
-        parser.error(f"--exc-amp must be in (0, {EXC_MAX_AMP}] m/s and --exc-freq in (0, 10] Hz")
+    if not 0 < abs(args.exc_amp) <= EXC_MAX_AMP or not 0.1 <= args.exc_step <= 5 or args.exc_recover < 0:
+        parser.error(f"|--exc-amp| must be in (0, {EXC_MAX_AMP}] m/s, --exc-step in [0.1, 5] s "
+                     f"and --exc-recover >= 0 s")
 
     flight = ExciteHover(uri=args.uri, run_args=args, axis="xyz".index(args.exc_axis),
-                         amp=args.exc_amp, freq=args.exc_freq, duration=args.duration, target=args.target,
-                         metadata=run_metadata(args))
+                         amp=args.exc_amp, step_s=args.exc_step, recover_s=args.exc_recover,
+                         duration=args.duration, target=args.target, metadata=run_metadata(args))
     try:
         flight.start()
         for _ in range(10):
