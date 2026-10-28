@@ -39,7 +39,7 @@ def fly(mod, tmp_path, steps, target, duration=30.0, **cf_kwargs):
     mod.Crazyflie = lambda **kwargs: cf
     path = tmp_path / "flight.parquet"
     flight = mod.ExciteHover(uri="fake", run_args=argparse.Namespace(record_path=str(path), record_every=1, log_every=100),
-                             axis=0, amp=AMP, freq=0.5, duration=duration, target=target)
+                             axis=0, amp=AMP, step_s=1.0, recover_s=4.0, duration=duration, target=target)
     flight._connected("fake")
     assert cf.loop_done.wait(timeout=30), "control loop did not finish"
     flight.stop()
@@ -49,8 +49,8 @@ def fly(mod, tmp_path, steps, target, duration=30.0, **cf_kwargs):
 
 
 def test_pure_step_on_excited_axis_and_hold_on_others(mod, tmp_path, monkeypatch):
-    """During excitation, the excited axis gets a pure step (hold=0) while unexcited axes stay held."""
-    monkeypatch.setattr(mod, "EXC_START_S", 0.0)   # step starts at +AMP and stays there for 1 s
+    """During PUSH, the excited axis gets a pure step (hold=0) while unexcited axes stay held."""
+    monkeypatch.setattr(mod, "EXC_START_S", -1.0)  # 1 s into the cycle: PUSH at +AMP for 1 s
     target = [POS[0] + 0.1, POS[1], POS[2] + 1.0]  # z error saturates the hold at HOLD_MAX
     _, cf, rows, path = fly(mod, tmp_path, steps=20, target=target)
     assert rows["hold_vx"] == pytest.approx([0.0] * 20)
@@ -83,12 +83,17 @@ def test_lands_after_duration(mod, tmp_path):
 
 
 def test_step_signal_shape():
-    start = excite_hover.EXC_START_S
-    assert excite_hover.step_signal(0, AMP, 0.5, start - 0.01) == [0.0, 0.0, 0.0]
-    values = [excite_hover.step_signal(1, AMP, 0.5, start + 0.01 * i) for i in range(2000)]
-    assert all(v[0] == v[2] == 0.0 and abs(v[1]) == AMP for v in values)
-    assert excite_hover.step_signal(0, AMP, 0.5, start + 0.5)[0] == AMP
-    assert excite_hover.step_signal(0, AMP, 0.5, start + 1.5)[0] == -AMP
+    start, step_s, recover_s = excite_hover.EXC_START_S, 1.0, 4.0
+    sig = lambda axis, t: excite_hover.step_signal(axis, AMP, step_s, recover_s, start + t)
+    assert sig(0, -0.01) == ([0.0, 0.0, 0.0], True)
+    # one cycle at 100 Hz: REST, PUSH (hold off), then RECOVER (hold on)
+    cycle = [sig(1, 0.005 + 0.01 * i) for i in range(600)]
+    assert all(e[0] == e[2] == 0.0 for e, _ in cycle)
+    assert [e[1] for e, _ in cycle] == [0.0] * 100 + [AMP] * 100 + [0.0] * 400
+    assert [hold for _, hold in cycle] == [False] * 200 + [True] * 400
+    # every PUSH goes the way of amp's sign
+    assert sig(0, 6 + 1.5)[0][0] == sig(0, 12 + 1.5)[0][0] == AMP
+    assert excite_hover.step_signal(0, -AMP, step_s, recover_s, start + 1.5)[0][0] == -AMP
 
 
 def test_cli_refuses_flights_the_estimator_cannot_use(mod, tmp_path, monkeypatch):
@@ -98,10 +103,10 @@ def test_cli_refuses_flights_the_estimator_cannot_use(mod, tmp_path, monkeypatch
     monkeypatch.setattr(sys, "argv", ["excite_hover"] + ok)
     with pytest.raises(_StopBeforeFlight):
         mod.main()
-    assert (seen[0]["axis"], seen[0]["metadata"]["excitation"]) == (1, "step")
+    assert (seen[0]["axis"], seen[0]["metadata"]["excitation"]) == (1, "push_recover")
     assert seen[0]["metadata"]["cflib_version"] != "unknown"
-    for bad in ([], ok + ["--record-every", "2"], ok + ["--duration", "2"], ok + ["--exc-amp", "0.6"],
-                ok + ["--exc-freq", "0"]):
+    for bad in ([], ok + ["--record-every", "2"], ok + ["--duration", "2"], ok + ["--exc-amp", "1.1"],
+                ok + ["--exc-step", "0"], ok + ["--exc-recover", "-1"]):
         monkeypatch.setattr(sys, "argv", ["excite_hover"] + bad)
         with pytest.raises(SystemExit):
             mod.main()

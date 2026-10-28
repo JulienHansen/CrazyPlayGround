@@ -60,4 +60,6 @@ python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/
 
 ## Sim2real notes
 
+To measure the radio delay, step response and velocity noise of the real drone, see `execution/sim2real/README.md`.
+
 <!-- known gaps, bodyrate control validation status -->
