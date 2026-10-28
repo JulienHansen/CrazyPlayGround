@@ -15,6 +15,7 @@ from test_hover_scripts import FakeCf, POS, _StopBeforeFlight
 
 SIM2REAL = os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real")
 sys.path.append(SIM2REAL)
+import excitation  # noqa: E402
 import excite_hover  # noqa: E402
 import measure_delay_noise  # noqa: E402
 
@@ -50,12 +51,12 @@ def fly(mod, tmp_path, steps, target, duration=30.0, **cf_kwargs):
 
 def test_pure_step_on_excited_axis_and_hold_on_others(mod, tmp_path, monkeypatch):
     """During PUSH, the excited axis gets a pure step (hold=0) while unexcited axes stay held."""
-    monkeypatch.setattr(mod, "EXC_START_S", -1.0)  # 1 s into the cycle: PUSH at +AMP for 1 s
+    monkeypatch.setattr(excitation, "EXC_START_S", -1.0)  # 1 s into the cycle: PUSH at +AMP for 1 s
     target = [POS[0] + 0.1, POS[1], POS[2] + 1.0]  # z error saturates the hold at HOLD_MAX
     _, cf, rows, path = fly(mod, tmp_path, steps=20, target=target)
     assert rows["hold_vx"] == pytest.approx([0.0] * 20)
     assert rows["vx"] == pytest.approx([AMP] * 20)
-    assert rows["vy"] == pytest.approx([0.0] * 20) and rows["vz"] == pytest.approx([mod.HOLD_MAX] * 20)
+    assert rows["vy"] == pytest.approx([0.0] * 20) and rows["vz"] == pytest.approx([excitation.HOLD_MAX] * 20)
     assert rows["exc_vx"] == pytest.approx([AMP] * 20) and rows["exc_vy"] == rows["exc_vz"] == [0.0] * 20
     assert rows["echo_vx"] == pytest.approx([AMP] * 20) and rows["echo_vy"] == rows["echo_vz"] == [0.0] * 20
     sent = cf.calls_to("send_velocity_world_setpoint")
@@ -80,20 +81,6 @@ def test_lands_after_duration(mod, tmp_path):
     assert 15 <= len(rows["step"]) <= 25 and not flight.running
     # the hand-over follows the last step setpoint directly: no gap without a setpoint
     assert [m for m, _ in cf.sent[-3:]] == ["send_velocity_world_setpoint", "send_notify_setpoint_stop", "land"]
-
-
-def test_step_signal_shape():
-    start, step_s, recover_s = excite_hover.EXC_START_S, 1.0, 4.0
-    sig = lambda axis, t: excite_hover.step_signal(axis, AMP, step_s, recover_s, start + t)
-    assert sig(0, -0.01) == ([0.0, 0.0, 0.0], True)
-    # one cycle at 100 Hz: REST, PUSH (hold off), then RECOVER (hold on)
-    cycle = [sig(1, 0.005 + 0.01 * i) for i in range(600)]
-    assert all(e[0] == e[2] == 0.0 for e, _ in cycle)
-    assert [e[1] for e, _ in cycle] == [0.0] * 100 + [AMP] * 100 + [0.0] * 400
-    assert [hold for _, hold in cycle] == [False] * 200 + [True] * 400
-    # every PUSH goes the way of amp's sign
-    assert sig(0, 6 + 1.5)[0][0] == sig(0, 12 + 1.5)[0][0] == AMP
-    assert excite_hover.step_signal(0, -AMP, step_s, recover_s, start + 1.5)[0][0] == -AMP
 
 
 def test_cli_refuses_flights_the_estimator_cannot_use(mod, tmp_path, monkeypatch):
