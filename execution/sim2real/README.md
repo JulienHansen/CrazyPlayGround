@@ -45,3 +45,26 @@ python execution/sim2real/plot_step_response.py flights/excite_x.parquet [more.p
 - The drone moves ~amp × step + braking: ~0.3 m at 0.2 m/s, ~1.3 m at 1 m/s. The P hold returns at most 0.3 m/s, so use `--exc-recover 6` at 1 m/s.
 - `--duration 90` gives ~14 steps (1 per cycle of 2 × step + recover); fly longer or several flights for more.
 - Above ~0.5 m/s the response is acceleration-limited (a ramp at ~3.8 m/s²), not first order: measure `tau` at a small amplitude.
+
+## Simulated step response (WP7)
+
+`excite_hover_sim.py` flies the same excitation (same `excitation.py` signal, P hold and flags) on the Isaac Lab `Vel-Hovering` plant, with no policy. The step plus the P hold is the env action, tracked by the cascade PID at its velocity level like the firmware velocity PID. The recording has the real flight's columns, so the two tools above read both.
+
+```bash
+# On a machine with Isaac Lab (in Docker: /workspace/isaaclab/isaaclab.sh -p ... --headless)
+python execution/sim2real/excite_hover_sim.py --record-path flights/sim_excite_x.parquet \
+    --exc-axis x --exc-amp 0.2 --exc-step 1.0 --exc-recover 4 --duration 90 --headless \
+    [env.action_latency_steps=4 ...]
+python execution/sim2real/measure_delay_noise.py flights/excite_x.parquet flights/sim_excite_x.parquet
+python execution/sim2real/plot_step_response.py flights/excite_x.parquet flights/sim_excite_x.parquet --out flights/real_vs_sim_x.png
+```
+
+Trailing `env.*=value` arguments are Hydra overrides of the simulated plant, e.g. the line `measure_delay_noise.py` prints. `--target` is relative to the env origin; the drone starts at rest on it. The Parquet footer holds `source=sim`, the env knobs and the excitation.
+
+What the estimator measures in sim:
+
+- `d` / `radio ms` is `env.action_latency_steps` exactly: `echo_v*` is the setpoint the controller used, after the env's command delay. With the default 0 there is no radio delay.
+- `dead ms` is the simulated plant from that setpoint to 5 % of the step (cascade PID and rigid body; no motor dynamics), plus the one step of the row's state read, the same as on the drone. It does not depend on the latency.
+- `noise` is ~0: `vel_*` is the true sim state, `env.add_noise` only perturbs the policy observation.
+
+Compare against flights recorded with the current `excite_hover.py` and the same flags: older recordings used other cycles. Known plant gaps: no motor dynamics, no integral limit on the velocity PID, `thrust_base` 30000 against the real hover thrust.
