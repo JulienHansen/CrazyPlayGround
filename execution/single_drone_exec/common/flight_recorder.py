@@ -212,6 +212,7 @@ class CrazyflieStateBase:
     def __init__(self, device: torch.device):
         self.lock = threading.Lock()
         self.running = True
+        self.landing = False  # set by utils.land_once: the flight lands once
         self.position_received = False
         self._last_pos_time: float = 0.0
         self.current_pos = torch.zeros(3, dtype=torch.float32, device=device)

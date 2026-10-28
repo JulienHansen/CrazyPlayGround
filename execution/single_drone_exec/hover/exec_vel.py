@@ -19,7 +19,7 @@ from cflib.crazyflie.log import LogConfig
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.flight_recorder import CrazyflieStateBase
-from common.utils import (emergency_land, hand_over_and_land, quat_apply, quat_inv, wait_until,
+from common.utils import (emergency_land, land_once, quat_apply, quat_inv, wait_until,
                           add_run_args, positive_int, nonnegative_int)
 
 # skrl imports
@@ -306,7 +306,7 @@ class CrazyflieController(CrazyflieStateBase):
             self.record_step(step, state, control_time, target_pos, obs, action, velocity_cmd, extra)
             step += 1
 
-        self.cf.commander.send_stop_setpoint()
+        land_once(self)  # at once, never send_stop_setpoint: it cuts the motors mid-air
         logger.info("Control loop stopped")
 
     # ---------- Connection management ----------
@@ -321,7 +321,7 @@ class CrazyflieController(CrazyflieStateBase):
         try:
             time.sleep(0.6)
             logger.info("Landing...")
-            hand_over_and_land(self.cf)
+            land_once(self)  # no-op once the control loop has landed
             time.sleep(2.5)
             self.cf.close_link()
             logger.info("Link closed")
