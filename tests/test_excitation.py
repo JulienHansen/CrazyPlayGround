@@ -36,18 +36,20 @@ def test_step_signal_shape():
 
 
 def test_command_is_a_pure_step_on_the_excited_axis_and_a_clamped_hold_elsewhere():
-    err = torch.tensor([0.1, -0.05, 1.0])
-    hold, cmd = excitation.excitation_command(err, 0, [AMP, 0.0, 0.0], hold_on=False)
-    assert hold.tolist() == pytest.approx([0.0, -0.05, excitation.HOLD_MAX])
-    assert cmd.tolist() == pytest.approx([AMP, -0.05, excitation.HOLD_MAX])
-    hold, cmd = excitation.excitation_command(err, 0, [0.0, 0.0, 0.0], hold_on=True)
-    assert hold[0].item() == cmd[0].item() == pytest.approx(0.1)
-    _, cmd = excitation.excitation_command(torch.tensor([5.0, 0.0, 0.0]), 0, [1.0, 0.0, 0.0], hold_on=True)
-    assert cmd[0].item() == excitation.MAX_VEL
+    pos_error = torch.tensor([0.1, -0.05, 1.0])
+    hold_vel, setpoint_vel = excitation.excitation_command(pos_error, 0, [AMP, 0.0, 0.0], hold_on_exc_axis=False)
+    assert hold_vel.tolist() == pytest.approx([0.0, -0.05, excitation.HOLD_MAX])
+    assert setpoint_vel.tolist() == pytest.approx([AMP, -0.05, excitation.HOLD_MAX])
+    hold_vel, setpoint_vel = excitation.excitation_command(pos_error, 0, [0.0, 0.0, 0.0], hold_on_exc_axis=True)
+    assert hold_vel[0].item() == setpoint_vel[0].item() == pytest.approx(0.1)
+    _, setpoint_vel = excitation.excitation_command(torch.tensor([5.0, 0.0, 0.0]), 0, [1.0, 0.0, 0.0],
+                                                    hold_on_exc_axis=True)
+    assert setpoint_vel[0].item() == excitation.MAX_VEL
     # batched [N, 3], as the simulator's tensors are
-    hold, cmd = excitation.excitation_command(err.repeat(4, 1), 1, [0.0, -AMP, 0.0], hold_on=False)
-    assert hold.shape == cmd.shape == (4, 3)
-    assert (hold[:, 1] == 0).all() and torch.allclose(cmd[:, 1], torch.tensor(-AMP))
+    hold_vel, setpoint_vel = excitation.excitation_command(pos_error.repeat(4, 1), 1, [0.0, -AMP, 0.0],
+                                                           hold_on_exc_axis=False)
+    assert hold_vel.shape == setpoint_vel.shape == (4, 3)
+    assert (hold_vel[:, 1] == 0).all() and torch.allclose(setpoint_vel[:, 1], torch.tensor(-AMP))
 
 
 def parse(argv):
@@ -82,16 +84,16 @@ def simulated_flight(path, latency_steps, plant_dead_steps=2, tau=0.15, duration
     sent, rows = [], []
     for k in range(int(duration / DT)):
         t = k * DT
-        err = target - pos
-        exc, hold_on = excitation.step_signal(0, AMP, 1.0, 2.0, t)
-        hold, cmd = excitation.excitation_command(err, 0, exc, hold_on)
-        sent.append(cmd)
+        pos_error = target - pos
+        step_vel, hold_on_exc_axis = excitation.step_signal(0, AMP, 1.0, 2.0, t)
+        hold_vel, setpoint_vel = excitation.excitation_command(pos_error, 0, step_vel, hold_on_exc_axis)
+        sent.append(setpoint_vel)
         echo = sent[k - latency_steps] if k >= latency_steps else torch.zeros(3)
         applied = sent[k - latency_steps - plant_dead_steps] if k >= latency_steps + plant_dead_steps else torch.zeros(3)
         measured = vel + torch.from_numpy(1e-3 * rng.standard_normal(3)).float()
         rows.append(excitation.excitation_row(k, t, pos.tolist(), measured.tolist(), [1.0, 0.0, 0.0, 0.0],
-                                              target.tolist(), err.tolist(), hold.tolist(), cmd.tolist(),
-                                              exc, echo.tolist()))
+                                              target.tolist(), pos_error.tolist(), hold_vel.tolist(),
+                                              setpoint_vel.tolist(), step_vel, echo.tolist()))
         vel = a * vel + (1 - a) * applied
         pos = pos + vel * DT
     excitation.write_recording(str(path), rows, {"source": "sim", "action_latency_steps": latency_steps})
