@@ -107,14 +107,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         pos = (u._robot.data.root_pos_w[0] - origin).clone()
         vel = u._robot.data.root_lin_vel_w[0].tolist()
         quat = u._robot.data.root_quat_w[0].tolist()  # (w, x, y, z)
-        err = target - pos
-        exc, hold_on = step_signal(axis, args_cli.exc_amp, args_cli.exc_step, args_cli.exc_recover, t)
-        hold, cmd = excitation_command(err, axis, exc, hold_on)
+        pos_error = target - pos
+        step_vel, hold_on_exc_axis = step_signal(axis, args_cli.exc_amp, args_cli.exc_step, args_cli.exc_recover, t)
+        hold_vel, setpoint_vel = excitation_command(pos_error, axis, step_vel, hold_on_exc_axis)
         with torch.inference_mode():
-            _, _, terminated, truncated, _ = env.step((cmd / env_cfg.max_velocity).unsqueeze(0))
+            _, _, terminated, truncated, _ = env.step((setpoint_vel / env_cfg.max_velocity).unsqueeze(0))
         echo = u._ref_vel[0].tolist()  # the setpoint the cascade PID tracked during this step
-        rows.append(excitation_row(k, t, pos.tolist(), vel, quat, args_cli.target, err.tolist(),
-                                   hold.tolist(), cmd.tolist(), exc, echo))
+        rows.append(excitation_row(k, t, pos.tolist(), vel, quat, args_cli.target, pos_error.tolist(),
+                                   hold_vel.tolist(), setpoint_vel.tolist(), step_vel, echo))
         if terminated.any() or truncated.any():
             print(f"[WARN] Episode ended at step {k} (z={pos[2].item():.2f} m) — keeping the {len(rows)} rows so far")
             ended_at = k

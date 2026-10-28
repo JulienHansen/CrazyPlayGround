@@ -153,16 +153,16 @@ class ExciteHover(CrazyflieStateBase):
                 break
 
             state = self.snapshot()  # one consistent read, used for the command and its recorded row
-            err = target - state.pos
-            exc, hold_on = step_signal(self.axis, self.amp, self.step_s, self.recover_s, elapsed)
-            hold, cmd = excitation_command(err, self.axis, exc, hold_on)
+            pos_error = target - state.pos
+            step_vel, hold_on_exc_axis = step_signal(self.axis, self.amp, self.step_s, self.recover_s, elapsed)
+            hold_vel, setpoint_vel = excitation_command(pos_error, self.axis, step_vel, hold_on_exc_axis)
             control_time = time.time()
-            self.cf.commander.send_velocity_world_setpoint(*cmd.tolist(), 0.0)  # yaw_rate = 0
+            self.cf.commander.send_velocity_world_setpoint(*setpoint_vel.tolist(), 0.0)  # yaw_rate = 0
             t_sent = time.perf_counter()
 
             deadline, slept_ms, overran = wait_until(deadline + INTERVAL, SPIN_MARGIN)
-            self.record_step(step, state, control_time, target, err, hold, cmd,
-                             exc + echo + [(t_sent - t_body) * 1e3, slept_ms, overran])
+            self.record_step(step, state, control_time, target, pos_error, hold_vel, setpoint_vel,
+                             step_vel + echo + [(t_sent - t_body) * 1e3, slept_ms, overran])
             step += 1
 
         land_once(self)  # at once, never send_stop_setpoint: it cuts the motors mid-air
