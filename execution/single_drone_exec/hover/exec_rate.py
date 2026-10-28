@@ -17,7 +17,7 @@ from cflib.crazyflie.log import LogConfig
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.flight_recorder import CrazyflieStateBase
-from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, add_run_args)
+from common.utils import (emergency_land, land_once, quat_apply, quat_inv, wait_until, add_run_args)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -310,7 +310,7 @@ class CrazyflieController(CrazyflieStateBase):
 
             deadline, _, _ = wait_until(deadline + INTERVAL, SPIN_MARGIN)
 
-        self.cf.commander.send_stop_setpoint()
+        land_once(self)  # at once, never send_stop_setpoint: it cuts the motors mid-air
         logger.info("Control loop stopped")
 
     def start(self):
@@ -323,7 +323,7 @@ class CrazyflieController(CrazyflieStateBase):
         try:
             time.sleep(0.2)
             logger.info("Landing...")
-            self.cf.high_level_commander.land(0.0, 2.0)
+            land_once(self)  # no-op once the control loop has landed
             time.sleep(2.5)
             self.cf.close_link()
             logger.info("Link closed")

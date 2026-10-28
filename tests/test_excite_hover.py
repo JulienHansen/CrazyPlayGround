@@ -1,0 +1,114 @@
+"""excite_hover.py against the fake Crazyflie of test_hover_scripts: the real control loop,
+watchdog and recorder, with only the radio faked."""
+
+import argparse
+import os
+import sys
+import time
+import types
+
+import pyarrow.parquet as pq
+import pytest
+from cflib.crazyflie.log import LogConfig
+
+from test_hover_scripts import FakeCf, POS, _StopBeforeFlight
+
+SIM2REAL = os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real")
+sys.path.append(SIM2REAL)
+import excite_hover  # noqa: E402
+import measure_delay_noise  # noqa: E402
+
+AMP = 0.2
+
+
+@pytest.fixture
+def mod(monkeypatch):
+    fast_time = types.SimpleNamespace(time=time.time, perf_counter=time.perf_counter, sleep=lambda s: None)
+    monkeypatch.setattr(excite_hover, "time", fast_time)
+    monkeypatch.setattr(LogConfig, "start", lambda logconf: logconf.fake_cf.fire(logconf))
+    return excite_hover
+
+
+def fly(mod, tmp_path, steps, target, duration=30.0, **cf_kwargs):
+    cf = FakeCf(steps, **cf_kwargs)
+    orig_packet = cf.packet
+    cf.packet = lambda name: (
+        {"ctrltarget.vx": AMP, "ctrltarget.vy": 0.0, "ctrltarget.vz": 0.0}
+        if name == "ctrltarget" else orig_packet(name)
+    )
+    mod.Crazyflie = lambda **kwargs: cf
+    path = tmp_path / "flight.parquet"
+    flight = mod.ExciteHover(uri="fake", run_args=argparse.Namespace(record_path=str(path), record_every=1, log_every=100),
+                             axis=0, amp=AMP, step_s=1.0, recover_s=4.0, duration=duration, target=target)
+    flight._connected("fake")
+    assert cf.loop_done.wait(timeout=30), "control loop did not finish"
+    flight.stop()
+    assert cf.calls_to("send_stop_setpoint") == [], "a motor cut in flight drops the drone"
+    assert cf.calls_to("land") == [(0.0, 2.0)], "the flight lands exactly once"
+    return flight, cf, pq.read_table(path).to_pydict(), str(path)
+
+
+def test_pure_step_on_excited_axis_and_hold_on_others(mod, tmp_path, monkeypatch):
+    """During PUSH, the excited axis gets a pure step (hold=0) while unexcited axes stay held."""
+    monkeypatch.setattr(mod, "EXC_START_S", -1.0)  # 1 s into the cycle: PUSH at +AMP for 1 s
+    target = [POS[0] + 0.1, POS[1], POS[2] + 1.0]  # z error saturates the hold at HOLD_MAX
+    _, cf, rows, path = fly(mod, tmp_path, steps=20, target=target)
+    assert rows["hold_vx"] == pytest.approx([0.0] * 20)
+    assert rows["vx"] == pytest.approx([AMP] * 20)
+    assert rows["vy"] == pytest.approx([0.0] * 20) and rows["vz"] == pytest.approx([mod.HOLD_MAX] * 20)
+    assert rows["exc_vx"] == pytest.approx([AMP] * 20) and rows["exc_vy"] == rows["exc_vz"] == [0.0] * 20
+    assert rows["echo_vx"] == pytest.approx([AMP] * 20) and rows["echo_vy"] == rows["echo_vz"] == [0.0] * 20
+    sent = cf.calls_to("send_velocity_world_setpoint")
+    assert [list(s[:3]) for s in sent] == [pytest.approx(list(r)) for r in zip(rows["vx"], rows["vy"], rows["vz"])]
+    assert all(body >= 0.0 for body in rows["dt_body_ms"])
+    # the estimator reads this recording as it is: the column contract between the two
+    cols = measure_delay_noise.load(path)
+    assert cols["exc_vx"].any() and not cols["exc_vy"].any() and not cols["exc_vz"].any()
+    assert cols["echo_vx"].any()
+
+
+def test_out_of_bounds_position_lands_immediately(mod, tmp_path, caplog):
+    flight, cf, rows, _ = fly(mod, tmp_path, steps=50, target=None, pos=(0.0, 0.0, 3.0))
+    assert "EMERGENCY LANDING triggered" in caplog.messages
+    assert rows["step"] == [] and not flight.running
+    assert cf.calls_to("send_notify_setpoint_stop") == [()]
+    assert cf.calls_to("land") == [(0.0, 2.0)]
+
+
+def test_lands_after_duration(mod, tmp_path):
+    flight, cf, rows, _ = fly(mod, tmp_path, steps=1000, target=None, duration=0.2)
+    assert 15 <= len(rows["step"]) <= 25 and not flight.running
+    # the hand-over follows the last step setpoint directly: no gap without a setpoint
+    assert [m for m, _ in cf.sent[-3:]] == ["send_velocity_world_setpoint", "send_notify_setpoint_stop", "land"]
+
+
+def test_step_signal_shape():
+    start, step_s, recover_s = excite_hover.EXC_START_S, 1.0, 4.0
+    sig = lambda axis, t: excite_hover.step_signal(axis, AMP, step_s, recover_s, start + t)
+    assert sig(0, -0.01) == ([0.0, 0.0, 0.0], True)
+    # one cycle at 100 Hz: REST, PUSH (hold off), then RECOVER (hold on)
+    cycle = [sig(1, 0.005 + 0.01 * i) for i in range(600)]
+    assert all(e[0] == e[2] == 0.0 for e, _ in cycle)
+    assert [e[1] for e, _ in cycle] == [0.0] * 100 + [AMP] * 100 + [0.0] * 400
+    assert [hold for _, hold in cycle] == [False] * 200 + [True] * 400
+    # every PUSH goes the way of amp's sign
+    assert sig(0, 6 + 1.5)[0][0] == sig(0, 12 + 1.5)[0][0] == AMP
+    assert excite_hover.step_signal(0, -AMP, step_s, recover_s, start + 1.5)[0][0] == -AMP
+
+
+def test_cli_refuses_flights_the_estimator_cannot_use(mod, tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(mod, "ExciteHover", lambda **kw: seen.append(kw) or (_ for _ in ()).throw(_StopBeforeFlight()))
+    ok = ["--record-path", str(tmp_path / "f.parquet"), "--exc-axis", "y"]
+    monkeypatch.setattr(sys, "argv", ["excite_hover"] + ok)
+    with pytest.raises(_StopBeforeFlight):
+        mod.main()
+    assert (seen[0]["axis"], seen[0]["metadata"]["excitation"]) == (1, "push_recover")
+    assert seen[0]["metadata"]["cflib_version"] != "unknown"
+    for bad in ([], ok + ["--record-every", "2"], ok + ["--duration", "2"], ok + ["--exc-amp", "1.1"],
+                ok + ["--exc-step", "0"], ok + ["--exc-recover", "-1"]):
+        monkeypatch.setattr(sys, "argv", ["excite_hover"] + bad)
+        with pytest.raises(SystemExit):
+            mod.main()
+    assert len(seen) == 1
+
