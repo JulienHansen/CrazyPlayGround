@@ -30,7 +30,7 @@ from cflib.crazyflie.log import LogConfig
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "single_drone_exec"))
 from common.flight_recorder import CrazyflieStateBase  # noqa: E402
-from common.utils import emergency_land, hand_over_and_land, wait_until, add_run_args  # noqa: E402
+from common.utils import emergency_land, land_once, wait_until, add_run_args  # noqa: E402
 
 device = torch.device("cpu")  # no model: nothing to gain from a GPU
 logging.basicConfig(format="{asctime} [{levelname}] {message}", style="{",
@@ -180,7 +180,7 @@ class ExciteHover(CrazyflieStateBase):
                              exc + echo + [(t_sent - t_body) * 1e3, slept_ms, overran])
             step += 1
 
-        self.cf.commander.send_stop_setpoint()
+        land_once(self)  # at once, never send_stop_setpoint: it cuts the motors mid-air
         logger.info("Control loop stopped")
 
     def start(self):
@@ -193,7 +193,7 @@ class ExciteHover(CrazyflieStateBase):
         try:
             time.sleep(0.6)
             logger.info("Landing...")
-            hand_over_and_land(self.cf)
+            land_once(self)  # no-op once the control loop has landed
             time.sleep(2.5)
             self.cf.close_link()
         finally:

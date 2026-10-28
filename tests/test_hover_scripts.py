@@ -54,7 +54,7 @@ class _Commands:
     def __getattr__(self, name):
         def call(*args):
             self._cf.sent.append((name, args))
-            if name == "send_stop_setpoint":      # every control loop ends with it
+            if name == "land":                    # every control loop ends by landing
                 self._cf.loop_done.set()
         return call
 
@@ -149,6 +149,8 @@ def fly(mod, tmp_path, steps, record=True, log_every=100, controller_kwargs=None
         controller.stop()
     finally:
         rows = pq.read_table(path).to_pydict() if record and os.path.exists(path) else None
+    assert cf.calls_to("send_stop_setpoint") == [], "a motor cut in flight drops the drone"
+    assert cf.calls_to("land") == [(0.0, 2.0)], "the flight lands exactly once"
     return controller, cf, agent, rows
 
 
@@ -212,8 +214,8 @@ def test_out_of_bounds_position_lands_immediately(script, tmp_path, caplog):
     assert "EMERGENCY LANDING triggered" in caplog.messages
     assert rows["step"] == [] and agent.seen == []
     assert not controller.running
-    assert cf.calls_to("send_notify_setpoint_stop") == [(), ()]
-    assert cf.calls_to("land") == [(0.0, 2.0), (0.0, 2.0)]
+    assert cf.calls_to("send_notify_setpoint_stop") == [()]
+    assert cf.calls_to("land") == [(0.0, 2.0)]
 
 
 def test_stale_position_lands_after_timeout(script, tmp_path, caplog):
@@ -279,9 +281,11 @@ def test_exec_vel_records_telemetry_and_loop_timing(tmp_path, monkeypatch):
 
 
 def test_exec_vel_lands_after_duration(tmp_path, monkeypatch):
-    controller, _, _, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=1000,
+    controller, cf, _, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=1000,
                                  controller_kwargs=dict(duration=0.2))
     assert 15 <= len(rows["step"]) <= 25 and not controller.running
+    # the hand-over follows the last policy setpoint directly: no gap without a setpoint
+    assert [m for m, _ in cf.sent[-3:]] == ["send_velocity_world_setpoint", "send_notify_setpoint_stop", "land"]
 
 
 def test_exec_vel_missing_log_variable_leaves_nan(tmp_path, monkeypatch):
