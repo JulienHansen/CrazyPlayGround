@@ -19,8 +19,8 @@ from cflib.crazyflie.log import LogConfig
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.flight_recorder import CrazyflieStateBase
-from common.utils import (emergency_land, quat_apply, quat_inv, wait_until, add_run_args,
-                          positive_int, nonnegative_int)
+from common.utils import (emergency_land, hand_over_and_land, quat_apply, quat_inv, wait_until,
+                          add_run_args, positive_int, nonnegative_int)
 
 # skrl imports
 from skrl.models.torch import Model, GaussianMixin
@@ -321,7 +321,7 @@ class CrazyflieController(CrazyflieStateBase):
         try:
             time.sleep(0.6)
             logger.info("Landing...")
-            self.cf.high_level_commander.land(0.0, 2.0)
+            hand_over_and_land(self.cf)
             time.sleep(2.5)
             self.cf.close_link()
             logger.info("Link closed")

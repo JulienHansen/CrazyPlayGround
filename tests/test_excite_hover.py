@@ -66,14 +66,17 @@ def test_pure_step_on_excited_axis_and_hold_on_others(mod, tmp_path, monkeypatch
 
 
 def test_out_of_bounds_position_lands_immediately(mod, tmp_path, caplog):
-    flight, _, rows, _ = fly(mod, tmp_path, steps=50, target=None, pos=(0.0, 0.0, 3.0))
+    flight, cf, rows, _ = fly(mod, tmp_path, steps=50, target=None, pos=(0.0, 0.0, 3.0))
     assert "EMERGENCY LANDING triggered" in caplog.messages
     assert rows["step"] == [] and not flight.running
+    assert cf.calls_to("send_notify_setpoint_stop") == [(), ()]
+    assert cf.calls_to("land") == [(0.0, 2.0), (0.0, 2.0)]
 
 
 def test_lands_after_duration(mod, tmp_path):
-    flight, _, rows, _ = fly(mod, tmp_path, steps=1000, target=None, duration=0.2)
+    flight, cf, rows, _ = fly(mod, tmp_path, steps=1000, target=None, duration=0.2)
     assert 15 <= len(rows["step"]) <= 25 and not flight.running
+    assert cf.sent[-2:] == [("send_notify_setpoint_stop", ()), ("land", (0.0, 2.0))]
 
 
 def test_step_signal_shape():

@@ -189,6 +189,7 @@ def test_records_one_consistent_row_per_step(script, tmp_path, caplog):
     assert [m.split("]")[0] for m in status] == ["[step 0", "[step 100"]
     assert any(m.startswith(f"Cmd: {rec.cmd_fields[0]}=") for m in caplog.messages)
     assert rec.skipped == 0
+    assert cf.sent[-2:] == [("send_notify_setpoint_stop", ()), ("land", (0.0, 2.0))]
 
 
 def test_without_record_path_only_logs(script, tmp_path, caplog):
@@ -211,6 +212,8 @@ def test_out_of_bounds_position_lands_immediately(script, tmp_path, caplog):
     assert "EMERGENCY LANDING triggered" in caplog.messages
     assert rows["step"] == [] and agent.seen == []
     assert not controller.running
+    assert cf.calls_to("send_notify_setpoint_stop") == [(), ()]
+    assert cf.calls_to("land") == [(0.0, 2.0), (0.0, 2.0)]
 
 
 def test_stale_position_lands_after_timeout(script, tmp_path, caplog):

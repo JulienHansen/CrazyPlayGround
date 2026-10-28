@@ -7,12 +7,23 @@ from typing import Sequence, Tuple
 import torch
 
 
+def hand_over_and_land(cf, duration: float = 2.0) -> None:
+    """Hand control from the low-level setpoints to the high-level commander, and land.
+
+    Low-level setpoints outrank the high-level commander, so land() alone is ignored. The
+    notify expires the last low-level setpoint at once: until a high-level trajectory runs,
+    the firmware has no setpoint and cuts the motors. So land() must follow it immediately.
+    """
+    cf.commander.send_notify_setpoint_stop()
+    cf.high_level_commander.land(0.0, duration)
+
+
 def emergency_land(controller) -> None:
     logger = logging.getLogger("CrazyflieRL")
     logger.warning("EMERGENCY LANDING triggered")
     controller.running = False
     try:
-        controller.cf.high_level_commander.land(0.0, 2.0)
+        hand_over_and_land(controller.cf)
     except Exception as e:
         logger.error(f"Emergency land command failed: {e}")
         try:
