@@ -57,6 +57,12 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--eval_csv",
+    type=str,
+    default=None,
+    help="Evaluate instead of playing: fly one full episode per env and write its step metrics to this CSV.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -74,6 +80,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import csv
 import gymnasium as gym
 import os
 import random
@@ -220,6 +227,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    if args_cli.eval_csv:
+        evaluate(env, runner, obs, args_cli.eval_csv)
+        env.close()
+        return
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -249,6 +260,49 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # close the simulator
     env.close()
+
+
+def evaluate(env, runner, obs, csv_path: str):
+    """Fly one full-length episode per env with mean actions and write its step metrics to a CSV.
+
+    Needs an env that fills ``extras["step_metrics"]`` at reset (Vel-Hovering). The
+    spawn and goal draws follow ``--seed``, so two checkpoints evaluated with the same
+    seed and ``--num_envs`` fly the same episodes.
+    """
+    base_env = env.unwrapped
+    base_env.episode_length_buf[:] = 0  # undo the randomised first reset: every episode lasts the full time
+    rows = {}
+    for _ in range(base_env.max_episode_length):
+        with torch.inference_mode():
+            outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
+            obs, _, terminated, truncated, info = env.step(outputs[-1].get("mean_actions", outputs[0]))
+        if not (terminated | truncated).any():
+            continue
+        metrics = {k: v.cpu() for k, v in info["step_metrics"].items()}
+        # finished envs auto-reset into new random episodes: keep only each env's first one
+        for i, env_id in enumerate(metrics.pop("env_ids").tolist()):
+            if env_id in rows:
+                continue
+            rows[env_id] = {"env_id": env_id}
+            for key, value in metrics.items():
+                if value.ndim == 2:  # (E, 3) positions
+                    rows[env_id].update({f"{key}_{axis}": x for axis, x in zip("xyz", value[i].tolist())})
+                else:
+                    rows[env_id][key] = value[i].item()
+        if len(rows) == base_env.num_envs:
+            break
+
+    rows = [rows[i] for i in sorted(rows)]
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[INFO] Wrote {len(rows)} episodes to {csv_path}")
+    for key in rows[0]:
+        if key != "env_id" and not key.endswith(("_x", "_y", "_z")):
+            values = torch.tensor([float(r[key]) for r in rows])
+            print(f"  {key:>14}: mean {values.nanmean().item():.4f}  ({int(values.isnan().sum())} NaN)")
 
 
 if __name__ == "__main__":
