@@ -403,9 +403,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.extras["log"] = dict()
         self.extras["log"].update(extras)
         extras = dict()
-        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+        # tensors, not .item(): skrl logs only one-element tensors and silently drops floats
+        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids])
+        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
+        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal
         self.extras["log"].update(extras)
 
         self._robot.reset(env_ids)
