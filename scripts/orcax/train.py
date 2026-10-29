@@ -151,9 +151,24 @@ class FpvRecorder(gym.Wrapper):
         self._write()
         return out
 
+    def _to_h264(self):
+        """Re-encode OpenCV's MPEG-4 Part 2 output to H.264, which common players open."""
+        try:
+            import subprocess
+
+            import imageio_ffmpeg
+        except ImportError:
+            return
+        tmp = self._path + ".h264.mp4"
+        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-loglevel", "error", "-y", "-i", self._path, "-c:v", "libx264"]
+        cmd += ["-profile:v", "main", "-pix_fmt", "yuv420p", "-crf", "20", "-movflags", "+faststart", "-an", tmp]
+        if subprocess.run(cmd).returncode == 0:
+            os.replace(tmp, self._path)
+
     def close(self):
         if self._writer is not None:
             self._writer.release()
+            self._to_h264()
             print(f"[orcax] onboard video: {self._path} ({self._frames} frames)", flush=True)
             self._writer = None
         return self.env.close()
