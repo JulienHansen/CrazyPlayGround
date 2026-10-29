@@ -87,7 +87,9 @@ gives `+capture_reward` and a crash gives `crash_reward`.
 
 ### Termination
 
-- **Success:** distance < `capture_radius` (a collision).
+- **Success:** a contact sensor on the pursuer, filtered to the evader's bodies,
+  reports a contact force above `capture_contact_force` in any physics substep
+  (a collision).
 - **Crash:** the pursuer goes below `min_altitude`, above `max_altitude`, or
   outside `arena_radius`.
 - **Truncation:** time-out, or the evader leaving the arena.

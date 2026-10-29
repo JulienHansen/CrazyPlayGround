@@ -24,7 +24,8 @@ The actor never sees a ground-truth position. Its shaping reward is a
 *progress* term computed from the detections alone: the decrease of the range
 implied by the box size between two consecutive detections, plus a term that
 keeps the evader centred in the image. The episode ends with a success bonus
-when the two drones are closer than ``capture_radius`` (a collision).
+when a contact sensor on the pursuer reports a contact with the evader (a
+collision).
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
@@ -106,10 +108,8 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     """Pursuer yaw error w.r.t. the line of sight at spawn; keep < hfov/2 so the evader starts in view."""
 
     # Termination.
-    capture_radius = 0.05
-    """Centre distance counted as a capture. Measured in sim: a level head-on hit makes contact at
-    ~0.06-0.10 m centre distance, a slanted (from above/below) hit reaches ~0.04 m, so 0.05 m demands a
-    near-centred, slanted impact rather than any touch."""
+    capture_contact_force = 1.0e-3
+    """Pursuer-evader contact force (N) above which the evader counts as captured."""
     arena_radius = 10.0
     """The evader leaving this disc truncates the episode."""
     pursuer_arena_margin = 2.0
@@ -153,15 +153,32 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
         ),
         debug_vis=False,
     )
+    # clone_in_fabric=False: contact sensors resolve their envs on the USD stage, and Fabric clones
+    # are not there (the sensor would see 1 env and fail to initialise).
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=8.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=4096, env_spacing=8.0, replicate_physics=True, clone_in_fabric=False
     )
 
-    robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot: ArticulationCfg = CRAZYFLIE_CFG.replace(
+        prim_path="/World/envs/env_.*/Robot",
+        spawn=CRAZYFLIE_CFG.spawn.replace(activate_contact_sensors=True),
+    )
     # Offset default pose so the two drones never overlap before the first reset.
     evader: ArticulationCfg = CRAZYFLIE_CFG.replace(
         prim_path="/World/envs/env_.*/Evader",
         init_state=CRAZYFLIE_CFG.init_state.replace(pos=(1.0, 0.0, 0.5)),
+    )
+    # Capture sensor: contacts between a pursuer body and any evader body, over every physics
+    # substep of the last policy step (history_length = decimation). PhysX filters need exactly
+    # one filter match per sensor body, so the env clones this cfg once per pursuer body.
+    capture_bodies: tuple[str, ...] = ("body", "m1_prop", "m2_prop", "m3_prop", "m4_prop")
+    capture_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/body",
+        filter_prim_paths_expr=[
+            f"/World/envs/env_.*/Evader/{body}" for body in ("body", "m1_prop", "m2_prop", "m3_prop", "m4_prop")
+        ],
+        history_length=decimation,
+        update_period=0.0,
     )
 
 
@@ -250,6 +267,11 @@ class PursuitEvasionEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self._robot
         self._evader = Articulation(self.cfg.evader)
         self.scene.articulations["evader"] = self._evader
+        self._capture_sensors = []
+        for body in self.cfg.capture_bodies:
+            sensor = ContactSensor(self.cfg.capture_sensor.replace(prim_path=f"/World/envs/env_.*/Robot/{body}"))
+            self.scene.sensors[f"capture_{body}"] = sensor
+            self._capture_sensors.append(sensor)
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -431,7 +453,12 @@ class PursuitEvasionEnv(DirectRLEnv):
 
         distance = torch.linalg.norm(p_pos - e_pos, dim=-1)
         self._min_distance = torch.minimum(self._min_distance, distance)
-        self._captured = distance < self.cfg.capture_radius
+        # force_matrix_w_history: (num_envs, T, 1, evader bodies, 3), N, one sensor per pursuer body.
+        contact_force = torch.stack(
+            [sensor.data.force_matrix_w_history.norm(dim=-1).flatten(1).amax(dim=1) for sensor in self._capture_sensors],
+            dim=-1,
+        ).amax(dim=-1)
+        self._captured = contact_force > self.cfg.capture_contact_force
 
         p_alt = p_pos[:, 2] - origins[:, 2]
         p_xy = torch.linalg.norm(p_pos[:, :2] - origins[:, :2], dim=-1)
