@@ -28,7 +28,7 @@ parser.add_argument("--task", type=str, required=True, help="Name of the task.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed (defaults to the YAML seed).")
 parser.add_argument(
-    "--timesteps", type=int, default=None, help="Total transitions, summed over envs (play: default 1000 steps per env)."
+    "--timesteps", type=int, default=None, help="Training: total transitions, summed over envs. Play: env steps (default 1000)."
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="Log to W&B (team entity).")
 parser.add_argument("--play", type=str, default=None, metavar="CHECKPOINT", help="Replay a checkpoint instead of training.")
@@ -278,7 +278,7 @@ def main():
 
     trainer_cfg = TrainerCfg(
         timesteps=args_cli.timesteps
-        or (cfg["trainer"]["timesteps"] if training else (args_cli.video_length if (args_cli.video or args_cli.fpv) else 1000) * num_envs),
+        or (cfg["trainer"]["timesteps"] if training else (args_cli.video_length if (args_cli.video or args_cli.fpv) else 1000)),  # play: eval counts env steps
         headless=args_cli.headless,
         close_environment_at_exit=False,  # the simulation app is closed below
         info_log_key="log",  # env extras["log"]: episode rewards, capture rate, ...
