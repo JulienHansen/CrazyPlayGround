@@ -30,7 +30,8 @@ controller's output times random factors; the cascade PID still assumes nominal 
 the policy has to absorb the mismatch.
 
 Distance reward shape: ``"tanh"`` (default, almost flat near the goal) or ``"exp"``, a single
-exponential that is steeper near the goal.
+exponential that is steeper near the goal, or ``"multiexp"``, the mean of several exponentials
+(coarse pull from afar plus a fine peak near the goal).
 """
 
 from __future__ import annotations
@@ -143,11 +144,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # scale x the controller output (battery sag, worn props, build differences).
     thrust_scale_range: tuple[float, float] = (1.0, 1.0)
     torque_scale_range: tuple[float, float] = (1.0, 1.0)
-    # distance-to-goal reward shape; both are 1 at the goal, so the term's weight keeps its meaning:
+    # distance-to-goal reward shape; all are 1 at the goal, so the term's weight keeps its meaning:
     # "tanh" = 1 - tanh(d / 0.8), almost flat near the goal (94 % of max at 5 cm);
     # "exp"  = exp(-d / distance_reward_length), steeper near the goal (slope 1 / length at d = 0)
+    # "multiexp" = mean_k exp(-d / (distance_reward_length * scale_k)), coarse + fine
     distance_reward_shape: str = "tanh"
-    distance_reward_length: float = 0.3  # metres, "exp" only: the reward is 1/e (37 %) at this distance
+    distance_reward_length: float = 0.3  # metres, "exp"/"multiexp": the reward is 1/e (37 %) at this distance
+    distance_reward_scales: tuple[float, ...] = (1.0, 0.1)  # "multiexp" only: multipliers of the length
 
 
 def check_cfg(cfg: QuadcopterEnvCfg):
@@ -170,10 +173,14 @@ def check_cfg(cfg: QuadcopterEnvCfg):
         (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
         (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
         (
-            cfg.distance_reward_shape in ("tanh", "exp"),
-            f"distance_reward_shape must be 'tanh' or 'exp', got {cfg.distance_reward_shape!r}",
+            cfg.distance_reward_shape in ("tanh", "exp", "multiexp"),
+            f"distance_reward_shape must be 'tanh', 'exp' or 'multiexp', got {cfg.distance_reward_shape!r}",
         ),
         (cfg.distance_reward_length > 0.0, f"distance_reward_length must be > 0, got {cfg.distance_reward_length}"),
+        (
+            len(cfg.distance_reward_scales) > 0 and all(s > 0.0 for s in cfg.distance_reward_scales),
+            f"distance_reward_scales must be non-empty and all > 0, got {cfg.distance_reward_scales}",
+        ),
     ]
     for ok, msg in checks:
         if not ok:
@@ -371,6 +378,9 @@ class QuadcopterEnv(DirectRLEnv):
         """Distance-to-goal reward in [0, 1], 1 at the goal; shape set by distance_reward_shape."""
         if self.cfg.distance_reward_shape == "exp":
             return torch.exp(-distance / self.cfg.distance_reward_length)
+        if self.cfg.distance_reward_shape == "multiexp":
+            scales = torch.tensor(self.cfg.distance_reward_scales, device=distance.device)
+            return torch.exp(-distance[:, None] / (self.cfg.distance_reward_length * scales)).mean(1)
         return 1 - torch.tanh(distance / 0.8)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:

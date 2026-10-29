@@ -81,6 +81,8 @@ def step_terms(env, cmd):
         {"torque_scale_range": (1.2, 1.1)},
         {"distance_reward_shape": "gauss"},
         {"distance_reward_length": 0.0},
+        {"distance_reward_shape": "multiexp", "distance_reward_scales": ()},
+        {"distance_reward_shape": "multiexp", "distance_reward_scales": (1.0, 0.0)},
     ],
 )
 def test_invalid_knobs_raise(knobs):
@@ -352,7 +354,7 @@ def test_thrust_torque_scaling():
         env.close()
 
 
-@pytest.mark.parametrize("shape", ["tanh", "exp"])
+@pytest.mark.parametrize("shape", ["tanh", "exp", "multiexp"])
 def test_reward_terms(shape):
     length = 0.2                                    # not the default, so a hard-coded 0.3 would fail
     env = make_env(distance_reward_shape=shape, distance_reward_length=length, action_rate_reward_scale=-0.5)
@@ -366,11 +368,15 @@ def test_reward_terms(shape):
             torch.testing.assert_close(reward, sum(terms.values()))
             # each term recomputed from the sim state (no env reset in between, so same state)
             d = torch.linalg.norm(env._desired_pos_w - data.root_pos_w, dim=1)
-            mapped = 1 - torch.tanh(d / 0.8) if shape == "tanh" else torch.exp(-d / length)
+            mapped = {
+                "tanh": 1 - torch.tanh(d / 0.8),
+                "exp": torch.exp(-d / length),
+                "multiexp": torch.stack([torch.exp(-d / (length * s)) for s in cfg.distance_reward_scales]).mean(0),
+            }[shape]
             torch.testing.assert_close(terms["distance_to_goal"], mapped * cfg.distance_to_goal_reward_scale * dt)
             torch.testing.assert_close(terms["lin_vel"], data.root_lin_vel_b.square().sum(1) * cfg.lin_vel_reward_scale * dt)
             torch.testing.assert_close(terms["ang_vel"], data.root_ang_vel_b.square().sum(1) * cfg.ang_vel_reward_scale * dt)
-        # both shapes are 1 at the goal: same maximum, only the slope around it differs
+        # all shapes are 1 at the goal: same maximum, only the slope around it differs
         zero = torch.zeros(1, device=env.device)
         torch.testing.assert_close(env._distance_reward(zero), torch.ones(1, device=env.device))
     finally:
