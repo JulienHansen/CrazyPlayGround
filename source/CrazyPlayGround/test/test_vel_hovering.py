@@ -83,6 +83,9 @@ def step_terms(env, cmd):
         {"distance_reward_length": 0.0},
         {"distance_reward_shape": "multiexp", "distance_reward_scales": ()},
         {"distance_reward_shape": "multiexp", "distance_reward_scales": (1.0, 0.0)},
+        {"distance_reward_curriculum_steps": -1},
+        {"distance_reward_curriculum_steps": 100, "distance_reward_length_min": 0.0},
+        {"distance_reward_curriculum_steps": 100, "distance_reward_length": 0.2, "distance_reward_length_min": 0.3},
     ],
 )
 def test_invalid_knobs_raise(knobs):
@@ -379,6 +382,23 @@ def test_reward_terms(shape):
         # all shapes are 1 at the goal: same maximum, only the slope around it differs
         zero = torch.zeros(1, device=env.device)
         torch.testing.assert_close(env._distance_reward(zero), torch.ones(1, device=env.device))
+    finally:
+        env.close()
+
+
+def test_distance_curriculum_decays_exponentially():
+    steps, length, length_min = 100, 0.8, 0.05
+    env = make_env(
+        distance_reward_curriculum_steps=steps, distance_reward_length=length, distance_reward_length_min=length_min
+    )
+    try:
+        # start, halfway (geometric mean, not the arithmetic one), end, and held after the end
+        for counter, expected in [(0, length), (steps // 2, (length * length_min) ** 0.5), (steps, length_min), (3 * steps, length_min)]:
+            env.common_step_counter = counter
+            assert env._distance_reward_length() == pytest.approx(expected)
+        # the reward uses the scheduled L: at d = L the tanh reward is 1 - tanh(1)
+        d = torch.full((1,), length_min, device=env.device)
+        torch.testing.assert_close(env._distance_reward(d), 1 - torch.tanh(torch.ones(1, device=env.device)))
     finally:
         env.close()
 
