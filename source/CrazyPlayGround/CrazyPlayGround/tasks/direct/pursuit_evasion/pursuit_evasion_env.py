@@ -12,16 +12,17 @@ Critic state (privileged, 26-D), positions relative to the env origin:
      quat_w pursuer(4), quat_w evader(4),
      ang_vel_b pursuer(3), ang_vel_b evader(3)]
 
-Actor observation (19-D). Only what an IMU and the camera can estimate: no world yaw
+Actor observation (19-D), with sensor noise (see the IMU and detector error models in the
+config). Only what an IMU and the camera can estimate: no world yaw
 (not observable without a magnetometer), no position, no knowledge of the evader's state:
 
     [gravity_b(3)          gravity direction in the body frame (IMU attitude filter: roll, pitch)
      ang_vel_b(3)          pursuer body rates (gyro), rad/s, times ``ang_vel_obs_scale``
-     visible, u, v, size   ideal camera detection of the evader (see ``detection.py``)
+     visible, u, v, size   camera detection of the evader (see ``detection.py``)
      los_h(3)              line of sight to the box centre in the heading frame (level, yawing with
                            the drone): camera bearing from (u, v) rotated by roll and pitch only;
                            0 when not visible
-     expansion(1)          box log-growth since the previous detection, scaled to [-1, 1] (a 1/TTC cue)
+     expansion(1)          growth of the filtered box log-size, scaled to [-1, 1] (a 1/TTC cue)
      time_since_seen(1)    seconds since the last detection, saturated at 1 s
      last action(4)]
 
@@ -53,7 +54,7 @@ from isaaclab.sensors import Camera, CameraCfg, ContactSensor, ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_from_euler_xyz, yaw_quat
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_from_euler_xyz, quat_mul, yaw_quat
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
 
@@ -101,7 +102,21 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     """Fixed input scaling of the body rates (Orcax PPO has no observation normaliser)."""
 
     # Camera and detector on the pursuer.
-    detector: DetectorCfg = DetectorCfg()
+    detector: DetectorCfg = DetectorCfg(pixel_noise_std=0.01, size_noise_rel_std=0.05, miss_prob=0.05)
+    """Camera detector. Default error model: ~3 px centre jitter, 5 % box-size noise, 5 % missed frames."""
+
+    # IMU error model (applied to the policy inputs only; the rate controller uses the true state).
+    attitude_noise_std_deg = 1.0
+    """White noise on the roll / pitch estimate, per step."""
+    attitude_bias_max_deg = 2.0
+    """Per-episode roll / pitch estimate bias, uniform in [-max, max] (estimator misalignment)."""
+    gyro_noise_std = 0.05
+    """White noise on the body rates, rad/s, per step."""
+    gyro_bias_max = 0.02
+    """Per-episode gyro bias per axis, uniform in [-max, max], rad/s."""
+    size_filter_alpha = 0.3
+    """Exponential filter on the box log-size used for the expansion (TTC) cue and the progress reward:
+    a per-frame difference of noisy box sizes would bury the growth signal in noise."""
 
     # Evader scripted policy.
     evader_speed_range: tuple[float, float] = (0.0, 0.6)
@@ -297,8 +312,11 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._detector = Detector(self.cfg.detector, self.device)
         self._gravity_w = torch.tensor([0.0, 0.0, -1.0], device=self.device).repeat(n, 1)
         self._det: dict[str, torch.Tensor] = {}
-        self._prev_visible = torch.zeros(n, device=self.device)
-        self._prev_log_size = torch.zeros(n, device=self.device)
+        self._log_size_f = torch.zeros(n, device=self.device)
+        """Filtered box log-size (held through missed frames)."""
+        self._log_size_valid = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self._attitude_bias = torch.zeros(n, 2, device=self.device)
+        self._gyro_bias = torch.zeros(n, 3, device=self.device)
         self._log_growth = torch.zeros(n, device=self.device)
         """Box log-growth over the last step, 0 unless the evader was detected at both ends."""
         self._target_radius = torch.full((n,), self.cfg.detector.target_radius, device=self.device)
@@ -477,16 +495,22 @@ class PursuitEvasionEnv(DirectRLEnv):
         p, e = self._robot.data, self._evader.data
 
         # IMU-observable attitude only: gravity in the body frame (roll, pitch), never the world yaw.
-        gravity_b = quat_apply_inverse(p.root_quat_w, self._gravity_w)
+        # Estimated attitude = true attitude with a roll / pitch error (episode bias + white noise).
+        att_err = self._attitude_bias + torch.randn_like(self._attitude_bias) * math.radians(
+            self.cfg.attitude_noise_std_deg
+        )
+        quat_est = quat_mul(p.root_quat_w, quat_from_euler_xyz(att_err[:, 0], att_err[:, 1], torch.zeros_like(att_err[:, 0])))
+        gyro = p.root_ang_vel_b + self._gyro_bias + torch.randn_like(self._gyro_bias) * self.cfg.gyro_noise_std
+        gravity_b = quat_apply_inverse(quat_est, self._gravity_w)
         # Line of sight from the detection (u, v), rotated into the heading frame with roll and pitch:
         # world frame, then the yaw removed again, so the result does not depend on the world yaw.
-        los_w = quat_apply(p.root_quat_w, self._detector.bearing_b(det["u"], det["v"]))
-        los_h = quat_apply_inverse(yaw_quat(p.root_quat_w), los_w) * det["visible"].unsqueeze(-1)
+        los_w = quat_apply(quat_est, self._detector.bearing_b(det["u"], det["v"]))
+        los_h = quat_apply_inverse(yaw_quat(quat_est), los_w) * det["visible"].unsqueeze(-1)
 
         obs = torch.cat(
             [
                 gravity_b,
-                p.root_ang_vel_b * self.cfg.ang_vel_obs_scale,
+                gyro * self.cfg.ang_vel_obs_scale,
                 torch.stack([det["visible"], det["u"], det["v"], det["size"]], dim=-1),
                 los_h,
                 (self._log_growth / self.cfg.max_log_growth_per_step).clamp(-1.0, 1.0).unsqueeze(-1),
@@ -548,12 +572,20 @@ class PursuitEvasionEnv(DirectRLEnv):
         det = self._det
         visible = det["visible"]
 
-        # Time-to-contact progress from detections only: box log-growth since the previous detection.
+        # Time-to-contact progress from detections only: growth of the filtered box log-size.
         # log(s_t / s_{t-1}) = log(d_{t-1} / d_t) for small angles, whatever the (unknown) target size.
+        seen = visible > 0
         log_size = torch.log(det["size"].clamp_min(1e-6))
-        both_seen = visible * self._prev_visible
+        a = self.cfg.size_filter_alpha
+        log_size_f = torch.where(
+            seen,
+            torch.where(self._log_size_valid, self._log_size_f + a * (log_size - self._log_size_f), log_size),
+            self._log_size_f,
+        )
         max_growth = self.cfg.max_log_growth_per_step
-        self._log_growth = (log_size - self._prev_log_size).clamp(-max_growth, max_growth) * both_seen
+        self._log_growth = (log_size_f - self._log_size_f).clamp(-max_growth, max_growth) * (
+            seen & self._log_size_valid
+        ).float()
         progress = self._log_growth
         centering = visible * (1.0 - 0.5 * (det["u"].square() + det["v"].square()))
         lost = 1.0 - visible
@@ -575,8 +607,8 @@ class PursuitEvasionEnv(DirectRLEnv):
             self._episode_sums[key] += value
 
         # Update the detection memory.
-        self._prev_log_size = torch.where(visible > 0, log_size, self._prev_log_size)
-        self._prev_visible = visible
+        self._log_size_f = log_size_f
+        self._log_size_valid |= seen
         self._time_since_seen = torch.where(visible > 0, torch.zeros_like(self._time_since_seen), self._time_since_seen + dt)
         self._episode_visible_steps += visible
         self._episode_steps += 1.0
@@ -663,8 +695,11 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._evader_ctrl.reset(env_ids)
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
-        self._prev_visible[env_ids] = 0.0
-        self._prev_log_size[env_ids] = 0.0
+        self._log_size_f[env_ids] = 0.0
+        self._log_size_valid[env_ids] = False
+        att_bias = math.radians(self.cfg.attitude_bias_max_deg)
+        self._attitude_bias[env_ids] = uniform(-att_bias, att_bias, k, 2)
+        self._gyro_bias[env_ids] = uniform(-self.cfg.gyro_bias_max, self.cfg.gyro_bias_max, k, 3)
         self._log_growth[env_ids] = 0.0
         self._target_radius[env_ids] = uniform(*self.cfg.target_radius_range, k)
         self._time_since_seen[env_ids] = 0.0

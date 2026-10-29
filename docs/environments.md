@@ -69,8 +69,15 @@ about the evader's state:
 The camera looks along body +x. `detection.py` projects the evader through a
 pinhole model (`hfov_deg`, `vfov_deg`, `max_range`) and returns the
 normalised box centre `u` (right) and `v` (up), and the box width `size`. The
-default detector is ideal. `pixel_noise_std`, `size_noise_rel_std` and
-`miss_prob` make it imperfect without changing the layout.
+default detector is noisy: `pixel_noise_std` = 0.01 (about 3 px of centre
+jitter), `size_noise_rel_std` = 0.05 and `miss_prob` = 0.05. Set them to 0
+for an ideal detector.
+
+The IMU inputs are noisy too: the roll/pitch estimate has a per-episode bias
+(up to `attitude_bias_max_deg`) plus white noise (`attitude_noise_std_deg`),
+and the gyro has a per-episode bias (`gyro_bias_max`) plus white noise
+(`gyro_noise_std`). The noise is on the policy inputs only; the rate
+controller and the critic use the true state.
 
 The critic gets a privileged 26-D `"critic"` state:
 
@@ -85,8 +92,9 @@ The shaping uses only what the camera reports, never the true distance. The
 target size is unknown: the detector's target radius is resampled every
 episode in `target_radius_range`, so the box size alone does not give a range.
 
-- **progress** (time-to-contact): the box log-growth between two consecutive
-  detections, `log(size_t / size_{t-1})`. For small angles this equals
+- **progress** (time-to-contact): the growth of the box log-size, filtered with
+  an exponential filter (`size_filter_alpha`, held through missed frames),
+  `log(size_t / size_{t-1})`. For small angles this equals
   `log(d_{t-1} / d_t)`, so it needs no target size. Its rate is the inverse
   time-to-contact. It is clipped to `max_log_growth_per_step`.
 - **centering**: `1 - (u² + v²) / 2` while the evader is visible.
