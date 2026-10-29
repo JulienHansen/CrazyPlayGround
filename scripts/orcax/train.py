@@ -296,6 +296,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        # Always close Isaac Sim: an exception left open makes the process hang instead of exiting.
+        simulation_app.close()
     sys.exit(0)

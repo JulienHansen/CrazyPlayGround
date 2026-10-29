@@ -195,13 +195,12 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     See :func:`make_fpv_camera_cfg`. Needs ``--enable_cameras``."""
 
 
-def make_fpv_camera_cfg(detector: DetectorCfg, width: int = 640, env_index: int = 0) -> CameraCfg:
+def make_fpv_camera_cfg(detector: DetectorCfg, width: int = 640) -> CameraCfg:
     """Rendered camera matching the detector: on the pursuer body, along body +x, same FOV.
 
     Args:
         detector: Detector whose ``hfov_deg`` / ``vfov_deg`` the camera reproduces.
         width: Image width in pixels; the height follows from the FOV ratio.
-        env_index: Env whose pursuer carries the camera.
 
     Returns:
         Camera config to assign to ``PursuitEvasionEnvCfg.fpv_camera``.
@@ -211,7 +210,9 @@ def make_fpv_camera_cfg(detector: DetectorCfg, width: int = 640, env_index: int 
     v_aperture = 2.0 * focal_length * math.tan(math.radians(detector.vfov_deg) / 2.0)
     height = int(round(width * v_aperture / h_aperture / 2.0)) * 2
     return CameraCfg(
-        prim_path=f"/World/envs/env_{env_index}/Robot/body/fpv_camera",
+        # On every env's pursuer: the scene resets sensors with all env ids, so a single-env
+        # camera would be indexed out of bounds. Keep num_envs small when rendering it.
+        prim_path="/World/envs/env_.*/Robot/body/fpv_camera",
         offset=CameraCfg.OffsetCfg(pos=(0.03, 0.0, 0.01), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
         data_types=["rgb"],
         width=width,
