@@ -356,7 +356,7 @@ def test_thrust_torque_scaling():
 
 @pytest.mark.parametrize("shape", ["tanh", "exp", "multiexp"])
 def test_reward_terms(shape):
-    length = 0.2                                    # not the default, so a hard-coded 0.3 would fail
+    length = 0.2                                    # not the default, so a hard-coded 0.3 or 0.8 would fail
     env = make_env(distance_reward_shape=shape, distance_reward_length=length, action_rate_reward_scale=-0.5)
     try:
         env.reset()
@@ -369,7 +369,7 @@ def test_reward_terms(shape):
             # each term recomputed from the sim state (no env reset in between, so same state)
             d = torch.linalg.norm(env._desired_pos_w - data.root_pos_w, dim=1)
             mapped = {
-                "tanh": 1 - torch.tanh(d / 0.8),
+                "tanh": 1 - torch.tanh(d / length),
                 "exp": torch.exp(-d / length),
                 "multiexp": torch.stack([torch.exp(-d / (length * s)) for s in cfg.distance_reward_scales]).mean(0),
             }[shape]
