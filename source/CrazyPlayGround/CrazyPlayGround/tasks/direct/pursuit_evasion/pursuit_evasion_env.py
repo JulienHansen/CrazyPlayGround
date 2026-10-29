@@ -70,7 +70,7 @@ _EVADER_CIRCLE = 1
 
 @configclass
 class PursuitEvasionEnvCfg(DirectRLEnvCfg):
-    episode_length_s = 15.0
+    episode_length_s = 20.0
     decimation = 5
 
     control_mode: str = "attitude"
@@ -102,8 +102,11 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     """Fixed input scaling of the body rates (Orcax PPO has no observation normaliser)."""
 
     # Camera and detector on the pursuer.
-    detector: DetectorCfg = DetectorCfg(pixel_noise_std=0.01, size_noise_rel_std=0.05, miss_prob=0.05)
-    """Camera detector. Default error model: ~3 px centre jitter, 5 % box-size noise, 5 % missed frames."""
+    detector: DetectorCfg = DetectorCfg(
+        max_range=25.0, pixel_noise_std=0.03, size_noise_rel_std=0.15, miss_prob=0.15, miss_prob_far=0.5
+    )
+    """Camera detector. Default error model: ~10 px centre jitter, 15 % box-size noise, missed frames
+    from 15 % up close to 50 % at the 25 m maximum range."""
 
     # IMU error model (applied to the policy inputs only; the rate controller uses the true state).
     attitude_noise_std_deg = 1.0
@@ -129,14 +132,14 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     evader_altitude_range: tuple[float, float] = (0.7, 2.5)
 
     # Spawn.
-    initial_distance_range: tuple[float, float] = (1.5, 3.0)
+    initial_distance_range: tuple[float, float] = (10.0, 20.0)
     initial_heading_noise = 30.0 * math.pi / 180.0
     """Pursuer yaw error w.r.t. the line of sight at spawn; keep < hfov/2 so the evader starts in view."""
 
     # Termination.
     capture_contact_force = 1.0e-3
     """Pursuer-evader contact force (N) above which the evader counts as captured."""
-    arena_radius = 10.0
+    arena_radius = 30.0
     """The evader leaving this disc truncates the episode."""
     pursuer_arena_margin = 2.0
     """The pursuer crashes only beyond ``arena_radius + pursuer_arena_margin``, so chasing near the edge is not punished."""
@@ -185,7 +188,7 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     # clone_in_fabric=False: contact sensors resolve their envs on the USD stage, and Fabric clones
     # are not there (the sensor would see 1 env and fail to initialise).
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=8.0, replicate_physics=True, clone_in_fabric=False
+        num_envs=4096, env_spacing=50.0, replicate_physics=True, clone_in_fabric=False
     )
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(

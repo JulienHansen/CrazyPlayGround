@@ -32,6 +32,9 @@ parser.add_argument(
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="Log to W&B (team entity).")
 parser.add_argument("--play", type=str, default=None, metavar="CHECKPOINT", help="Replay a checkpoint instead of training.")
+parser.add_argument(
+    "--init_from", type=str, default=None, metavar="CHECKPOINT", help="Start training from these weights. Needs the same obs/action layout and the same --num_envs as the run that saved them (with a different env count the first step hangs)."
+)
 parser.add_argument("--video", action="store_true", default=False, help="With --play: record a video of env 0.")
 parser.add_argument("--video_length", type=int, default=1500, help="Video length in policy steps.")
 parser.add_argument(
@@ -300,6 +303,10 @@ def main():
     )
     trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agent=agent)
 
+    if training and args_cli.init_from:
+        # A SequentialTrainer keeps a loaded agent's state (it does not re-initialise it).
+        agent.load(args_cli.init_from)
+        print(f"[orcax] initialised from {args_cli.init_from}")
     if training:
         print(f"[orcax] {args_cli.task}: {num_envs} envs, {trainer_cfg.timesteps} transitions, logs in {exp['directory']}")
         trainer.train()

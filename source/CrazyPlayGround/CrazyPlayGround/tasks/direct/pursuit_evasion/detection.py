@@ -48,7 +48,10 @@ class DetectorCfg:
     size_noise_rel_std: float = 0.0
     """Relative std of the multiplicative noise on the apparent size."""
     miss_prob: float = 0.0
-    """Probability that a target inside the field of view is not detected at a given step."""
+    """Probability that a target inside the field of view is not detected at a given step (at range 0)."""
+    miss_prob_far: float | None = None
+    """Miss probability at ``max_range``; it grows linearly with range from ``miss_prob``
+    (small, distant boxes are the ones a real detector drops). ``None``: constant ``miss_prob``."""
 
 
 class Detector:
@@ -121,8 +124,11 @@ class Detector:
             v = v + torch.randn_like(v) * self.cfg.pixel_noise_std
         if self.cfg.size_noise_rel_std > 0.0:
             size = size * (1.0 + torch.randn_like(size) * self.cfg.size_noise_rel_std).clamp_min(0.1)
-        if self.cfg.miss_prob > 0.0:
-            visible = visible & (torch.rand_like(u) >= self.cfg.miss_prob)
+        miss_far = self.cfg.miss_prob if self.cfg.miss_prob_far is None else self.cfg.miss_prob_far
+        if self.cfg.miss_prob > 0.0 or miss_far > 0.0:
+            frac = (dist / self.cfg.max_range).clamp(0.0, 1.0)
+            p_miss = self.cfg.miss_prob + (miss_far - self.cfg.miss_prob) * frac
+            visible = visible & (torch.rand_like(u) >= p_miss)
 
         vis_f = visible.float()
         return {

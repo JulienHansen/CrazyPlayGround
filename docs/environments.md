@@ -69,9 +69,11 @@ about the evader's state:
 The camera looks along body +x. `detection.py` projects the evader through a
 pinhole model (`hfov_deg`, `vfov_deg`, `max_range`) and returns the
 normalised box centre `u` (right) and `v` (up), and the box width `size`. The
-default detector is noisy: `pixel_noise_std` = 0.01 (about 3 px of centre
-jitter), `size_noise_rel_std` = 0.05 and `miss_prob` = 0.05. Set them to 0
-for an ideal detector.
+default detector is noisy: `pixel_noise_std` = 0.03 (about 10 px of centre
+jitter), `size_noise_rel_std` = 0.15, and missed frames from `miss_prob` = 0.15
+up close to `miss_prob_far` = 0.5 at the 25 m `max_range`. Set them to 0 for an
+ideal detector. The pursuer spawns 10 to 20 m from the evader, in a 30 m
+arena, with 20 s episodes.
 
 The IMU inputs are noisy too: the roll/pitch estimate has a per-episode bias
 (up to `attitude_bias_max_deg`) plus white noise (`attitude_noise_std_deg`),
