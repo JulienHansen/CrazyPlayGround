@@ -136,6 +136,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {}).setdefault("config", {})[
         "num_envs"
     ] = env_cfg.scene.num_envs
+    # skrl's writer isn't torch's, so tensorboard sync uploads nothing; it only makes
+    # W&B ignore the step= that wandb_tb_patch passes, leaving _step a log-call counter
+    agent_cfg["agent"]["experiment"]["wandb_kwargs"].setdefault("sync_tensorboard", False)
 
     # multi-gpu training config
     if args_cli.distributed:
