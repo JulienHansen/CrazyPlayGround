@@ -106,8 +106,10 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     """Pursuer yaw error w.r.t. the line of sight at spawn; keep < hfov/2 so the evader starts in view."""
 
     # Termination.
-    capture_radius = 0.15
-    """Centre distance counted as a collision; side-on contact of two Crazyflies is ~0.11-0.14 m."""
+    capture_radius = 0.05
+    """Centre distance counted as a capture. Measured in sim: a level head-on hit makes contact at
+    ~0.06-0.10 m centre distance, a slanted (from above/below) hit reaches ~0.04 m, so 0.05 m demands a
+    near-centred, slanted impact rather than any touch."""
     arena_radius = 10.0
     """The evader leaving this disc truncates the episode."""
     pursuer_arena_margin = 2.0
