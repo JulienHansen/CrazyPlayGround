@@ -12,18 +12,22 @@ Critic state (privileged, 26-D), positions relative to the env origin:
      quat_w pursuer(4), quat_w evader(4),
      ang_vel_b pursuer(3), ang_vel_b evader(3)]
 
-Actor observation (16-D):
+Actor observation (17-D):
 
     [q_pursuer_evader(4)   orientation of the evader in the pursuer frame, w >= 0
      ang_vel_b(3)          pursuer body rates, rad/s, times ``ang_vel_obs_scale``
      visible, u, v, size   ideal camera detection of the evader (see ``detection.py``)
+     expansion(1)          box log-growth since the previous detection, scaled to [-1, 1] (a 1/TTC cue)
      time_since_seen(1)    seconds since the last detection, saturated at 1 s
      last action(4)]
 
-The actor never sees a ground-truth position. Its shaping reward is a
-*progress* term computed from the detections alone: the decrease of the range
-implied by the box size between two consecutive detections, plus a term that
-keeps the evader centred in the image. The episode ends with a success bonus
+The actor never sees a ground-truth position, and the target's size is unknown
+(the detector's target radius is resampled every episode), so the box size
+alone does not give a range. The shaping reward is a scale-free *progress*
+term computed from the detections alone: the log-growth of the box between two
+consecutive detections, ``log(size_t / size_{t-1})`` = ``log(d_{t-1} / d_t)``,
+whose rate is the inverse time-to-contact. A second term keeps the evader
+centred in the image. The episode ends with a success bonus
 when a contact sensor on the pursuer reports a contact with the evader (a
 collision).
 """
@@ -39,8 +43,9 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaaclab.sensors import Camera, CameraCfg, ContactSensor, ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
@@ -71,8 +76,10 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     * ``"velocity"``: [vx, vy, yaw_rate, vz], velocities in the heading frame.
     """
     action_space = 4
-    observation_space = 16
+    observation_space = 17
     state_space = 26
+    debug_vis = False
+    """Draw a blue sphere above the pursuer and a red one above the evader (for videos)."""
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
 
@@ -117,11 +124,14 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     min_altitude = 0.15
     max_altitude = 4.0
 
+    target_radius_range: tuple[float, float] = (0.03, 0.15)
+    """Detector target radius, resampled per episode, m: the target size is unknown to the policy."""
+
     # Rewards.
-    progress_reward_scale = 10.0
-    """Per metre of detected range decrease."""
-    max_progress_per_step = 0.1
-    """Clip of the per-step detected range decrease, m."""
+    progress_reward_scale = 5.0
+    """Per unit of box log-growth (time-to-contact progress, independent of the target size)."""
+    max_log_growth_per_step = 0.2
+    """Clip of the per-step box log-growth; also the scale of the ``expansion`` observation."""
     centering_reward_scale = 1.0
     lost_reward_scale = -1.0
     ang_vel_reward_scale = -0.05
@@ -179,6 +189,39 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
         ],
         history_length=decimation,
         update_period=0.0,
+    )
+    fpv_camera: CameraCfg | None = None
+    """Optional rendered camera on the pursuer (videos only; the policy uses ``detector``, not images).
+    See :func:`make_fpv_camera_cfg`. Needs ``--enable_cameras``."""
+
+
+def make_fpv_camera_cfg(detector: DetectorCfg, width: int = 640, env_index: int = 0) -> CameraCfg:
+    """Rendered camera matching the detector: on the pursuer body, along body +x, same FOV.
+
+    Args:
+        detector: Detector whose ``hfov_deg`` / ``vfov_deg`` the camera reproduces.
+        width: Image width in pixels; the height follows from the FOV ratio.
+        env_index: Env whose pursuer carries the camera.
+
+    Returns:
+        Camera config to assign to ``PursuitEvasionEnvCfg.fpv_camera``.
+    """
+    focal_length = 10.0
+    h_aperture = 2.0 * focal_length * math.tan(math.radians(detector.hfov_deg) / 2.0)
+    v_aperture = 2.0 * focal_length * math.tan(math.radians(detector.vfov_deg) / 2.0)
+    height = int(round(width * v_aperture / h_aperture / 2.0)) * 2
+    return CameraCfg(
+        prim_path=f"/World/envs/env_{env_index}/Robot/body/fpv_camera",
+        offset=CameraCfg.OffsetCfg(pos=(0.03, 0.0, 0.01), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        data_types=["rgb"],
+        width=width,
+        height=height,
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=focal_length,
+            horizontal_aperture=h_aperture,
+            vertical_aperture=v_aperture,
+            clipping_range=(0.01, 50.0),
+        ),
     )
 
 
@@ -249,16 +292,22 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._detector = Detector(self.cfg.detector, self.device)
         self._det: dict[str, torch.Tensor] = {}
         self._prev_visible = torch.zeros(n, device=self.device)
-        self._prev_range_est = torch.zeros(n, device=self.device)
+        self._prev_log_size = torch.zeros(n, device=self.device)
+        self._log_growth = torch.zeros(n, device=self.device)
+        """Box log-growth over the last step, 0 unless the evader was detected at both ends."""
+        self._target_radius = torch.full((n,), self.cfg.detector.target_radius, device=self.device)
         self._time_since_seen = torch.zeros(n, device=self.device)
         self._captured = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._crashed = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.capture_count = torch.zeros(n, dtype=torch.long, device=self.device)
+        """Captures per env since creation, never reset (for evaluation and videos)."""
 
         self._episode_sums = {
             key: torch.zeros(n, device=self.device)
             for key in ["progress", "centering", "lost", "ang_vel", "action_rate", "capture", "crash"]
         }
         self._episode_visible_steps = torch.zeros(n, device=self.device)
+        self.set_debug_vis(self.cfg.debug_vis)
         self._episode_steps = torch.zeros(n, device=self.device)
         self._min_distance = torch.full((n,), float("inf"), device=self.device)
 
@@ -267,6 +316,8 @@ class PursuitEvasionEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self._robot
         self._evader = Articulation(self.cfg.evader)
         self.scene.articulations["evader"] = self._evader
+        if self.cfg.fpv_camera is not None:
+            self.scene.sensors["fpv_camera"] = Camera(self.cfg.fpv_camera)
         self._capture_sensors = []
         for body in self.cfg.capture_bodies:
             sensor = ContactSensor(self.cfg.capture_sensor.replace(prim_path=f"/World/envs/env_.*/Robot/{body}"))
@@ -404,7 +455,10 @@ class PursuitEvasionEnv(DirectRLEnv):
 
     def _detect(self) -> dict[str, torch.Tensor]:
         return self._detector(
-            self._robot.data.root_pos_w, self._robot.data.root_quat_w, self._evader.data.root_pos_w
+            self._robot.data.root_pos_w,
+            self._robot.data.root_quat_w,
+            self._evader.data.root_pos_w,
+            target_radius=self._target_radius,
         )
 
     def _get_observations(self) -> dict:
@@ -424,6 +478,7 @@ class PursuitEvasionEnv(DirectRLEnv):
                 q_rel,
                 p.root_ang_vel_b * self.cfg.ang_vel_obs_scale,
                 torch.stack([det["visible"], det["u"], det["v"], det["size"]], dim=-1),
+                (self._log_growth / self.cfg.max_log_growth_per_step).clamp(-1.0, 1.0).unsqueeze(-1),
                 self._time_since_seen.clamp(max=1.0).unsqueeze(-1),
                 self._actions,
             ],
@@ -459,6 +514,7 @@ class PursuitEvasionEnv(DirectRLEnv):
             dim=-1,
         ).amax(dim=-1)
         self._captured = contact_force > self.cfg.capture_contact_force
+        self.capture_count += self._captured.long()
 
         p_alt = p_pos[:, 2] - origins[:, 2]
         p_xy = torch.linalg.norm(p_pos[:, :2] - origins[:, :2], dim=-1)
@@ -481,12 +537,13 @@ class PursuitEvasionEnv(DirectRLEnv):
         det = self._det
         visible = det["visible"]
 
-        # Progress from detections only: range implied by the box size, compared with the previous detection.
-        range_est = self._detector.size_to_range(det["size"].clamp_min(1e-6))
+        # Time-to-contact progress from detections only: box log-growth since the previous detection.
+        # log(s_t / s_{t-1}) = log(d_{t-1} / d_t) for small angles, whatever the (unknown) target size.
+        log_size = torch.log(det["size"].clamp_min(1e-6))
         both_seen = visible * self._prev_visible
-        progress = (self._prev_range_est - range_est).clamp(
-            -self.cfg.max_progress_per_step, self.cfg.max_progress_per_step
-        ) * both_seen
+        max_growth = self.cfg.max_log_growth_per_step
+        self._log_growth = (log_size - self._prev_log_size).clamp(-max_growth, max_growth) * both_seen
+        progress = self._log_growth
         centering = visible * (1.0 - 0.5 * (det["u"].square() + det["v"].square()))
         lost = 1.0 - visible
         ang_vel = self._robot.data.root_ang_vel_b.square().sum(dim=-1)
@@ -507,7 +564,7 @@ class PursuitEvasionEnv(DirectRLEnv):
             self._episode_sums[key] += value
 
         # Update the detection memory.
-        self._prev_range_est = torch.where(visible > 0, range_est, self._prev_range_est)
+        self._prev_log_size = torch.where(visible > 0, log_size, self._prev_log_size)
         self._prev_visible = visible
         self._time_since_seen = torch.where(visible > 0, torch.zeros_like(self._time_since_seen), self._time_since_seen + dt)
         self._episode_visible_steps += visible
@@ -596,7 +653,37 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
         self._prev_visible[env_ids] = 0.0
-        self._prev_range_est[env_ids] = 0.0
+        self._prev_log_size[env_ids] = 0.0
+        self._log_growth[env_ids] = 0.0
+        self._target_radius[env_ids] = uniform(*self.cfg.target_radius_range, k)
         self._time_since_seen[env_ids] = 0.0
         self._captured[env_ids] = False
         self._crashed[env_ids] = False
+
+    # ------------------------------------------------------------------
+    # Debug visualisation
+    # ------------------------------------------------------------------
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        if debug_vis and not hasattr(self, "_drone_markers"):
+            sphere = lambda rgb: sim_utils.SphereCfg(  # noqa: E731
+                radius=0.035, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=rgb)
+            )
+            self._drone_markers = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/PursuitEvasion/drones",
+                    markers={"pursuer": sphere((0.1, 0.3, 1.0)), "evader": sphere((1.0, 0.1, 0.1))},
+                )
+            )
+        if hasattr(self, "_drone_markers"):
+            self._drone_markers.set_visibility(debug_vis)
+
+    def _debug_vis_callback(self, event):
+        if not hasattr(self, "scene"):  # the render callback can fire once more after close()
+            return
+        above = torch.tensor([0.0, 0.0, 0.06], device=self.device)
+        pos_w = torch.cat([self._robot.data.root_pos_w, self._evader.data.root_pos_w]) + above
+        indices = torch.cat(
+            [torch.zeros(self.num_envs, dtype=torch.long), torch.ones(self.num_envs, dtype=torch.long)]
+        ).to(self.device)
+        self._drone_markers.visualize(translations=pos_w, marker_indices=indices)

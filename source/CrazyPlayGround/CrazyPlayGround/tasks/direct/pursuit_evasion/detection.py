@@ -39,7 +39,8 @@ class DetectorCfg:
     max_range: float = 6.0
     """Beyond this distance the target is never detected."""
     target_radius: float = 0.06
-    """Radius of the sphere that stands for the target drone when computing its apparent size."""
+    """Default radius of the sphere that stands for the target when computing its apparent size.
+    The env overrides it per episode (``target_radius_range``): the target size is unknown to the policy."""
 
     # Error model (all zero = ideal detector).
     pixel_noise_std: float = 0.0
@@ -65,26 +66,12 @@ class Detector:
         self._tan_half_vfov = math.tan(math.radians(cfg.vfov_deg) / 2.0)
         self._hfov = math.radians(cfg.hfov_deg)
 
-    def size_to_range(self, size_norm: torch.Tensor) -> torch.Tensor:
-        """Invert the apparent-size model: distance implied by a normalised box width.
-
-        This is the only way the reward recovers a range: it uses what the
-        detector sees, not the simulator's ground truth.
-
-        Args:
-            size_norm: Normalised box width, shape ``(num_envs,)``. Must be > 0.
-
-        Returns:
-            Estimated distance to the target, shape ``(num_envs,)``, m.
-        """
-        half_angle = 0.5 * size_norm.clamp_min(1e-6) * self._hfov
-        return self.cfg.target_radius / torch.tan(half_angle)
-
     def __call__(
         self,
         cam_pos_w: torch.Tensor,
         cam_quat_w: torch.Tensor,
         target_pos_w: torch.Tensor,
+        target_radius: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Detect the target.
 
@@ -92,6 +79,7 @@ class Detector:
             cam_pos_w: Camera (pursuer) position, shape ``(num_envs, 3)``, world frame, m.
             cam_quat_w: Camera (pursuer) orientation, shape ``(num_envs, 4)``, WXYZ, world frame.
             target_pos_w: Target (evader) position, shape ``(num_envs, 3)``, world frame, m.
+            target_radius: Target radius per env, shape ``(num_envs,)``, m. Defaults to ``cfg.target_radius``.
 
         Returns:
             A dict of tensors of shape ``(num_envs,)``:
@@ -112,7 +100,8 @@ class Detector:
         visible = in_front & (u.abs() <= 1.0) & (v.abs() <= 1.0) & (dist <= self.cfg.max_range)
 
         # Angular diameter of a sphere of radius r at distance d, over the horizontal FOV.
-        size = 2.0 * torch.atan(self.cfg.target_radius / dist.clamp_min(self.cfg.target_radius)) / self._hfov
+        radius = self.cfg.target_radius if target_radius is None else target_radius
+        size = 2.0 * torch.atan(radius / torch.maximum(dist, torch.as_tensor(radius, device=dist.device))) / self._hfov
 
         if self.cfg.pixel_noise_std > 0.0:
             u = u + torch.randn_like(u) * self.cfg.pixel_noise_std

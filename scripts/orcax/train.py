@@ -32,8 +32,17 @@ parser.add_argument(
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="Log to W&B (team entity).")
 parser.add_argument("--play", type=str, default=None, metavar="CHECKPOINT", help="Replay a checkpoint instead of training.")
+parser.add_argument("--video", action="store_true", default=False, help="With --play: record a video of env 0.")
+parser.add_argument("--video_length", type=int, default=1500, help="Video length in policy steps.")
+parser.add_argument(
+    "--fpv", action="store_true", default=False, help="With --play: record env 0's onboard camera, with the detection box."
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
+if args_cli.video or args_cli.fpv:
+    if args_cli.play is None:
+        parser.error("--video and --fpv need --play CHECKPOINT")
+    args_cli.enable_cameras = True
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")  # leave GPU memory to PhysX
 
@@ -45,7 +54,9 @@ simulation_app = app_launcher.app
 import math
 from datetime import datetime
 
+import cv2
 import distrax
+import torch
 import flax.linen as nn
 import gymnasium as gym
 import jax.numpy as jnp
@@ -56,6 +67,7 @@ from orcax.utils.experiments import ExperimentCfg
 from orcax.wrappers.isaaclab import IsaacLabWrapper
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab.envs import ViewerCfg
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg
 
 import CrazyPlayGround.tasks  # noqa: F401
@@ -96,6 +108,94 @@ class ValueNet(nn.Module):
         return nn.Dense(1, kernel_init=_orth(1.0))(x).squeeze(-1)
 
 
+class FpvRecorder(gym.Wrapper):
+    """Play-only: write env 0's onboard camera to an mp4, with the ideal detection drawn on it.
+
+    The green box is what the policy receives (``visible``, ``u``, ``v``, ``size``); a frame
+    without a box means the detector reports the evader as not visible.
+    """
+
+    def __init__(self, env: gym.Env, path: str, num_frames: int, fps: float):
+        super().__init__(env)
+        self._path, self._num_frames, self._fps = path, num_frames, fps
+        self._writer = None
+        self._frames = 0
+
+    def _write(self):
+        if self._frames >= self._num_frames:
+            return
+        env = self.env.unwrapped
+        rgb = env.scene["fpv_camera"].data.output["rgb"][0, ..., :3].cpu().numpy()
+        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        h, w = frame.shape[:2]
+        if self._writer is None:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            self._writer = cv2.VideoWriter(self._path, cv2.VideoWriter_fourcc(*"mp4v"), self._fps, (w, h))
+        det = {k: v[0].item() for k, v in env._detect().items()}
+        if det["visible"] > 0:
+            cx, cy = w / 2 * (1 + det["u"]), h / 2 * (1 - det["v"])
+            half = max(3.0, det["size"] * w / 2)
+            cv2.rectangle(frame, (int(cx - half), int(cy - half)), (int(cx + half), int(cy + half)), (0, 255, 0), 2)
+            growth = env._log_growth[0].item()  # box log-growth over the last step
+            label = f"TTC {env.step_dt / growth:.2f} s" if growth > 1e-4 else "not closing"
+        else:
+            label = "target not visible"
+        cv2.putText(frame, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        captures = int(env.capture_count[0])
+        cv2.putText(frame, f"captures: {captures}", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        self._writer.write(frame)
+        self._frames += 1
+
+    def step(self, action):
+        out = self.env.step(action)
+        self._write()
+        return out
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.release()
+            print(f"[orcax] onboard video: {self._path} ({self._frames} frames)", flush=True)
+            self._writer = None
+        return self.env.close()
+
+
+class PairCamera(gym.Wrapper):
+    """Play-only: aim the viewport at the midpoint of env 0's two drones every step.
+
+    Pulls back as the drones separate, and prints the video time of each capture in env 0.
+    """
+
+    def __init__(self, env: gym.Env, video_fps: float):
+        super().__init__(env)
+        self._video_fps = video_fps
+        self._steps = 0
+        self._captures = 0
+
+    def _aim(self):
+        env = self.env.unwrapped
+        p = env.scene["robot"].data.root_pos_w[0]
+        e = env.scene["evader"].data.root_pos_w[0]
+        mid = 0.5 * (p + e)
+        back = torch.tensor([-1.0, -1.0, 0.55], device=mid.device)
+        back = back / back.norm() * (1.2 + 1.2 * torch.linalg.norm(p - e).clamp(max=4.0))
+        env.sim.set_camera_view((mid + back).tolist(), mid.tolist())
+
+    def reset(self, **kwargs):
+        out = self.env.reset(**kwargs)
+        self._aim()
+        return out
+
+    def step(self, action):
+        out = self.env.step(action)
+        self._steps += 1
+        captures = int(getattr(self.env.unwrapped, "capture_count", torch.zeros(1))[0])
+        if captures > self._captures:
+            self._captures = captures
+            print(f"[orcax] env 0 capture #{captures} at t = {self._steps / self._video_fps:.2f} s", flush=True)
+        self._aim()
+        return out
+
+
 def main():
     cfg = load_cfg_from_registry(args_cli.task, "orcax_cfg_entry_point")
     seed = args_cli.seed if args_cli.seed is not None else cfg["seed"]
@@ -103,7 +203,32 @@ def main():
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.seed = seed
-    env = gym.make(args_cli.task, cfg=env_cfg)
+    if args_cli.video:
+        # Static viewer origin: PairCamera re-aims it every step. Markers on both drones.
+        env_cfg.viewer = ViewerCfg(origin_type="world")
+        if hasattr(env_cfg, "debug_vis"):
+            env_cfg.debug_vis = True
+    if args_cli.fpv:
+        from CrazyPlayGround.tasks.direct.pursuit_evasion.pursuit_evasion_env import make_fpv_camera_cfg
+
+        env_cfg.fpv_camera = make_fpv_camera_cfg(env_cfg.detector)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    play_dir = os.path.dirname(os.path.dirname(os.path.abspath(args_cli.play))) if args_cli.play else None
+    if args_cli.fpv:
+        env = FpvRecorder(
+            env, os.path.join(play_dir, "videos", "fpv.mp4"), args_cli.video_length, 1.0 / env.unwrapped.step_dt
+        )
+    if args_cli.video:
+        env = PairCamera(env, video_fps=1.0 / env.unwrapped.step_dt)
+        video_dir = os.path.join(play_dir, "videos")
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=video_dir,
+            step_trigger=lambda step: step == 0,
+            video_length=args_cli.video_length,
+            disable_logger=True,
+        )
+        print(f"[orcax] recording {args_cli.video_length} steps to {video_dir}")
     env = IsaacLabWrapper(env, seed=seed)
     num_envs = env.num_envs
 
@@ -152,7 +277,8 @@ def main():
     )
 
     trainer_cfg = TrainerCfg(
-        timesteps=args_cli.timesteps or (cfg["trainer"]["timesteps"] if training else 1000 * num_envs),
+        timesteps=args_cli.timesteps
+        or (cfg["trainer"]["timesteps"] if training else (args_cli.video_length if (args_cli.video or args_cli.fpv) else 1000) * num_envs),
         headless=args_cli.headless,
         close_environment_at_exit=False,  # the simulation app is closed below
         info_log_key="log",  # env extras["log"]: episode rewards, capture rate, ...

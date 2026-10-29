@@ -51,11 +51,13 @@ have the same dynamics.
 
 ### Observation space
 
-The actor gets 16 values:
+The actor gets 17 values:
 
 - `q_pursuer_evader` (4): the evader's orientation in the pursuer's frame, with w >= 0.
 - Pursuer body rates (3), times `ang_vel_obs_scale`.
 - Camera detection (4): `visible`, `u`, `v`, `size`.
+- Expansion (1): the box log-growth since the previous detection, scaled to [-1, 1]
+  (a 1/time-to-contact cue).
 - Time since the last detection (1), saturated at 1 s.
 - Last action (4).
 
@@ -74,11 +76,14 @@ The critic gets a privileged 26-D `"critic"` state:
 
 ### Reward
 
-The shaping uses only what the camera reports, never the true distance.
+The shaping uses only what the camera reports, never the true distance. The
+target size is unknown: the detector's target radius is resampled every
+episode in `target_radius_range`, so the box size alone does not give a range.
 
-- **progress**: the decrease of the range implied by the box size
-  (`Detector.size_to_range`) between two consecutive detections. It is clipped
-  to `max_progress_per_step`.
+- **progress** (time-to-contact): the box log-growth between two consecutive
+  detections, `log(size_t / size_{t-1})`. For small angles this equals
+  `log(d_{t-1} / d_t)`, so it needs no target size. Its rate is the inverse
+  time-to-contact. It is clipped to `max_log_growth_per_step`.
 - **centering**: `1 - (u² + v²) / 2` while the evader is visible.
 - **lost**: a penalty while the evader is not visible.
 
