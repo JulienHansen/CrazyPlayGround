@@ -51,11 +51,16 @@ have the same dynamics.
 
 ### Observation space
 
-The actor gets 17 values:
+The actor gets 19 values, only what an IMU and the camera can estimate. There is
+no world yaw (unobservable without a magnetometer), no position and nothing
+about the evader's state:
 
-- `q_pursuer_evader` (4): the evader's orientation in the pursuer's frame, with w >= 0.
-- Pursuer body rates (3), times `ang_vel_obs_scale`.
+- Gravity in the body frame (3): roll and pitch from an IMU attitude filter.
+- Pursuer body rates from the gyro (3), times `ang_vel_obs_scale`.
 - Camera detection (4): `visible`, `u`, `v`, `size`.
+- Line of sight (3): the camera bearing to the box centre, from `u` and `v`,
+  in the heading frame (level, yawing with the drone), using roll and pitch only.
+  Zero when not visible.
 - Expansion (1): the box log-growth since the previous detection, scaled to [-1, 1]
   (a 1/time-to-contact cue).
 - Time since the last detection (1), saturated at 1 s.

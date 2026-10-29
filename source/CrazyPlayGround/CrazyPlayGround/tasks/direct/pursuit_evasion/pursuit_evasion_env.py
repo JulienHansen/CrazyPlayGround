@@ -12,11 +12,15 @@ Critic state (privileged, 26-D), positions relative to the env origin:
      quat_w pursuer(4), quat_w evader(4),
      ang_vel_b pursuer(3), ang_vel_b evader(3)]
 
-Actor observation (17-D):
+Actor observation (19-D). Only what an IMU and the camera can estimate: no world yaw
+(not observable without a magnetometer), no position, no knowledge of the evader's state:
 
-    [q_pursuer_evader(4)   orientation of the evader in the pursuer frame, w >= 0
-     ang_vel_b(3)          pursuer body rates, rad/s, times ``ang_vel_obs_scale``
+    [gravity_b(3)          gravity direction in the body frame (IMU attitude filter: roll, pitch)
+     ang_vel_b(3)          pursuer body rates (gyro), rad/s, times ``ang_vel_obs_scale``
      visible, u, v, size   ideal camera detection of the evader (see ``detection.py``)
+     los_h(3)              line of sight to the box centre in the heading frame (level, yawing with
+                           the drone): camera bearing from (u, v) rotated by roll and pitch only;
+                           0 when not visible
      expansion(1)          box log-growth since the previous detection, scaled to [-1, 1] (a 1/TTC cue)
      time_since_seen(1)    seconds since the last detection, saturated at 1 s
      last action(4)]
@@ -49,7 +53,7 @@ from isaaclab.sensors import Camera, CameraCfg, ContactSensor, ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_from_euler_xyz, subtract_frame_transforms, yaw_quat
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_from_euler_xyz, yaw_quat
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
 
@@ -76,7 +80,7 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     * ``"velocity"``: [vx, vy, yaw_rate, vz], velocities in the heading frame.
     """
     action_space = 4
-    observation_space = 17
+    observation_space = 19
     state_space = 26
     debug_vis = False
     """Draw a blue sphere above the pursuer and a red one above the evader (for videos)."""
@@ -291,6 +295,7 @@ class PursuitEvasionEnv(DirectRLEnv):
 
         # Detection memory, used by the progress reward and the observation.
         self._detector = Detector(self.cfg.detector, self.device)
+        self._gravity_w = torch.tensor([0.0, 0.0, -1.0], device=self.device).repeat(n, 1)
         self._det: dict[str, torch.Tensor] = {}
         self._prev_visible = torch.zeros(n, device=self.device)
         self._prev_log_size = torch.zeros(n, device=self.device)
@@ -471,14 +476,19 @@ class PursuitEvasionEnv(DirectRLEnv):
             det = {k: torch.where(kept, self._det[k], v) for k, v in det.items()}
         p, e = self._robot.data, self._evader.data
 
-        _, q_rel = subtract_frame_transforms(p.root_pos_w, p.root_quat_w, e.root_pos_w, e.root_quat_w)
-        q_rel = torch.where(q_rel[:, :1] < 0.0, -q_rel, q_rel)  # q and -q are the same rotation
+        # IMU-observable attitude only: gravity in the body frame (roll, pitch), never the world yaw.
+        gravity_b = quat_apply_inverse(p.root_quat_w, self._gravity_w)
+        # Line of sight from the detection (u, v), rotated into the heading frame with roll and pitch:
+        # world frame, then the yaw removed again, so the result does not depend on the world yaw.
+        los_w = quat_apply(p.root_quat_w, self._detector.bearing_b(det["u"], det["v"]))
+        los_h = quat_apply_inverse(yaw_quat(p.root_quat_w), los_w) * det["visible"].unsqueeze(-1)
 
         obs = torch.cat(
             [
-                q_rel,
+                gravity_b,
                 p.root_ang_vel_b * self.cfg.ang_vel_obs_scale,
                 torch.stack([det["visible"], det["u"], det["v"], det["size"]], dim=-1),
+                los_h,
                 (self._log_growth / self.cfg.max_log_growth_per_step).clamp(-1.0, 1.0).unsqueeze(-1),
                 self._time_since_seen.clamp(max=1.0).unsqueeze(-1),
                 self._actions,

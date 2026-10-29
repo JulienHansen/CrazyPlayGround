@@ -66,6 +66,19 @@ class Detector:
         self._tan_half_vfov = math.tan(math.radians(cfg.vfov_deg) / 2.0)
         self._hfov = math.radians(cfg.hfov_deg)
 
+    def bearing_b(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Unit line-of-sight vector to the box centre, from the detection only.
+
+        Args:
+            u: Normalised horizontal image coordinate, shape ``(num_envs,)`` (right is +).
+            v: Normalised vertical image coordinate, shape ``(num_envs,)`` (up is +).
+
+        Returns:
+            Bearing, shape ``(num_envs, 3)``, body frame (FLU), unit norm.
+        """
+        ray = torch.stack([torch.ones_like(u), -u * self._tan_half_hfov, v * self._tan_half_vfov], dim=-1)
+        return ray / torch.linalg.norm(ray, dim=-1, keepdim=True)
+
     def __call__(
         self,
         cam_pos_w: torch.Tensor,
