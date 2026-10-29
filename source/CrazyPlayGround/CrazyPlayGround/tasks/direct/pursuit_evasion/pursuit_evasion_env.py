@@ -556,11 +556,11 @@ class PursuitEvasionEnv(DirectRLEnv):
 
         p_alt = p_pos[:, 2] - origins[:, 2]
         p_xy = torch.linalg.norm(p_pos[:, :2] - origins[:, :2], dim=-1)
+        self._crash_floor = (p_alt < self.cfg.min_altitude) & ~self._captured
+        self._crash_ceiling = (p_alt > self.cfg.max_altitude) & ~self._captured
+        self._crash_arena = (p_xy > self.cfg.arena_radius + self.cfg.pursuer_arena_margin) & ~self._captured
         self._crashed = (
-            (p_alt < self.cfg.min_altitude)
-            | (p_alt > self.cfg.max_altitude)
-            | (p_xy > self.cfg.arena_radius + self.cfg.pursuer_arena_margin)
-            | torch.isnan(p_pos).any(dim=-1)
+            self._crash_floor | self._crash_ceiling | self._crash_arena | torch.isnan(p_pos).any(dim=-1)
         ) & ~self._captured
 
         # The evader leaving the arena is not the pursuer's fault: truncate, don't punish.
@@ -629,6 +629,11 @@ class PursuitEvasionEnv(DirectRLEnv):
         log = {f"Episode_Reward/{k}": v[env_ids].mean() / self.max_episode_length_s for k, v in self._episode_sums.items()}
         log["Episode_Termination/capture"] = torch.count_nonzero(self._captured[env_ids]).item()
         log["Episode_Termination/crash"] = torch.count_nonzero(self._crashed[env_ids]).item()
+        if hasattr(self, "_crash_floor"):
+            for cause in ("floor", "ceiling", "arena"):
+                log[f"Episode_Termination/crash_{cause}"] = torch.count_nonzero(
+                    getattr(self, f"_crash_{cause}")[env_ids]
+                ).item()
         log["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         log["Metrics/capture_rate"] = self._captured[env_ids].float().mean().item()
         min_distance = self._min_distance[env_ids]

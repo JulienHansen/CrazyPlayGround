@@ -38,6 +38,9 @@ parser.add_argument(
 parser.add_argument("--video", action="store_true", default=False, help="With --play: record a video of env 0.")
 parser.add_argument("--video_length", type=int, default=1500, help="Video length in policy steps.")
 parser.add_argument(
+    "--stats", action="store_true", default=False, help="With --play: print episode outcome totals over all envs."
+)
+parser.add_argument(
     "--fpv", action="store_true", default=False, help="With --play: record env 0's onboard camera, with the detection box."
 )
 AppLauncher.add_app_launcher_args(parser)
@@ -109,6 +112,28 @@ class ValueNet(nn.Module):
         for width in self.hidden:
             x = _ACTIVATIONS[self.activation](nn.Dense(width, kernel_init=_orth(math.sqrt(2)))(x))
         return nn.Dense(1, kernel_init=_orth(1.0))(x).squeeze(-1)
+
+
+class EpisodeStats(gym.Wrapper):
+    """Play-only: sum the env's per-reset termination counts (``extras["log"]``) and print them at close."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self._totals: dict[str, float] = {}
+
+    def step(self, action):
+        out = self.env.step(action)
+        for key, value in self.env.unwrapped.extras.get("log", {}).items():
+            if key.startswith("Episode_Termination/"):
+                self._totals[key] = self._totals.get(key, 0.0) + float(value)
+        return out
+
+    def close(self):
+        episodes = sum(v for k, v in self._totals.items() if k.split("/")[1] in ("capture", "crash", "time_out"))
+        print(f"[orcax] episodes finished: {episodes:.0f}", flush=True)
+        for key, value in sorted(self._totals.items()):
+            print(f"[orcax]   {key.split('/')[1]:14s} {value:6.0f}  ({value / max(episodes, 1):.1%})", flush=True)
+        return self.env.close()
 
 
 class FpvRecorder(gym.Wrapper):
@@ -232,6 +257,8 @@ def main():
         env_cfg.fpv_camera = make_fpv_camera_cfg(env_cfg.detector)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     play_dir = os.path.dirname(os.path.dirname(os.path.abspath(args_cli.play))) if args_cli.play else None
+    if args_cli.stats:
+        env = EpisodeStats(env)
     if args_cli.fpv:
         env = FpvRecorder(
             env, os.path.join(play_dir, "videos", "fpv.mp4"), args_cli.video_length, 1.0 / env.unwrapped.step_dt
