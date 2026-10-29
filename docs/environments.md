@@ -34,7 +34,7 @@
 
 ## Pursuit-evasion
 
-`tasks/direct/pursuit_evasion/`, IDs `Att-PursuitEvasion` and `Vel-PursuitEvasion`.
+`tasks/direct/pursuit_evasion/`, IDs `Rate-PursuitEvasion` (ACRO), `Att-PursuitEvasion` and `Vel-PursuitEvasion`.
 
 Two Crazyflies per env. The pursuer (`Robot`) learns with PPO to collide with
 the evader (`Evader`). The evader runs a scripted policy: a straight line
@@ -45,7 +45,8 @@ have the same dynamics.
 
 | Level | Action (in [-1, 1]) |
 |---|---|
-| `Att` | roll, pitch, yaw rate, thrust |
+| `Rate` (ACRO) | roll rate, pitch rate, yaw rate, thrust |
+| `Att` (angle mode) | roll, pitch, yaw rate, thrust |
 | `Vel` | vx, vy, yaw rate, vz, in the heading frame |
 
 ### Observation space
@@ -104,7 +105,7 @@ the Isaac Lab venv, so add the JAX overlay to the path:
 ```bash
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 PYTHONPATH=~/.venvs/isaac_orcax_overlay:~/Orcax/Orcax \
-~/.venvs/isaac/bin/python scripts/orcax/train.py --task Att-PursuitEvasion --num_envs 4096 --headless
+~/.venvs/isaac/bin/python scripts/orcax/train.py --task Rate-PursuitEvasion --num_envs 4096 --headless
 # replay: add --play logs/orcax/pursuit_evasion/<run>/checkpoints/best.pkl
 ```
 

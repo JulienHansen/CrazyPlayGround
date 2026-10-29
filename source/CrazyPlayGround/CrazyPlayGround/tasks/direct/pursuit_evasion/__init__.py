@@ -11,7 +11,11 @@ from . import agents
 # Register Gym environments.
 ##
 
-for _level, _cfg in (("Att", "AttPursuitEvasionEnvCfg"), ("Vel", "VelPursuitEvasionEnvCfg")):
+for _level, _cfg in (
+    ("Rate", "RatePursuitEvasionEnvCfg"),
+    ("Att", "AttPursuitEvasionEnvCfg"),
+    ("Vel", "VelPursuitEvasionEnvCfg"),
+):
     gym.register(
         id=f"{_level}-PursuitEvasion",
         entry_point=f"{__name__}.pursuit_evasion_env:PursuitEvasionEnv",

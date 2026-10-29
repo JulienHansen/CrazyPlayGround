@@ -62,13 +62,20 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     decimation = 5
 
     control_mode: str = "attitude"
-    """``"attitude"``: [roll, pitch, yaw_rate, thrust]; ``"velocity"``: [vx, vy, vz, yaw_rate] in the heading frame."""
+    """Setpoints the policy sends to the cascaded PID:
+
+    * ``"rate"`` (ACRO): [roll_rate, pitch_rate, yaw_rate, thrust], body rates straight to the rate loop.
+    * ``"attitude"`` (angle mode, self-levelling): [roll, pitch, yaw_rate, thrust].
+    * ``"velocity"``: [vx, vy, yaw_rate, vz], velocities in the heading frame.
+    """
     action_space = 4
     observation_space = 16
     state_space = 26
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
 
+    # Rate-mode (ACRO) action scaling (same as Rate-Hovering).
+    max_body_rate = math.pi
     # Attitude-mode action scaling (same as Att-Hovering).
     max_roll_pitch = 30.0 * math.pi / 180.0
     max_yaw_rate = 180.0 * math.pi / 180.0
@@ -157,6 +164,11 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
 
 
 @configclass
+class RatePursuitEvasionEnvCfg(PursuitEvasionEnvCfg):
+    control_mode = "rate"
+
+
+@configclass
 class AttPursuitEvasionEnvCfg(PursuitEvasionEnvCfg):
     control_mode = "attitude"
 
@@ -170,8 +182,8 @@ class PursuitEvasionEnv(DirectRLEnv):
     cfg: PursuitEvasionEnvCfg
 
     def __init__(self, cfg: PursuitEvasionEnvCfg, render_mode: str | None = None, **kwargs):
-        if cfg.control_mode not in ("attitude", "velocity"):
-            raise ValueError(f"control_mode must be 'attitude' or 'velocity', got {cfg.control_mode!r}")
+        if cfg.control_mode not in ("rate", "attitude", "velocity"):
+            raise ValueError(f"control_mode must be 'rate', 'attitude' or 'velocity', got {cfg.control_mode!r}")
         super().__init__(cfg, render_mode, **kwargs)
 
         n = self.num_envs
@@ -197,6 +209,7 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._evader_moment = torch.zeros(n, 1, 3, device=self.device)
 
         # Pursuer setpoints.
+        self._rate_ref = torch.zeros(n, 3, device=self.device)
         self._att_ref = torch.zeros(n, 3, device=self.device)
         self._yaw_rate_ref = torch.zeros(n, 1, device=self.device)
         self._thrust_pwm = torch.zeros(n, 1, device=self.device)
@@ -256,13 +269,16 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
         self._yaw_rate_ref = (self._actions[:, 2] * self.cfg.max_yaw_rate).unsqueeze(-1)
-        if self.cfg.control_mode == "attitude":
-            roll_ref = self._actions[:, 0] * self.cfg.max_roll_pitch
-            pitch_ref = self._actions[:, 1] * self.cfg.max_roll_pitch
-            self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
+        if self.cfg.control_mode in ("rate", "attitude"):
             thrust_norm = (self._actions[:, 3] + 1.0) * 0.5
             thrust_n = self._min_thrust + thrust_norm * (self._max_thrust - self._min_thrust)
             self._thrust_pwm = (thrust_n / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
+        if self.cfg.control_mode == "rate":
+            self._rate_ref = self._actions[:, :3] * self.cfg.max_body_rate
+        elif self.cfg.control_mode == "attitude":
+            roll_ref = self._actions[:, 0] * self.cfg.max_roll_pitch
+            pitch_ref = self._actions[:, 1] * self.cfg.max_roll_pitch
+            self._att_ref = torch.stack([roll_ref, pitch_ref, torch.zeros_like(roll_ref)], dim=-1)
         else:
             # [vx, vy, vz] are expressed in the heading (yaw-only) frame, since the
             # policy does not observe its own world yaw.
@@ -309,7 +325,15 @@ class PursuitEvasionEnv(DirectRLEnv):
 
     def _apply_action(self):
         root_state = self._root_state(self._robot)
-        if self.cfg.control_mode == "attitude":
+        if self.cfg.control_mode == "rate":
+            thrust, moment = self._ctrl(
+                root_state,
+                target_body_rates=self._rate_ref,
+                thrust_cmd=self._thrust_pwm,
+                command_level="body_rate",
+                body_rates_in_body_frame=True,
+            )
+        elif self.cfg.control_mode == "attitude":
             thrust, moment = self._ctrl(
                 root_state,
                 target_attitude=self._att_ref,
