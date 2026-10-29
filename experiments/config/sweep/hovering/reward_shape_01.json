@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "wandb": { "project": "hovering" },
+  "defaults": {
+    "trainer": "skrl",
+    "env_name": "Vel-Hovering",
+    "algo": "PPO",
+    "num_envs": 4096,
+    "total_timesteps": 78643200,
+    "rollout_length": 32,
+    "lr": 5e-4,
+    "lambda_coef": 0.95,
+    "entropy_coef": 0.0,
+    "env_kwargs": {
+      "add_noise": false,
+      "noise_corr": 0.0,
+      "noise_bias_std": 0.0,
+      "wind_force_range": [0.0, 0.0],
+      "thrust_scale_range": [1.0, 1.0],
+      "torque_scale_range": [1.0, 1.0],
+      "action_latency_steps": 0,
+      "action_latency_max_steps": 0,
+      "distance_reward_length": 0.25
+    },
+    "seed": [42, 123, 7]
+  },
+  "experiments": [
+    {
+      "name": "shape-x-ppo",
+      "sweep": {
+        "env_kwargs.distance_reward_shape": ["tanh", "exp", "multiexp"],
+        "lr": [2.5e-4, 5e-4, 1e-3],
+        "lambda_coef": [0.9, 0.95, 0.99],
+        "entropy_coef": [0.0, 1e-3, 1e-2]
+      }
+    }
+  ]
+}

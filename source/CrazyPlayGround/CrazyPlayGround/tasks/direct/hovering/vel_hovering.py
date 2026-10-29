@@ -151,11 +151,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     thrust_scale_range: tuple[float, float] = (1.0, 1.0)
     torque_scale_range: tuple[float, float] = (1.0, 1.0)
     # distance-to-goal reward shape; all are 1 at the goal, so the term's weight keeps its meaning:
-    # "tanh" = 1 - tanh(d / 0.8), almost flat near the goal (94 % of max at 5 cm);
-    # "exp"  = exp(-d / distance_reward_length), steeper near the goal (slope 1 / length at d = 0)
-    # "multiexp" = mean_k exp(-d / (distance_reward_length * scale_k)), coarse + fine
+    # "tanh" = 1 - tanh(d / L), almost flat near the goal (94 % of max at 5 cm with L = 0.8);
+    # "exp"  = exp(-d / L), steeper near the goal (slope 1 / L at d = 0)
+    # "multiexp" = mean_k exp(-d / (L * scale_k)), coarse + fine
     distance_reward_shape: str = "tanh"
-    distance_reward_length: float = 0.3  # metres, "exp"/"multiexp": the reward is 1/e (37 %) at this distance
+    distance_reward_length: float = 0.8  # L in metres, shared by all shapes; 0.8 = original tanh reward
     distance_reward_scales: tuple[float, ...] = (1.0, 0.1)  # "multiexp" only: multipliers of the length
 
 
@@ -396,7 +396,7 @@ class QuadcopterEnv(DirectRLEnv):
         if self.cfg.distance_reward_shape == "multiexp":
             scales = torch.tensor(self.cfg.distance_reward_scales, device=distance.device)
             return torch.exp(-distance[:, None] / (self.cfg.distance_reward_length * scales)).mean(1)
-        return 1 - torch.tanh(distance / 0.8)
+        return 1 - torch.tanh(distance / self.cfg.distance_reward_length)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
