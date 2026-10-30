@@ -18,6 +18,7 @@ Example (Isaac Lab venv plus a JAX overlay)::
 """
 
 import argparse
+import ast
 import os
 import sys
 
@@ -31,6 +32,13 @@ parser.add_argument(
     "--timesteps", type=int, default=None, help="Training: total transitions, summed over envs. Play: env steps (default 1000)."
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="Log to W&B (team entity).")
+parser.add_argument(
+    "--env",
+    action="append",
+    default=[],
+    metavar="KEY=VALUE",
+    help="Set an env config field, e.g. --env curriculum_start_level=0.2 (repeatable; VALUE is a Python literal).",
+)
 parser.add_argument("--play", type=str, default=None, metavar="CHECKPOINT", help="Replay a checkpoint instead of training.")
 parser.add_argument(
     "--init_from", type=str, default=None, metavar="CHECKPOINT", help="Start training from these weights. Needs the same obs/action layout and the same --num_envs as the run that saved them (with a different env count the first step hangs)."
@@ -246,6 +254,11 @@ def main():
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.seed = seed
+    for item in args_cli.env:
+        key, _, value = item.partition("=")
+        if not hasattr(env_cfg, key):
+            raise ValueError(f"--env {item}: the env config has no field {key!r}")
+        setattr(env_cfg, key, ast.literal_eval(value))
     if args_cli.video:
         # Static viewer origin: PairCamera re-aims it every step. Markers on both drones.
         env_cfg.viewer = ViewerCfg(origin_type="world")

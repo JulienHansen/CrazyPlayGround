@@ -138,6 +138,8 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
     """Grow the spawn distance from ``curriculum_start_range`` to ``initial_distance_range`` as the
     pursuer gets good at it. Turn off for evaluation and videos (always the full distance)."""
     curriculum_start_range: tuple[float, float] = (2.0, 4.0)
+    curriculum_start_level = 0.0
+    """Initial level, in [0, 1]: set it to the level a previous run reached to continue from there."""
     curriculum_window_episodes: int = 20000
     """Episodes per evaluation window of the curriculum."""
     curriculum_capture_threshold = 0.7
@@ -347,7 +349,7 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._episode_visible_steps = torch.zeros(n, device=self.device)
         self.set_debug_vis(self.cfg.debug_vis)
         self._episode_steps = torch.zeros(n, device=self.device)
-        self._curriculum_level = 0.0 if self.cfg.curriculum else 1.0
+        self._curriculum_level = self.cfg.curriculum_start_level if self.cfg.curriculum else 1.0
         self._window_episodes = 0
         self._window_captures = 0
         self._min_distance = torch.full((n,), float("inf"), device=self.device)
