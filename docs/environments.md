@@ -75,6 +75,12 @@ up close to `miss_prob_far` = 0.5 at the 25 m `max_range`. Set them to 0 for an
 ideal detector. The pursuer spawns 10 to 20 m from the evader, in a 30 m
 arena, with 20 s episodes.
 
+Training uses a spawn-distance curriculum (`curriculum`): the distance grows
+from `curriculum_start_range` (2 to 4 m) to `initial_distance_range` in steps
+of `curriculum_level_step`, each time the capture rate over
+`curriculum_window_episodes` episodes reaches `curriculum_capture_threshold`.
+`Curriculum/level` is logged. Play and videos turn it off (full distance).
+
 The IMU inputs are noisy too: the roll/pitch estimate has a per-episode bias
 (up to `attitude_bias_max_deg`) plus white noise (`attitude_noise_std_deg`),
 and the gyro has a per-episode bias (`gyro_bias_max`) plus white noise

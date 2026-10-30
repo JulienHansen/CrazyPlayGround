@@ -251,6 +251,8 @@ def main():
         env_cfg.viewer = ViewerCfg(origin_type="world")
         if hasattr(env_cfg, "debug_vis"):
             env_cfg.debug_vis = True
+    if args_cli.play is not None and hasattr(env_cfg, "curriculum"):
+        env_cfg.curriculum = False  # evaluate and record at the final task difficulty
     if args_cli.fpv:
         from CrazyPlayGround.tasks.direct.pursuit_evasion.pursuit_evasion_env import make_fpv_camera_cfg
 

@@ -133,6 +133,17 @@ class PursuitEvasionEnvCfg(DirectRLEnvCfg):
 
     # Spawn.
     initial_distance_range: tuple[float, float] = (10.0, 20.0)
+    """Spawn distance at the end of the curriculum (and always, with the curriculum off), m."""
+    curriculum: bool = True
+    """Grow the spawn distance from ``curriculum_start_range`` to ``initial_distance_range`` as the
+    pursuer gets good at it. Turn off for evaluation and videos (always the full distance)."""
+    curriculum_start_range: tuple[float, float] = (2.0, 4.0)
+    curriculum_window_episodes: int = 20000
+    """Episodes per evaluation window of the curriculum."""
+    curriculum_capture_threshold = 0.7
+    """Capture rate over a window above which the level goes up."""
+    curriculum_level_step = 0.1
+    """Level increment; level 0 = start range, level 1 = ``initial_distance_range``."""
     initial_heading_noise = 30.0 * math.pi / 180.0
     """Pursuer yaw error w.r.t. the line of sight at spawn; keep < hfov/2 so the evader starts in view."""
 
@@ -336,6 +347,9 @@ class PursuitEvasionEnv(DirectRLEnv):
         self._episode_visible_steps = torch.zeros(n, device=self.device)
         self.set_debug_vis(self.cfg.debug_vis)
         self._episode_steps = torch.zeros(n, device=self.device)
+        self._curriculum_level = 0.0 if self.cfg.curriculum else 1.0
+        self._window_episodes = 0
+        self._window_captures = 0
         self._min_distance = torch.full((n,), float("inf"), device=self.device)
 
     def _setup_scene(self):
@@ -638,6 +652,10 @@ class PursuitEvasionEnv(DirectRLEnv):
         log["Metrics/capture_rate"] = self._captured[env_ids].float().mean().item()
         min_distance = self._min_distance[env_ids]
         stepped = torch.isfinite(min_distance)  # false on the initial reset, before any step
+        if self.cfg.curriculum:
+            self._update_curriculum(int(stepped.sum()), int((self._captured[env_ids] & stepped).sum()))
+        log["Curriculum/level"] = self._curriculum_level
+        log["Curriculum/max_spawn_distance"] = self._spawn_distance_range()[1]
         if stepped.any():
             log["Metrics/min_distance"] = min_distance[stepped].mean().item()
         log["Metrics/visible_fraction"] = (self._episode_visible_steps[env_ids] / steps).mean().item()
@@ -668,7 +686,7 @@ class PursuitEvasionEnv(DirectRLEnv):
 
         # Pursuer spawn: at a random bearing and distance from the evader, facing it up to some heading noise.
         bearing = uniform(-math.pi, math.pi, k)
-        dist = uniform(*self.cfg.initial_distance_range, k)
+        dist = uniform(*self._spawn_distance_range(), k)
         pursuer_pos_w = evader_pos_w.clone()
         pursuer_pos_w[:, 0] += dist * torch.cos(bearing)
         pursuer_pos_w[:, 1] += dist * torch.sin(bearing)
@@ -741,3 +759,24 @@ class PursuitEvasionEnv(DirectRLEnv):
             [torch.zeros(self.num_envs, dtype=torch.long), torch.ones(self.num_envs, dtype=torch.long)]
         ).to(self.device)
         self._drone_markers.visualize(translations=pos_w, marker_indices=indices)
+
+    # ------------------------------------------------------------------
+    # Spawn-distance curriculum
+    # ------------------------------------------------------------------
+
+    def _spawn_distance_range(self) -> tuple[float, float]:
+        """Spawn distance range at the current curriculum level, m."""
+        (lo0, hi0), (lo1, hi1) = self.cfg.curriculum_start_range, self.cfg.initial_distance_range
+        level = self._curriculum_level
+        return lo0 + (lo1 - lo0) * level, hi0 + (hi1 - hi0) * level
+
+    def _update_curriculum(self, episodes: int, captures: int):
+        """Raise the level once a window of episodes reaches the capture threshold (never lowers it)."""
+        self._window_episodes += episodes
+        self._window_captures += captures
+        if self._window_episodes < self.cfg.curriculum_window_episodes:
+            return
+        if self._window_captures / self._window_episodes >= self.cfg.curriculum_capture_threshold:
+            self._curriculum_level = min(1.0, self._curriculum_level + self.cfg.curriculum_level_step)
+        self._window_episodes = 0
+        self._window_captures = 0
