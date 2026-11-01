@@ -489,8 +489,9 @@ class QuadcopterEnv(DirectRLEnv):
 
         self.extras["log"]["Metrics/crash_rate"] = died.float().mean()
         full = self.reset_time_outs[env_ids] & ~died & (length == self.episode_length_buf[env_ids])
-        for key, value in metrics.items():
-            mean = value[full].nanmean()
+        # d0, rise_10_90 and iae_norm stay in step_metrics (play.py --eval_csv) but not in the training log
+        for key in ("tau", "overshoot", "settling_time", "steady_state_error", "effort"):
+            mean = metrics[key][full].nanmean()
             if torch.isfinite(mean):  # a NaN would poison skrl's mean over the whole write interval
                 self.extras["log"]["Metrics/" + key] = mean
 
