@@ -45,9 +45,9 @@ def step_response(
     Returns:
         Dict of (E,) tensors: ``d0`` [m], displacement length; ``tau`` [s], first time s >= 0.632;
         ``rise_10_90`` [s], time from s >= 0.1 to s >= 0.9; ``overshoot`` [-],
-        max(s) - 1 clamped at 0; ``settling`` [s], time of the first sample after the
+        max(s) - 1 clamped at 0; ``settling_time`` [s], time of the first sample after the
         last one outside the band max(band_frac * d0, band_min), 0 if never outside and
-        NaN if still outside at the end; ``ss_error`` [m], mean d over the last
+        NaN if still outside at the end; ``steady_state_error`` [m], mean d over the last
         ``ss_window_s``; ``iae_norm`` [s], integral of d dt divided by d0.
     """
     T = pos_w.shape[1]
@@ -82,6 +82,6 @@ def step_response(
     iae_norm = torch.where(valid, d, 0.0).sum(1) * dt / d0_safe
 
     too_short = d0 < d0_min
-    out = {"tau": tau, "rise_10_90": t_90 - t_10, "overshoot": overshoot, "settling": settling, "iae_norm": iae_norm}
+    out = {"tau": tau, "rise_10_90": t_90 - t_10, "overshoot": overshoot, "settling_time": settling, "iae_norm": iae_norm}
     out = {k: torch.where(too_short, nan, v) for k, v in out.items()}
-    return {"d0": d0, **out, "ss_error": ss_error}
+    return {"d0": d0, **out, "steady_state_error": ss_error}
