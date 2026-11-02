@@ -228,6 +228,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     import wandb
 
     if wandb.run is not None:
+        # AUC and smoothed max of the return, which experiments/analyze.py ranks configs on
+        sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "experiments"))
+        import curves
+        from CrazyPlayGround.wandb_tb_patch import HISTORY
+
+        history = HISTORY.get(curves.RETURN_METRIC)
+        if history:
+            timesteps, values = zip(*history)
+            # skrl's timestep counts steps per env; analyze.py works in env steps summed over envs
+            env_steps = [t * env_cfg.scene.num_envs for t in timesteps]
+            wandb.run.summary.update({**curves.summarize(env_steps, values), "return_metric": curves.RETURN_METRIC})
         wandb.run.summary["completed"] = True
         # simulation_app.close() ends the process without wandb's exit hook: sync now
         wandb.finish()
