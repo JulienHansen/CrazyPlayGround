@@ -11,7 +11,12 @@ wandb's ``sync_tensorboard=True`` only patches the latter, so scalars logged thr
 skrl's writer (e.g. the ``Episode_Reward/*`` extras) never reach W&B even though they
 show up correctly in local TensorBoard logs. This patches skrl's writer to call
 ``wandb.log`` directly whenever a W&B run is active.
+
+Every scalar is also kept in ``HISTORY`` (tag -> list of (timestep, value)), so
+train.py can write learning-curve statistics to the run summary at the end.
 """
+
+HISTORY: dict[str, list[tuple[int, float]]] = {}
 
 try:
     from skrl.utils.tensorboard import SummaryWriter as _SkrlSummaryWriter
@@ -23,6 +28,7 @@ if _SkrlSummaryWriter is not None and not getattr(_SkrlSummaryWriter, "_wandb_pa
 
     def _add_scalar_with_wandb(self, *, tag: str, value: float, timestep: int) -> None:
         _original_add_scalar(self, tag=tag, value=value, timestep=timestep)
+        HISTORY.setdefault(tag, []).append((timestep, float(value)))
         try:
             import wandb
 

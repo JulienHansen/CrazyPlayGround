@@ -23,6 +23,7 @@ and experiment results are centralised in one W&B team, `crazyplayground`.
 | `experiments/config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
 | `experiments/parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
 | `experiments/run_skrl.sh`, `skrl_args.py` | Launch a sweep's pending runs, N `train.py` processes at a time; map sweep keys to `train.py` args |
+| `experiments/analyze.py`, `curves.py` | Rank each method's configs on W&B and plot IQM curves with bootstrap CIs, plus a Markdown report; `curves.py` holds the AUC/smoothing/IQM maths shared with `train.py` |
 | `tests/` | pytest. Hardware tests drive the real scripts against a fake Crazyflie |
 | `docs/` | MkDocs: environments, controller, configuration, deployment |
 
@@ -56,7 +57,10 @@ python experiments/parser.py experiments/config/sweep/hovering/test_01.json     
 python experiments/wandb_check.py experiments/config/sweep/hovering/test_01.json   # add --runs; needs `wandb login`
 experiments/run_skrl.sh experiments/config/sweep/hovering/test_01.json -j 2 --dry-run   # drop --dry-run to train; -- <train.py flags>
 
+python experiments/analyze.py experiments/config/sweep/hovering/reward_shape_01.json --method-key env_kwargs.distance_reward_shape   # figures + .md in outputs/analysis/
+
 python -m pytest tests/test_sweep_parser.py tests/test_wandb_check.py tests/test_skrl_args.py   # needs only pytest
+python -m pytest tests/test_curves.py tests/test_analyze.py                                     # also numpy, matplotlib
 python -m pytest tests/                                                 # also torch, pyarrow, cflib
 ```
 
@@ -117,9 +121,11 @@ sweep file. Ad-hoc `train.py` runs are for debugging only; run them with
 3. `python experiments/wandb_check.py <file>`: only `failed` and `missing` runs get trained.
 4. Launch with `experiments/run_skrl.sh <file> -j N`. Launching is the user's
    decision: it spends shared GPU hours and writes to the team W&B. Ask first.
-5. Compare on W&B by group. A group is one config, and W&B plots the mean and
-   spread over its seeds. Only compare runs with the same `total_timesteps`.
-   When reporting, give the sweep file, the commit and the W&B groups.
+5. Compare with `python experiments/analyze.py <file> --method-key <key>`. Per
+   env and method, it keeps the configs within `--threshold` % of the best
+   max smoothed return, ranks them by AUC, and plots the IQM over seeds with a
+   bootstrap CI. Only compare runs with the same `total_timesteps`. When
+   reporting, give the generated `.md` (sweep file, commit, W&B groups).
 
 ## W&B conventions
 
@@ -132,7 +138,10 @@ sweep file. Ad-hoc `train.py` runs are for debugging only; run them with
   shared by all seeds of one config. The key keeps two sweep files that reuse a
   label in separate groups.
 - Run config: `run_key`, `config_key` (same hash without the seed), and `exp`
-  (the resolved sweep settings). Summary: `completed: true` once training ends.
+  (the resolved sweep settings). Summary, written by `train.py` once training
+  ends: `completed: true`, plus `auc_return`, `max_smoothed_return`,
+  `smooth_frac` and `return_metric` (see `experiments/curves.py`), the keys
+  `analyze.py` ranks on.
 - Find runs with
   `wandb.Api().runs("crazyplayground/<project>", filters={"config.run_key": key})`.
   Never delete or edit W&B runs.

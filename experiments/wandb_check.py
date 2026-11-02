@@ -70,6 +70,30 @@ def fetch_records(
     """
     if not run_keys:
         return []
+    try:
+        return [
+            {
+                "run_key": run.config.get("run_key"),
+                "state": str(run.state).lower(),
+                "completed": run.summary_metrics.get(COMPLETED_KEY) is True,
+                "url": run.url,
+            }
+            for run in query_runs(
+                f"{entity}/{project}", {"config.run_key": {"$in": list(run_keys)}}, api
+            )
+        ]
+    except ValueError as e:
+        if "Could not find project" in str(e):
+            return None
+        raise
+
+
+def query_runs(path: str, filters: dict, api=None):
+    """``api.runs(path, filters)`` with config and summary fetched in bulk.
+
+    Raises:
+        ValueError: "Could not find project ..." when the project does not exist.
+    """
     if api is None:
         import wandb
 
@@ -79,26 +103,7 @@ def fetch_records(
     # older versions have no lazy argument
     if "lazy" in inspect.signature(api.runs).parameters:
         kwargs["lazy"] = False
-    try:
-        return [
-            {
-                "run_key": run.config.get("run_key"),
-                "state": str(run.state).lower(),
-                "completed": run.summary_metrics.get(COMPLETED_KEY) is True,
-                "url": run.url,
-            }
-            for run in api.runs(
-                f"{entity}/{project}",
-                filters={"config.run_key": {"$in": list(run_keys)}},
-                per_page=200,
-                include_sweeps=False,
-                **kwargs,
-            )
-        ]
-    except ValueError as e:
-        if "Could not find project" in str(e):
-            return None
-        raise
+    return api.runs(path, filters=filters, per_page=200, include_sweeps=False, **kwargs)
 
 
 def classify(runs: list[Run], records: list[dict]) -> list[RunStatus]:
