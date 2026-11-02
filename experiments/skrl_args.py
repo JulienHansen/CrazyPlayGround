@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shlex
 import sys
 
@@ -44,6 +45,7 @@ AGENT_KEYS = {
 }
 OTHER_KEYS = ("trainer", "total_timesteps", "env_kwargs")
 WANDB = "++agent.agent.experiment.wandb_kwargs"
+GROUP_MAX = 128  # W&B refuses a longer group name ("128 limit exceeded for GroupName")
 
 
 def run_args(run: Run, sweep: Sweep) -> list[str]:
@@ -78,12 +80,28 @@ def run_args(run: Run, sweep: Sweep) -> list[str]:
         f"{WANDB}.project={_value(sweep.project)}",
         f"{WANDB}.entity={_value(sweep.entity)}",
         f"{WANDB}.name={_value(run.name)}",
-        f"{WANDB}.group={_value(run.group)}",
+        f"{WANDB}.group={_value(wandb_group(run))}",
         f"{WANDB}.config.run_key={_value(run.run_key)}",
         f"{WANDB}.config.config_key={_value(run.config_key)}",
     ]
     args += [f"{WANDB}.config.exp.{path}={_value(v)}" for path, v in _leaves(config)]
     return args
+
+
+def wandb_group(run: Run) -> str:
+    """``run.group``, shortened to W&B's limit only when it is too long.
+
+    Dotted sweep keys lose their prefix first (``env_kwargs.distance_reward_shape=tanh``
+    becomes ``distance_reward_shape=tanh``), then the label is cut. The trailing
+    ``[config_key]`` always stays, so the group still holds exactly one config.
+    """
+    if len(run.group) <= GROUP_MAX:
+        return run.group
+    label, key = run.group.rsplit(" [", 1)
+    key = " [" + key
+    # a prefix is "name." followed by a key and "=": values such as 0.0001 are left alone
+    label = re.sub(r"[A-Za-z_][A-Za-z0-9_]*\.(?=[A-Za-z0-9_.]+=)", "", label)
+    return label[: GROUP_MAX - len(key)] + key
 
 
 def _value(value) -> str:
