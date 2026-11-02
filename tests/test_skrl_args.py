@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experiments"))
 from parser import SweepError, expand  # noqa: E402
-from skrl_args import run_args  # noqa: E402
+from skrl_args import GROUP_MAX, run_args, wandb_group  # noqa: E402
 
 
 def sweep(**defaults):
@@ -65,3 +65,29 @@ def test_timesteps_need_num_envs():
     del s.runs[0].config["num_envs"]
     with pytest.raises(SweepError, match="needs num_envs"):
         run_args(s.runs[0], s)
+
+
+def test_long_wandb_groups_are_shortened_to_the_limit():
+    s = expand({
+        "version": 1,
+        "wandb": {"project": "hovering"},
+        "defaults": {"trainer": "skrl", "env_name": "Vel-Hovering", "seed": [42], "num_envs": 8192},
+        "experiments": [{"name": "shape-x-ppo", "sweep": {
+            "env_kwargs.distance_reward_shape": ["tanh", "multiexp"],
+            "lr": [0.00025], "lambda_coef": [0.95], "entropy_coef": [0.0001], "rollout_length": [32, 64],
+        }}],
+    })
+    assert any(len(run.group) > GROUP_MAX for run in s.runs)  # the case this test is for
+    for run in s.runs:
+        group = wandb_group(run)
+        assert len(group) <= GROUP_MAX
+        assert group.endswith(f" [{run.config_key}]")
+        assert f'.group="{group}"' in " ".join(run_args(run, s))
+        if len(run.group) > GROUP_MAX:
+            assert "env_kwargs." not in group and "distance_reward_shape=" in group
+            assert "lr=0.00025" in group  # values keep their dots
+
+
+def test_short_wandb_groups_are_unchanged():
+    s = sweep()
+    assert wandb_group(s.runs[0]) == s.runs[0].group
