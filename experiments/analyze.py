@@ -97,22 +97,23 @@ class HistoryCache:
         self.refresh = refresh
         self.downloads = 0
 
-    def history(self, run) -> tuple[np.ndarray, np.ndarray]:
+    def history(self, run, metric: str | None = None) -> tuple[np.ndarray, np.ndarray]:
         """(env steps, values) of ``run``, sorted by step."""
-        path = os.path.join(self.dir, f"{run.id}__{_slug(self.metric)}.npz")
+        key = metric or self.metric
+        path = os.path.join(self.dir, f"{run.id}__{_slug(key)}.npz")
         if not self.refresh and os.path.exists(path):
             with np.load(path) as data:
                 timesteps, values = data["timesteps"], data["values"]
         else:
             rows = [
                 row
-                for row in run.scan_history(keys=["_step", self.metric])
-                if row.get(self.metric) is not None
+                for row in run.scan_history(keys=["_step", key])
+                if row.get(key) is not None and math.isfinite(float(row[key]))
             ]
             self.downloads += 1
             rows.sort(key=lambda row: row["_step"])
             timesteps = np.array([row["_step"] for row in rows], dtype=float)
-            values = np.array([row[self.metric] for row in rows], dtype=float)
+            values = np.array([row[key] for row in rows], dtype=float)
             if _is_done(run):
                 os.makedirs(self.dir, exist_ok=True)
                 np.savez(path, timesteps=timesteps, values=values)
@@ -127,10 +128,13 @@ def analyze(args: argparse.Namespace, api=None) -> list[str]:
     cache = HistoryCache(args.cache, entity, project, args.metric, args.refresh)
     selections = select(entity, project, args, sweeps, cache, api)
 
+    plot_metrics = list(getattr(args, "plot_metrics", None) or [args.metric])
     curve_of = {}
     for selection in selections:
         for config in selection.selected:
-            curve_of[config.config_key] = config_curve(config, cache, args)
+            for metric in plot_metrics:
+                curve_of[(config.config_key, metric)] = config_curve(config, cache, args, metric)
+            curve_of[config.config_key] = curve_of[(config.config_key, plot_metrics[0])]
 
     os.makedirs(args.out, exist_ok=True)
     meta = _meta(args, entity, project, sweeps)
@@ -283,11 +287,13 @@ def search_space(configs: list[Config], method_key: str, sweeps: list[Sweep]) ->
     return {k: _sorted(vs) for k, vs in space.items()}
 
 
-def config_curve(config: Config, cache: HistoryCache, args) -> tuple[np.ndarray, ...]:
+def config_curve(
+    config: Config, cache: HistoryCache, args, metric: str | None = None
+) -> tuple[np.ndarray, ...]:
     """(grid, IQM, CI low, CI high) of one config: each seed smoothed, then aligned."""
     steps_list, values_list = [], []
     for score in config.runs:
-        steps, values = cache.history(score.run)
+        steps, values = cache.history(score.run, metric)
         steps_list.append(steps)
         values_list.append(curves.smooth(steps, values, args.smooth / 100))
     grid, matrix = curves.align(steps_list, values_list, args.grid_points)
@@ -296,7 +302,7 @@ def config_curve(config: Config, cache: HistoryCache, args) -> tuple[np.ndarray,
 
 
 def plot(envs: list[str], selections: list[Selection], curve_of: dict, methods: list[str], args, stem: str) -> list[str]:
-    """One subplot per env; ``<stem>.png`` and ``<stem>.pdf``. Colours follow ``methods``."""
+    """One subplot per env (or env x metric); ``<stem>.png`` and ``<stem>.pdf``. Colours follow ``methods``."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -304,27 +310,41 @@ def plot(envs: list[str], selections: list[Selection], curve_of: dict, methods: 
     from matplotlib.lines import Line2D
 
     colors = {m: plt.get_cmap("tab10")(i % 10) for i, m in enumerate(methods)}
+    plot_metrics = list(getattr(args, "plot_metrics", None) or [args.metric])
+    raw_log_y = getattr(args, "log_y", None)
+    log_y = set(plot_metrics if raw_log_y == [] else (raw_log_y or ()))
+    multi_metric = len(plot_metrics) > 1
     combined = len(envs) > 1
-    ncols = min(len(envs), 3)
-    nrows = math.ceil(len(envs) / ncols)
+    if multi_metric:
+        ncols = len(plot_metrics)
+        nrows = len(envs)
+        pairs = [(env, m) for env in envs for m in plot_metrics]
+    else:
+        ncols = min(len(envs), 3)
+        nrows = math.ceil(len(envs) / ncols)
+        pairs = [(env, plot_metrics[0]) for env in envs]
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.6 * nrows), squeeze=False)
-    for ax in axes.flat[len(envs):]:
+    for ax in axes.flat[len(pairs):]:
         ax.set_visible(False)
-    for ax, env in zip(axes.flat, envs):
+    for ax, (env, metric) in zip(axes.flat, pairs):
+        use_log_y = metric in log_y
         for selection in (s for s in selections if s.env == env):
             for i, config in enumerate(selection.selected):
-                grid, center, low, high = curve_of[config.config_key]
+                grid, center, low, high = curve_of.get((config.config_key, metric)) or curve_of[config.config_key]
                 color = colors[selection.method]
                 label = selection.method
-                if args.top_k > 1 and config.hps:
+                if (args.top_k > 1 or multi_metric) and config.hps:
                     label += f" ({_hp_text(config.hps)})"
                 ax.plot(grid, center, color=color, linestyle=LINESTYLES[i % len(LINESTYLES)], label=label)
-                ax.fill_between(grid, low, high, color=color, alpha=0.2, linewidth=0)
-        ax.set_title(env)
+                ci_low = np.maximum(low, 1e-12) if use_log_y else low
+                ax.fill_between(grid, ci_low, high, color=color, alpha=0.2, linewidth=0)
+        if use_log_y:
+            ax.set_yscale("log")
+        ax.set_title(f"{env} — {metric}" if (multi_metric and combined) else (metric if multi_metric else env))
         ax.set_xlabel("environment steps")
-        ax.set_ylabel(args.metric)
-        ax.grid(alpha=0.3)
-        if not combined:
+        ax.set_ylabel(metric)
+        ax.grid(True, which="both" if use_log_y else "major", alpha=0.3)
+        if not combined and not multi_metric:
             ax.legend(fontsize="small")
     if combined:
         # labels with hyperparameters differ between envs, so the shared legend shows methods and ranks
@@ -336,6 +356,13 @@ def plot(envs: list[str], selections: list[Selection], curve_of: dict, methods: 
             ]
         fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 6), frameon=False)
         fig.tight_layout(rect=(0, 0.08, 1, 1))
+    elif multi_metric:
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        ncol = 1 if any(len(lbl) > 35 for lbl in labels) else min(len(handles), 3)
+        bottom = 0.04 * math.ceil(len(handles) / ncol) + 0.02
+        fig.suptitle(envs[0])
+        fig.legend(handles, labels, loc="lower center", ncol=ncol, frameon=False, fontsize="small")
+        fig.tight_layout(rect=(0, bottom, 1, 0.95))
     else:
         fig.tight_layout()
     paths = [stem + ".png", stem + ".pdf"]
@@ -403,18 +430,26 @@ def _meta(args, entity: str, project: str, sweeps: list[Sweep]) -> dict:
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         commit = "unknown"
+    plot_metrics = list(getattr(args, "plot_metrics", None) or [args.metric])
+    items = {
+        "date": datetime.date.today().isoformat(),
+        "commit": f"`{commit}`",
+        "sweep files": ", ".join(f"`{s.path}`" for s in sweeps) or "none (all matching runs)",
+        "method key": f"`{args.method_key}`",
+        "metric": f"`{args.metric}`",
+    }
+    if plot_metrics != [args.metric]:
+        items["plot metrics"] = ", ".join(f"`{m}`" for m in plot_metrics)
+    items.update(
+        {
+            "ranking": f"threshold {_fmt(args.threshold)} %, top-{args.top_k}, smoothing {_fmt(args.smooth)} % of training",
+            "curves": f"IQM across seeds, {_fmt(args.ci * 100)} % bootstrap CI ({args.bootstrap} resamples)",
+        }
+    )
     return {
         "title": f"{entity}/{project}: best configs per method",
         "threshold": _fmt(args.threshold),
-        "items": {
-            "date": datetime.date.today().isoformat(),
-            "commit": f"`{commit}`",
-            "sweep files": ", ".join(f"`{s.path}`" for s in sweeps) or "none (all matching runs)",
-            "method key": f"`{args.method_key}`",
-            "metric": f"`{args.metric}`",
-            "ranking": f"threshold {_fmt(args.threshold)} %, top-{args.top_k}, smoothing {_fmt(args.smooth)} % of training",
-            "curves": f"IQM across seeds, {_fmt(args.ci * 100)} % bootstrap CI ({args.bootstrap} resamples)",
-        },
+        "items": items,
     }
 
 
@@ -489,6 +524,14 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--top-k", type=int, default=2, help="configs plotted per method")
     cli.add_argument("--smooth", type=float, default=curves.SMOOTH_FRAC * 100, help="smoothing window, %% of training")
     cli.add_argument("--metric", default=curves.RETURN_METRIC, help="W&B key of the return")
+    cli.add_argument(
+        "--plot-metrics", nargs="+",
+        help="W&B keys to plot side by side for the selected configs (default: --metric)",
+    )
+    cli.add_argument(
+        "--log-y", nargs="*",
+        help="metrics to plot with a log Y-axis (all metrics if given with no values)",
+    )
     cli.add_argument("--grid-points", type=int, default=200)
     cli.add_argument("--bootstrap", type=int, default=2000, help="bootstrap resamples")
     cli.add_argument("--ci", type=float, default=0.95, help="confidence level")
