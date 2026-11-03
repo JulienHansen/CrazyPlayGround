@@ -225,3 +225,20 @@ def test_both_layouts_write_figures_and_reports(sweep_file, tmp_path):
 def test_main_reports_a_missing_project(capsys):
     assert analyze.main(["--entity", "x"]) == 1
     assert "--project" in capsys.readouterr().err
+
+
+def test_plot_metrics_writes_side_by_side_subplots(sweep_file, tmp_path):
+    runs = fake_runs(sweep_file)
+    metrics = [curves.RETURN_METRIC, "Metrics/steady_state_error", "Metrics/settling_time"]
+    args = make_args(
+        sweep_file, tmp_path, "--top-k", "1", "--plot-metrics", *metrics, "--log-y", *metrics[1:]
+    )
+    written = analyze.analyze(args, FakeApi(runs))
+    # 2 methods x 1 top config x 3 seeds x 3 metrics = 18 history scans; non-selected configs = 0 scans
+    assert sum(r.scan_calls for r in runs) == 18
+    assert all(r.scan_calls in (0, 3) for r in runs)
+    assert all(os.path.getsize(p) > 0 for p in written)
+    report = (tmp_path / "out" / "hovering_Vel-Hovering.md").read_text()
+    assert "**plot metrics:** `Reward / Total reward (mean)`, `Metrics/steady_state_error`, `Metrics/settling_time`" in report
+
+
