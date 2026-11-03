@@ -155,7 +155,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # "exp"  = exp(-d / L), steeper near the goal (slope 1 / L at d = 0)
     # "multiexp" = mean_k exp(-d / (L * scale_k)), coarse + fine
     distance_reward_shape: str = "tanh"
-    distance_reward_length: float = 0.8  # L in metres, shared by all shapes; 0.8 = original tanh reward
+    distance_reward_length: float = 0.8  # L in metres, shared by all shapes
     distance_reward_scales: tuple[float, ...] = (1.0, 0.1)  # "multiexp" only: multipliers of the length
 
 
@@ -489,7 +489,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         self.extras["log"]["Metrics/crash_rate"] = died.float().mean()
         full = self.reset_time_outs[env_ids] & ~died & (length == self.episode_length_buf[env_ids])
-        # d0, rise_10_90 and iae_norm stay in step_metrics (play.py --eval_csv) but not in the training log
+        # d0 and rise_10_90 stay in step_metrics (play.py --eval_csv) but not in the training log
         for key in ("tau", "overshoot", "settling_time", "steady_state_error", "effort"):
             mean = metrics[key][full].nanmean()
             if torch.isfinite(mean):  # a NaN would poison skrl's mean over the whole write interval
