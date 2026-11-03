@@ -79,7 +79,7 @@ def test_close_drains_every_queued_row(tmp_path):
 
 
 def test_step_mode_schema(tmp_path):
-    path = tmp_path / "flight.parquet"
+    path = tmp_path / "flights" / "flight.parquet"
     rec = FlightRecorder(str(path), **FIELDS)
     rec.start()
     rec.record(_sample(0))

@@ -19,6 +19,6 @@ def test_iqm_is_the_mean_of_the_central_half():
 
 def test_main_writes_the_figure(tmp_path, capsys):
     flights = [write_flight(tmp_path / f"alternate_{a}.parquet", alternate=a) for a in (False, True)]
-    out = tmp_path / "step.png"
+    out = tmp_path / "flights" / "step.png"
     plot_step_response.main(flights + ["--out", str(out)])
     assert out.stat().st_size > 0 and f"saved {out}" in capsys.readouterr().out

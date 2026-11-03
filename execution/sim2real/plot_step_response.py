@@ -65,6 +65,7 @@ def main(argv=None):
     fig.tight_layout()
 
     if args.out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         fig.savefig(args.out, dpi=120)
         print(f"saved {args.out}")
     else:

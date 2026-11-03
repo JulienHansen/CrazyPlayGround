@@ -42,6 +42,8 @@ def load(path):
             sys.exit(f"{path}: non-finite v{ax} or vel_{ax}")
         cols.setdefault(f"exc_v{ax}", np.zeros(len(cols["step"])))
         cols.setdefault(f"echo_v{ax}", np.full(len(cols["step"]), np.nan))
+        if np.any(cols[f"exc_v{ax}"] != 0) and not np.isfinite(cols[f"echo_v{ax}"]).all():
+            sys.exit(f"{path}: non-finite echo_v{ax} on excited axis (missing ctrltarget.v*?)")
     return cols
 
 
@@ -91,7 +93,9 @@ def step_response(exc, echo, vel, dt):
             echo_delays.append(int(matched[0]))
 
     mean_vel_response = np.mean(norm_vel_windows, axis=0)
-    radio_delay_steps = int(np.median(echo_delays)) if echo_delays else 0
+    if not np.isfinite(echo).all() or not echo_delays:
+        raise ValueError("echo_v* is NaN or never matched the sent step (missing ctrltarget.v*?)")
+    radio_delay_steps = int(np.median(echo_delays))
 
     step_at_5pct = _crossing_step(mean_vel_response, STEP_ONSET, start_step=radio_delay_steps)
     start_63pct = step_at_5pct if isinstance(step_at_5pct, int) else radio_delay_steps

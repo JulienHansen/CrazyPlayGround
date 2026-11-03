@@ -113,3 +113,11 @@ def test_rejects_a_recording_with_skipped_steps(tmp_path):
     with pytest.raises(SystemExit, match="not consecutive"):
         mdn.main([path])
 
+
+def test_rejects_nan_echo(tmp_path):
+    exc, echo, y = synthetic_step_flight(2, 0.0)
+    echo[:] = np.nan
+    with pytest.raises(ValueError, match="ctrltarget"):
+        mdn.step_response(exc, echo, y, DT)
+
+

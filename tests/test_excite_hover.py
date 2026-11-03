@@ -112,3 +112,23 @@ def test_cli_refuses_flights_the_estimator_cannot_use(mod, tmp_path, monkeypatch
             mod.main()
     assert len(seen) == 1
 
+
+def test_missing_ctrltarget_raises_before_takeoff(mod, tmp_path):
+    cf = FakeCf(steps=10)
+    orig_add_config = cf.log.add_config
+
+    def reject_ctrltarget(logconf):
+        if logconf.name == "ctrltarget":
+            raise KeyError("ctrltarget.vx")
+        orig_add_config(logconf)
+
+    cf.log.add_config = reject_ctrltarget
+    mod.Crazyflie = lambda **kwargs: cf
+    flight = mod.ExciteHover(uri="fake", run_args=argparse.Namespace(record_path=str(tmp_path / "f.parquet"), record_every=1, log_every=100),
+                             axis=0, amp=AMP, step_s=1.0, recover_s=4.0, duration=30.0)
+    with pytest.raises(RuntimeError, match="ctrltarget"):
+        flight._connected("fake")
+    assert not flight.running
+    assert cf.calls_to("takeoff") == []
+
+

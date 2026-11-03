@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import threading
 import time
@@ -116,6 +117,7 @@ class FlightRecorder:
     def start(self) -> None:
         """Open the Parquet writer (if recording) and launch the recorder thread."""
         if self.record_path:
+            os.makedirs(os.path.dirname(os.path.abspath(self.record_path)), exist_ok=True)
             self._schema = self._schema.with_metadata({str(k): str(v) for k, v in self.metadata.items()})
             self._writer = pq.ParquetWriter(self.record_path, self._schema)
         self._thread = threading.Thread(target=self._drain_loop, daemon=True)

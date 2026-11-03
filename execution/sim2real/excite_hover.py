@@ -101,11 +101,11 @@ class ExciteHover(CrazyflieStateBase):
         self.cf.connection_lost.add_callback(self._connection_lost)
 
     def _connected(self, uri: str):
+        self.setup_state_logging()
+        self._setup_target_logging()
         logger.info(f"Connected to {uri}, taking off...")
         self.cf.high_level_commander.takeoff(0.5, 1)
         time.sleep(1.5)
-        self.setup_state_logging()
-        self._setup_target_logging()
         threading.Thread(target=self.control_loop, daemon=True).start()
 
     def _setup_target_logging(self):
@@ -116,8 +116,8 @@ class ExciteHover(CrazyflieStateBase):
         try:
             self.cf.log.add_config(logconf)
         except (KeyError, AttributeError) as e:
-            logger.warning(f"Log block ctrltarget unavailable ({e}); echo_v* columns stay NaN")
-            return
+            self.running = False
+            raise RuntimeError(f"Log block ctrltarget unavailable ({e}): firmware must expose {CTRLTARGET_VARS}") from e
 
         def _callback(timestamp, data, logconf):
             with self.lock:
