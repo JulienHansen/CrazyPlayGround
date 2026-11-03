@@ -24,6 +24,8 @@ _isaac_sim/
 logs/
 outputs/
 runs/
+flights/
+*.parquet
 
 # Weights & Biases
 wandb/

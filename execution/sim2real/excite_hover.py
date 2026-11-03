@@ -22,7 +22,6 @@ import os
 import sys
 import time
 import importlib.metadata
-import subprocess
 import threading
 import argparse
 import logging
@@ -37,6 +36,8 @@ from cflib.crazyflie.log import LogConfig
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "single_drone_exec"))
 from common.flight_recorder import CrazyflieStateBase  # noqa: E402
 from common.utils import emergency_land, land_once, wait_until, add_run_args  # noqa: E402
+from excitation import (INTERVAL, EXC_START_S, step_signal, excitation_command,  # noqa: E402
+                        add_excitation_args, check_excitation_args, excitation_metadata)
 
 device = torch.device("cpu")  # no model: nothing to gain from a GPU
 logging.basicConfig(format="{asctime} [{levelname}] {message}", style="{",
@@ -46,34 +47,12 @@ logger = logging.getLogger("CrazyflieRL")
 # ── Safety thresholds (as hover/exec_vel.py) ─────────────────────────────────
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without a position callback before emergency land
 POS_VARIANCE_THRESHOLD = 0.5   # kalman position variance [m²] above which tracking is unreliable
-GRACE_PERIOD           = 3.0   # seconds before enforcing the z lower bound
+GRACE_PERIOD           = 3.0   # seconds before enforcing the z lower bound, at most EXC_START_S
 
-INTERVAL = 0.01      # 100 Hz, the policy step (sim dt=1/500, decimation=5)
 SPIN_MARGIN = 0.002  # sleep to 2 ms before each deadline, busy-wait the rest (see wait_until)
-MAX_VEL = 1.0        # m/s, vel_hovering.py max_velocity
-KP, HOLD_MAX = 1.0, 0.3  # 1/s, m/s: holds the unexcited axes on target
 
-# ── Step Excitation ──────────────────────────────────────────────────────────
-EXC_START_S = GRACE_PERIOD  # the z-floor watchdog is armed before the drone is pushed
-EXC_MAX_AMP = 1.0           # m/s, MAX_VEL: the command is clamped there anyway
+# ── Step Excitation (signal, command law and flags in excitation.py) ─────────
 CTRLTARGET_VARS = ["ctrltarget.vx", "ctrltarget.vy", "ctrltarget.vz"]
-
-
-def step_signal(axis: int, amp: float, step_s: float, recover_s: float, t: float) -> tuple:
-    """(world velocity step [m/s], hold_on) on `axis`, `t` s into the flight.
-
-    Cycles REST / PUSH (step_s each, P hold off on `axis`) then RECOVER (recover_s, P hold on).
-    The PUSH is always `amp`, so every step is in one direction. Before EXC_START_S: no step and
-    the P hold is on.
-    """
-    exc = [0.0, 0.0, 0.0]
-    s = t - EXC_START_S
-    if s < 0:
-        return exc, True
-    phase_t = s % (2 * step_s + recover_s)
-    if step_s <= phase_t < 2 * step_s:
-        exc[axis] = amp
-    return exc, phase_t >= 2 * step_s
 
 
 class ExciteHover(CrazyflieStateBase):
@@ -174,21 +153,16 @@ class ExciteHover(CrazyflieStateBase):
                 break
 
             state = self.snapshot()  # one consistent read, used for the command and its recorded row
-            err = target - state.pos
-            hold = (KP * err).clamp(-HOLD_MAX, HOLD_MAX)
-            exc, hold_on = step_signal(self.axis, self.amp, self.step_s, self.recover_s, elapsed)
-            # Keep the position P-hold on the two unexcited axes so the drone stays in place,
-            # but zero it on the excited axis outside RECOVER so the sent velocity is a pure step.
-            if not hold_on:
-                hold[self.axis] = 0.0
-            cmd = (hold + torch.tensor(exc)).clamp(-MAX_VEL, MAX_VEL)
+            pos_error = target - state.pos
+            step_vel, hold_on_exc_axis = step_signal(self.axis, self.amp, self.step_s, self.recover_s, elapsed)
+            hold_vel, setpoint_vel = excitation_command(pos_error, self.axis, step_vel, hold_on_exc_axis)
             control_time = time.time()
-            self.cf.commander.send_velocity_world_setpoint(*cmd.tolist(), 0.0)  # yaw_rate = 0
+            self.cf.commander.send_velocity_world_setpoint(*setpoint_vel.tolist(), 0.0)  # yaw_rate = 0
             t_sent = time.perf_counter()
 
             deadline, slept_ms, overran = wait_until(deadline + INTERVAL, SPIN_MARGIN)
-            self.record_step(step, state, control_time, target, err, hold, cmd,
-                             exc + echo + [(t_sent - t_body) * 1e3, slept_ms, overran])
+            self.record_step(step, state, control_time, target, pos_error, hold_vel, setpoint_vel,
+                             step_vel + echo + [(t_sent - t_body) * 1e3, slept_ms, overran])
             step += 1
 
         land_once(self)  # at once, never send_stop_setpoint: it cuts the motors mid-air
@@ -213,20 +187,12 @@ class ExciteHover(CrazyflieStateBase):
 
 def run_metadata(args) -> dict:
     """What flew, stored in the recording's Parquet footer."""
-    meta = {"uri": args.uri, "argv": " ".join(sys.argv), "target": str(args.target),
-            "duration_s": str(args.duration), "excitation": "push_recover", "exc_axis": args.exc_axis,
-            "exc_amp": str(args.exc_amp), "exc_step_s": str(args.exc_step),
-            "exc_recover_s": str(args.exc_recover), "kp": str(KP)}
+    meta = {"uri": args.uri, **excitation_metadata(args)}
     for package in ("torch", "cflib"):  # cflib has no __version__
         try:
             meta[f"{package}_version"] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             meta[f"{package}_version"] = "unknown"
-    try:
-        meta["git_commit"] = subprocess.run(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
-                                            capture_output=True, text=True, check=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        meta["git_commit"] = "unknown"
     return meta
 
 
@@ -236,25 +202,14 @@ def main():
     parser.add_argument("--uri", type=str, default="radio://0/80/2M/E7E7E7E7E8", help="URI of the Crazyflie")
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Hover target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
-    parser.add_argument("--exc-axis", choices=["x", "y", "z"], default="x",
-                        help="World axis to excite. Prefer x/y: z from a 0.5 m hover nears the 0.1 m floor cut-out.")
-    parser.add_argument("--exc-amp", type=float, default=0.2, help=f"Step amplitude [m/s], |amp| at most {EXC_MAX_AMP}. Its sign is the push direction.")
-    parser.add_argument("--exc-step", type=float, default=1.0,
-                        help="Seconds of each REST and PUSH phase, in [0.1, 5]. Longer than the step's t90.")
-    parser.add_argument("--exc-recover", type=float, default=4.0,
-                        help="Seconds of P hold back to the target between steps. ~6 s at --exc-amp 1.")
-    parser.add_argument("--duration", type=float, default=90.0, help="Seconds of flight before landing.")
+    add_excitation_args(parser)
     add_run_args(parser)
     args = parser.parse_args()
     if not args.record_path:
         parser.error("--record-path is required: the flight exists to be recorded")
     if args.record_every != 1:
         parser.error("--record-every must be 1: the noise correlation is per control step")
-    if args.duration <= EXC_START_S:
-        parser.error(f"--duration must be above {EXC_START_S:g} s, when the excitation starts")
-    if not 0 < abs(args.exc_amp) <= EXC_MAX_AMP or not 0.1 <= args.exc_step <= 5 or args.exc_recover < 0:
-        parser.error(f"|--exc-amp| must be in (0, {EXC_MAX_AMP}] m/s, --exc-step in [0.1, 5] s "
-                     f"and --exc-recover >= 0 s")
+    check_excitation_args(parser, args)
 
     flight = ExciteHover(uri=args.uri, run_args=args, axis="xyz".index(args.exc_axis),
                          amp=args.exc_amp, step_s=args.exc_step, recover_s=args.exc_recover,
