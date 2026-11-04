@@ -86,6 +86,11 @@ def step_terms(env, cmd):
         {"distance_reward_curriculum_steps": -1},
         {"distance_reward_curriculum_steps": 100, "distance_reward_length_min": 0.0},
         {"distance_reward_curriculum_steps": 100, "distance_reward_length": 0.2, "distance_reward_length_min": 0.3},
+        {"distance_reward_curriculum_ratio": -0.1},
+        {"distance_reward_curriculum_ratio": 1.1},
+        {"distance_reward_curriculum_ratio": 0.5, "total_steps": 0},
+        {"distance_reward_curriculum_ratio": 0.5, "total_steps": 100, "distance_reward_length_min": 0.0},
+        {"distance_reward_curriculum_ratio": 0.5, "total_steps": 100, "distance_reward_length": 0.2, "distance_reward_length_min": 0.3},
     ],
 )
 def test_invalid_knobs_raise(knobs):
@@ -399,6 +404,24 @@ def test_distance_curriculum_decays_exponentially():
         # the reward uses the scheduled L: at d = L the tanh reward is 1 - tanh(1)
         d = torch.full((1,), length_min, device=env.device)
         torch.testing.assert_close(env._distance_reward(d), 1 - torch.tanh(torch.ones(1, device=env.device)))
+    finally:
+        env.close()
+
+
+def test_distance_curriculum_ratio_decays_exponentially():
+    ratio, total_steps, length, length_min = 0.5, 200, 0.8, 0.05
+    env = make_env(
+        distance_reward_curriculum_ratio=ratio,
+        total_steps=total_steps,
+        distance_reward_length=length,
+        distance_reward_length_min=length_min,
+    )
+    try:
+        # ratio 0.5 of 200 steps is 100 steps
+        steps = 100
+        for counter, expected in [(0, length), (steps // 2, (length * length_min) ** 0.5), (steps, length_min), (3 * steps, length_min)]:
+            env.common_step_counter = counter
+            assert env._distance_reward_length() == pytest.approx(expected)
     finally:
         env.close()
 

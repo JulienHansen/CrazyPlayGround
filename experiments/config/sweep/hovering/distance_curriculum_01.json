@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "wandb": { "project": "hovering" },
+  "wandb": { "project": "hovering-curriculum" },
   "defaults": {
     "trainer": "skrl",
     "env_name": "Vel-Hovering",
     "algo": "PPO",
     "num_envs": 8192,
     "total_timesteps": 200e6,
-    "rollout_length": 32,
-    "lr": 2.5e-4,
+    "rollout_length": 64,
+    "lr": 1.0e-4,
     "lambda_coef": 0.99,
     "entropy_coef": 0.0,
     "env_kwargs": {
@@ -20,7 +20,7 @@
       "torque_scale_range": [1.0, 1.0],
       "action_latency_steps": 0,
       "action_latency_max_steps": 0,
-      "distance_reward_shape": "exp",
+      "distance_reward_shape": "multiexp",
       "distance_reward_length": 0.8,
       "distance_reward_length_min": 0.1
     },
@@ -31,7 +31,7 @@
     { "name": "fixed-L0.1", "env_kwargs": { "distance_reward_length": 0.1 } },
     {
       "name": "curriculum-0.8to0.1",
-      "sweep": { "env_kwargs.distance_reward_curriculum_steps": [6100, 12200, 24400] }
+      "sweep": { "env_kwargs.distance_reward_curriculum_ratio": [0.25, 0.5, 1.0] }
     }
   ]
 }

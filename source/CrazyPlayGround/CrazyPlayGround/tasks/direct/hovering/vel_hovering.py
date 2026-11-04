@@ -161,9 +161,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     distance_reward_shape: str = "tanh"
     distance_reward_length: float = 0.8  # L in metres, shared by all shapes
     distance_reward_scales: tuple[float, ...] = (1.0, 0.1)  # "multiexp" only: multipliers of the length
-    # curriculum on L: policy steps (common_step_counter) to decay L down to the minimum; 0 = L fixed
+    # curriculum on L:
+    # Option A: ratio in [0.0, 1.0] of total training steps (e.g. 0.5 = 50% of total steps)
+    distance_reward_curriculum_ratio: float = 0.0
+    # Option B: policy steps (common_step_counter) directly; 0 = L fixed when ratio is 0.0
     distance_reward_curriculum_steps: int = 0
     distance_reward_length_min: float = 0.1  # final L in metres; only used with the curriculum on
+    total_steps: int = 0  # total training steps per env, injected by train.py or cfg
 
 
 def check_cfg(cfg: QuadcopterEnvCfg):
@@ -195,11 +199,19 @@ def check_cfg(cfg: QuadcopterEnvCfg):
             f"distance_reward_scales must be non-empty and all > 0, got {cfg.distance_reward_scales}",
         ),
         (
+            0.0 <= cfg.distance_reward_curriculum_ratio <= 1.0,
+            f"distance_reward_curriculum_ratio must be in [0.0, 1.0], got {cfg.distance_reward_curriculum_ratio}",
+        ),
+        (
+            cfg.distance_reward_curriculum_ratio == 0.0 or cfg.total_steps > 0,
+            f"distance_reward_curriculum_ratio > 0 requires total_steps > 0, got {cfg.total_steps}",
+        ),
+        (
             cfg.distance_reward_curriculum_steps >= 0,
             f"distance_reward_curriculum_steps must be >= 0, got {cfg.distance_reward_curriculum_steps}",
         ),
         (
-            not cfg.distance_reward_curriculum_steps
+            (not cfg.distance_reward_curriculum_steps and not cfg.distance_reward_curriculum_ratio)
             or 0.0 < cfg.distance_reward_length_min <= cfg.distance_reward_length,
             f"distance_reward_length_min must be in (0, distance_reward_length={cfg.distance_reward_length}], "
             f"got {cfg.distance_reward_length_min}",
@@ -416,14 +428,23 @@ class QuadcopterEnv(DirectRLEnv):
             return torch.exp(-distance[:, None] / (length * scales)).mean(1)
         return 1 - torch.tanh(distance / length)
 
+    def _curriculum_steps(self) -> int:
+        """Effective steps over which the curriculum decays L: calculated from
+        distance_reward_curriculum_ratio * total_steps if ratio > 0, else distance_reward_curriculum_steps."""
+        cfg = self.cfg
+        if cfg.distance_reward_curriculum_ratio > 0.0:
+            return int(round(cfg.distance_reward_curriculum_ratio * cfg.total_steps))
+        return cfg.distance_reward_curriculum_steps
+
     def _distance_reward_length(self) -> float:
         """Current L: distance_reward_length decayed exponentially to distance_reward_length_min over
-        distance_reward_curriculum_steps policy steps, then held; fixed when the curriculum is off."""
+        the curriculum duration (ratio or policy steps), then held; fixed when the curriculum is off."""
         cfg = self.cfg
-        if not cfg.distance_reward_curriculum_steps:
+        steps = self._curriculum_steps()
+        if not steps:
             return cfg.distance_reward_length
         # shortcut: common_step_counter restarts at 0 on --checkpoint resume and in play, so the schedule does too
-        progress = min(self.common_step_counter / cfg.distance_reward_curriculum_steps, 1.0)
+        progress = min(self.common_step_counter / steps, 1.0)
         return cfg.distance_reward_length * (cfg.distance_reward_length_min / cfg.distance_reward_length) ** progress
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -451,6 +472,10 @@ class QuadcopterEnv(DirectRLEnv):
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
         extras["Metrics/final_distance_to_goal"] = final_distance_to_goal
         extras["Curriculum/distance_reward_length"] = torch.tensor(self._distance_reward_length())
+        curriculum_steps = self._curriculum_steps()
+        if curriculum_steps > 0:
+            progress = min(self.common_step_counter / curriculum_steps, 1.0)
+            extras["Curriculum/progress"] = torch.tensor(progress)
         self.extras["log"].update(extras)
         self._log_step_response(env_ids)
 
