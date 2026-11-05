@@ -11,6 +11,7 @@ import pytest
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real", "hovering"))
 from plot_hover import (  # noqa: E402
     build_plot_parser,
+    crop_recording,
     load_recording,
     load_telemetry,
     main,
@@ -112,7 +113,7 @@ def test_plot_comparison_overlays_position_velocity_and_command(tmp_path, monkey
             assert set(lines) == {"real:real", "sim:sim"} | ({"target"} if r == 0 else set())
             assert lines["real:real"].get_ydata() == pytest.approx(getattr(real, attr)[:, i])
             assert lines["sim:sim"].get_ydata() == pytest.approx(getattr(sim, attr)[:, i])
-            assert lines["sim:sim"].get_linestyle() == "--" and lines["real:real"].get_linestyle() == "-"
+            assert lines["sim:sim"].get_linestyle() == "-" and lines["real:real"].get_linestyle() == "-"
     assert len(fig.legends) == 1
     assert [t.get_text() for t in fig.legends[0].get_texts()] == ["real: real", "sim: sim", "target"]
     assert "sim starts 20 cm from real" in capsys.readouterr().out
@@ -124,6 +125,20 @@ def test_main_compare_writes_one_figure(tmp_path):
     assert (tmp_path / "sim_real_comparison.png").stat().st_size > 0
     main(files + ["--compare", "--out", str(tmp_path / "figs" / "cmp.png")])
     assert (tmp_path / "figs" / "cmp.png").stat().st_size > 0
+
+
+def test_crop_recording_keeps_the_first_seconds(tmp_path):
+    rec = crop_recording(load_recording(real_flight(tmp_path / "real.parquet")), 0.205)  # 100 Hz: steps 0..20
+    assert rec.times[-1] == pytest.approx(0.2) and len(rec.times) == 21
+    assert all(len(getattr(rec, a)) == 21 for a in ("positions", "velocities", "cmd_velocities", "targets"))
+
+
+def test_main_t_max(tmp_path):
+    files = [real_flight(tmp_path / "real.parquet"), sim_flight(tmp_path / "sim.parquet")]
+    main(files + ["--compare", "--t-max", "0.2"])
+    assert (tmp_path / "sim_real_comparison.png").stat().st_size > 0
+    with pytest.raises(SystemExit):
+        main(files + ["--compare", "--t-max", "0"])
 
 
 def test_main_compare_needs_two_recordings(tmp_path):

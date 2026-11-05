@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import numpy as np
@@ -212,6 +212,13 @@ class HoverRecording:
     targets: np.ndarray
 
 
+def crop_recording(rec: HoverRecording, t_max: float) -> HoverRecording:
+    """The part of `rec` with times <= t_max seconds."""
+    keep = rec.times <= t_max
+    return replace(rec, times=rec.times[keep], positions=rec.positions[keep], velocities=rec.velocities[keep],
+                   cmd_velocities=rec.cmd_velocities[keep], targets=rec.targets[keep])
+
+
 def _footer(path: str) -> dict[str, str]:
     """Parquet footer metadata as str -> str; empty for CSV."""
     if not path.endswith(".parquet"):
@@ -272,7 +279,7 @@ def plot_comparison(
     """Overlay recordings (typically one sim, one real) on shared axes.
 
     One column per axis; rows are position, measured velocity and commanded velocity. Each
-    recording keeps one colour across all subplots, solid for real and dashed for sim.
+    recording keeps one colour across all subplots, solid lines for both, told apart by colour and legend.
 
     Args:
         recordings: Recordings from `load_recording`.
@@ -316,7 +323,7 @@ def plot_comparison(
             ax = ax_arr[r, i]
             first = r == 0 and i == 0  # labels on one subplot only: they feed the single figure legend
             for j, rec in enumerate(recordings):
-                ax.plot(rec.times, getattr(rec, attr)[:, i], "--" if rec.source == "sim" else "-",
+                ax.plot(rec.times, getattr(rec, attr)[:, i], "-",
                         color=f"C{j}", lw=1.3, gid=f"{rec.source}:{rec.name}",
                         label=f"{rec.source}: {rec.name}" if first else None)
                 if r == 0 and not shared_target:
@@ -402,6 +409,13 @@ def build_plot_parser() -> argparse.ArgumentParser:
         metavar=("YMIN", "YMAX"),
         help="With --compare: custom y-axis limits for the velocity-command row.",
     )
+    parser.add_argument(
+        "--t-max",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Plot only the first SECONDS of each recording (e.g. --t-max 10).",
+    )
     return parser
 
 
@@ -418,6 +432,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         recordings = [load_recording(path) for path in args.files]
     except (ValueError, FileNotFoundError) as e:
         parser.error(str(e))
+    if args.t_max is not None:
+        if args.t_max <= 0:
+            parser.error("--t-max must be positive")
+        recordings = [crop_recording(rec, args.t_max) for rec in recordings]
 
     if args.compare:
         outdir = args.outdir or os.path.dirname(os.path.abspath(args.files[0]))
