@@ -262,3 +262,52 @@ def test_a_batch_that_fails_to_write_is_dropped_once(tmp_path):
         rec.record(sample)
     rec.close()
     assert _read(path)["step"] == list(range(5)) + list(range(10, 30))
+    assert rec.skipped == 5 and rec.written == 25   # the whole dropped batch is counted
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_final_flush_failure_does_not_kill_the_thread(tmp_path, caplog):
+    """The flush at close() runs outside the per-row try: a bad last batch must be counted, not crash."""
+    path = tmp_path / "flight.parquet"
+    rec = FlightRecorder(str(path), batch_size=10, **FIELDS)
+    rec.start()
+    for step in range(15):
+        sample = _sample(step)
+        if step == 12:
+            sample["obs"] = ["x", "y"]   # builds, but pyarrow cannot write it
+        rec.record(sample)
+    rec.close()
+    assert _read(path)["step"] == list(range(10))
+    assert rec.skipped == 5 and rec.written == 10
+    assert "Recorder skipped 5 row(s), see the first error above" in caplog.messages
+
+
+def test_extra_fields_are_recorded(tmp_path):
+    """Regression: a merge once dropped the extra columns from each row, which emptied every exec_vel flight."""
+    path = tmp_path / "flight.parquet"
+    rec = FlightRecorder(str(path), extra_fields=["e0", "e1"], **FIELDS)
+    rec.start()
+    for step in range(120):   # two full batches of 50 and a partial one
+        rec.record({**_sample(step), "extra": [float(step), 2.0 * step]})
+    rec.close()
+    table = _read(path)
+    assert table["step"] == list(range(120))
+    assert table["e0"] == [float(s) for s in range(120)]
+    assert table["e1"] == [2.0 * s for s in range(120)]
+    assert rec.skipped == 0 and rec.written == 120
+
+
+def test_declared_column_missing_fails_each_row_from_step_0(tmp_path, caplog):
+    """A declared column the sample does not fill fails on its own row at step 0, not 50 steps later in
+    the batch, and close() says the file is empty."""
+    path = tmp_path / "flight.parquet"
+    rec = FlightRecorder(str(path), extra_fields=["e0"], **FIELDS)
+    rec.start()
+    for step in range(60):
+        rec.record(_sample(step))   # no "extra"
+    rec.close()
+    assert _read(path)["step"] == []
+    assert rec.skipped == 60 and rec.written == 0
+    failures = [m for m in caplog.messages if m.startswith("Recorder failed at step")]
+    assert failures == ["Recorder failed at step 0; skipping bad rows"]
+    assert f"Recording {path} holds no rows" in caplog.messages

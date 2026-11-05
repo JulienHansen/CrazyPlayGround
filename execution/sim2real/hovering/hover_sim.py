@@ -4,10 +4,19 @@ Flies an RL checkpoint from a user-specified starting position to a target hover
 for a duration of --time seconds, computing step-response metrics (tau, rise time, overshoot,
 settling time, steady-state error) and delegating plot generation to plot_hover.py.
 
+Every run is recorded to --record-path (required), in exec_vel.py's format: the same columns
+(control_time, pos_*, vel_*, target_*, vx/vy/vz, ...) plus `source: sim` in the Parquet footer, so
+plot_hover.py reads a sim run and a real flight the same way and can overlay them (--compare).
+
 Usage:
     python execution/sim2real/hovering/hover_sim.py --checkpoint logs/.../best_agent.pt \
         --start-pos 0.5 0.0 1.0 --target 0.0 0.0 1.0 --time 10.0 --no-video \
-        --ylim -0.05 0.55 --outdir outputs/sim2real/test
+        --ylim -0.05 0.55 --outdir outputs/sim2real/test --record-path outputs/sim2real/test/sim.parquet
+
+    # matched to a real exec_vel.py flight (which starts at the 0.5 m takeoff height), for --compare
+    python execution/sim2real/hovering/hover_sim.py --checkpoint logs/.../best_agent.pt \
+        --start-pos 0.0 0.0 0.5 --target 0.5 0.0 1.0 --time 30 --no-video \
+        --record-path flights/sim_x0.5_z1.parquet
 """
 
 from __future__ import annotations
@@ -15,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Sequence
 
 import numpy as np
 
@@ -23,6 +33,63 @@ try:
     from .plot_hover import plot_step_response, plot_target_error
 except ImportError:
     from plot_hover import plot_step_response, plot_target_error
+
+
+def hover_row(
+    step: int,
+    t: float,
+    pos: Sequence[float],
+    vel: Sequence[float],
+    quat_wxyz: Sequence[float],
+    target: Sequence[float],
+    action: Sequence[float],
+    cmd: Sequence[float],
+) -> dict:
+    """One control step under the column names FlightRecorder uses for exec_vel.py.
+
+    Args:
+        step: Control-step index.
+        t: Seconds since the first step; stored as `control_time` (a real flight stores epoch
+            seconds there, and plot_hover.py subtracts the first value from both).
+        pos: (3,) position relative to the env origin, world frame, m.
+        vel: (3,) linear velocity, world frame, m/s.
+        quat_wxyz: (4,) attitude quaternion (w, x, y, z).
+        target: (3,) target position, world frame, m.
+        action: (3,) policy action in [-1, 1] (`action_v*`).
+        cmd: (3,) commanded velocity, world frame, m/s (`vx/vy/vz`): action * max_velocity.
+
+    Returns:
+        The row as {column: value}; `obs_age_s` is 0.0 since the sim has no radio.
+    """
+    row = {"step": int(step), "control_time": float(t), "obs_age_s": 0.0}
+    for prefix, values in (("pos_", pos), ("vel_", vel)):
+        row.update({prefix + ax: float(v) for ax, v in zip("xyz", values, strict=True)})
+    row.update({"quat_" + c: float(v) for c, v in zip("wxyz", quat_wxyz, strict=True)})
+    for prefix, values in (("target_", target), ("action_v", action), ("v", cmd)):
+        row.update({prefix + ax: float(v) for ax, v in zip("xyz", values, strict=True)})
+    return row
+
+
+def write_recording(path: str, rows: list[dict], metadata: dict) -> None:
+    """Write hover_row rows to Parquet as FlightRecorder does: `step` int64, the rest float64.
+
+    Twin of `write_recording` in system-identification/excitation.py (that folder is not a package).
+
+    Args:
+        path: Parquet file to write; its folder is created if needed.
+        rows: Rows from `hover_row`, all with the same columns.
+        metadata: Footer key/values, stored as str -> str.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    names = list(rows[0]) if rows else ["step"]
+    table = pa.table(
+        {name: pa.array([row[name] for row in rows], type=pa.int64() if name == "step" else pa.float64())
+         for name in names}
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    pq.write_table(table.replace_schema_metadata({str(k): str(v) for k, v in metadata.items()}), path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,8 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-path",
         type=str,
-        default=None,
-        help="Optional Parquet file to save full flight telemetry.",
+        required=True,
+        help="Parquet file to write the flight to, in exec_vel.py's format (read by plot_hover.py).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
     return parser
@@ -231,7 +298,8 @@ if __name__ == "__main__":
         positions = []
         velocities = []
         cmd_velocities = []
-        records = []
+        rows = []
+        ended_at = None
 
         print(
             f"[INFO] Simulating hover: start={args_cli.start_pos}, target={args_cli.target}, "
@@ -254,39 +322,22 @@ if __name__ == "__main__":
             pos = (u._robot.data.root_pos_w[0] - origin).clone()
             vel = u._robot.data.root_lin_vel_w[0].clone()
             action_row = action[0] if action.ndim > 1 else action
-            cmd = (action_row[:3].cpu().numpy()) * max_velocity
+            action_np = action_row[:3].cpu().numpy()  # policy action in [-1, 1]
+            cmd = action_np * max_velocity  # commanded velocity, world frame, m/s (already NumPy)
             t = round(step * dt, 4)
 
             times.append(t)
             positions.append(pos.cpu().numpy())
             velocities.append(vel.cpu().numpy())
-            cmd_velocities.append(cmd.cpu().numpy())
+            cmd_velocities.append(cmd)
 
-            if args_cli.record_path:
-                quat = u._robot.data.root_quat_w[0].tolist()
-                records.append(
-                    {
-                        "step": step,
-                        "time": t,
-                        "pos_x": pos[0].item(),
-                        "pos_y": pos[1].item(),
-                        "pos_z": pos[2].item(),
-                        "vel_x": vel[0].item(),
-                        "vel_y": vel[1].item(),
-                        "vel_z": vel[2].item(),
-                        "cmd_vx": cmd[0].item(),
-                        "cmd_vy": cmd[1].item(),
-                        "cmd_vz": cmd[2].item(),
-                        "quat_w": quat[0],
-                        "quat_x": quat[1],
-                        "quat_y": quat[2],
-                        "quat_z": quat[3],
-                    }
-                )
+            quat_wxyz = u._robot.data.root_quat_w[0].tolist()  # Isaac Lab 2.x order
+            rows.append(hover_row(step, t, pos.tolist(), vel.tolist(), quat_wxyz, args_cli.target, action_np, cmd))
 
             obs, _, terminated, truncated, _ = env.step(action)
             if terminated.any() or truncated.any():
                 print(f"[WARN] Episode ended at step {step}/{n_steps} (z={pos[2].item():.2f} m)")
+                ended_at = step
                 break
 
         env.close()
@@ -351,16 +402,23 @@ if __name__ == "__main__":
             ylim=error_ylim,
         )
 
-        # ── Write optional Parquet telemetry ────────────────────────────────
-        if args_cli.record_path and records:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-
+        # ── Write the Parquet recording (exec_vel.py's format) ──────────────
+        if rows:
             rec_path = os.path.abspath(args_cli.record_path)
-            os.makedirs(os.path.dirname(rec_path), exist_ok=True)
-            table = pa.Table.from_pylist(records)
-            pq.write_table(table, rec_path)
-            print(f"[INFO] Wrote {len(records)} telemetry rows to {rec_path}")
+            metadata = {
+                "source": "sim",
+                "task": args_cli.task,
+                "checkpoint": checkpoint_path,
+                "seed": args_cli.seed,
+                "start_pos": list(args_cli.start_pos),
+                "target": list(args_cli.target),
+                "sim_dt": env_cfg.sim.dt,
+                "decimation": env_cfg.decimation,
+                "max_velocity": max_velocity,
+                "ended_at_step": ended_at,
+            }
+            write_recording(rec_path, rows, metadata)
+            print(f"[INFO] Wrote {len(rows)} telemetry rows to {rec_path}")
 
     try:
         run_simulation()

@@ -1,9 +1,22 @@
-"""Plotting routines and standalone CLI for sim2real hover evaluation."""
+"""Plotting routines and standalone CLI for sim2real hover evaluation.
+
+Reads one recording format, exec_vel.py's (FlightRecorder columns: control_time, pos_*, vel_*,
+target_*, vx/vy/vz). Real flights write it, and so does hover_sim.py, adding `source: sim` to the
+Parquet footer; a file without that key is a real flight.
+
+Usage:
+    # step-response and target-error figures, one pair per recording (<stem>_step_response.png, ...)
+    python execution/sim2real/hovering/plot_hover.py flights/flight.parquet [more.parquet ...]
+
+    # sim and real overlaid: position, velocity and velocity command, one column per axis
+    python execution/sim2real/hovering/plot_hover.py flights/flight.parquet flights/sim.parquet --compare
+"""
 
 from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
@@ -176,25 +189,186 @@ def load_telemetry(file_path: str) -> dict[str, np.ndarray]:
             return load_telemetry(file_path + ".parquet")
 
 
+@dataclass
+class HoverRecording:
+    """One hover recording, sim or real, in the units and frames the plots use.
+
+    Attributes:
+        name: File name without extension.
+        source: "sim" or "real".
+        times: (N,) seconds since the first recorded step.
+        positions: (N, 3) position, world frame, m.
+        velocities: (N, 3) measured linear velocity, world frame, m/s.
+        cmd_velocities: (N, 3) commanded velocity sent to the velocity controller, world frame, m/s.
+        targets: (N, 3) target position, world frame, m.
+    """
+
+    name: str
+    source: str
+    times: np.ndarray
+    positions: np.ndarray
+    velocities: np.ndarray
+    cmd_velocities: np.ndarray
+    targets: np.ndarray
+
+
+def _footer(path: str) -> dict[str, str]:
+    """Parquet footer metadata as str -> str; empty for CSV."""
+    if not path.endswith(".parquet"):
+        return {}
+    import pyarrow.parquet as pq
+
+    metadata = pq.read_schema(path).metadata or {}
+    return {k.decode(): v.decode() for k, v in metadata.items()}
+
+
+RECORDING_COLUMNS = ("control_time",) + tuple(
+    f"{prefix}{ax}" for prefix in ("pos_", "vel_", "target_", "v") for ax in "xyz"
+)
+"""The exec_vel.py (FlightRecorder) columns the plots read; hover_sim.py writes the same."""
+
+
+def load_recording(path: str) -> HoverRecording:
+    """Load a hover recording in exec_vel.py's format, from a real flight or from hover_sim.py.
+
+    Args:
+        path: Recording (.parquet; .csv carries no footer, so it always loads as real).
+
+    Returns:
+        The recording, with times starting at 0 (a real flight's control_time is epoch seconds).
+
+    Raises:
+        ValueError: The file holds no rows or lacks a column of RECORDING_COLUMNS.
+    """
+    data = load_telemetry(path)
+    if len(next(iter(data.values()), [])) == 0:
+        raise ValueError(f"{path} holds no rows")
+    missing = [c for c in RECORDING_COLUMNS if c not in data]
+    if missing:
+        raise ValueError(f"{path} is not an exec_vel.py / hover_sim.py recording: missing {missing}")
+
+    def stack(prefix: str) -> np.ndarray:
+        return np.column_stack([data[f"{prefix}{ax}"] for ax in "xyz"])
+
+    return HoverRecording(
+        name=os.path.splitext(os.path.basename(path))[0],
+        source=_footer(path).get("source", "real"),  # FlightRecorder writes no source
+        times=data["control_time"] - data["control_time"][0],
+        positions=stack("pos_"),
+        velocities=stack("vel_"),
+        cmd_velocities=stack("v"),
+        targets=stack("target_"),
+    )
+
+
+def plot_comparison(
+    recordings: Sequence[HoverRecording],
+    out_path: str,
+    axes: Sequence[str] = ("x", "y", "z"),
+    pos_ylim: tuple[float, float] | list[float] | None = None,
+    vel_ylim: tuple[float, float] | list[float] | None = None,
+    cmd_ylim: tuple[float, float] | list[float] | None = None,
+) -> str:
+    """Overlay recordings (typically one sim, one real) on shared axes.
+
+    One column per axis; rows are position, measured velocity and commanded velocity. Each
+    recording keeps one colour across all subplots, solid for real and dashed for sim.
+
+    Args:
+        recordings: Recordings from `load_recording`.
+        out_path: Destination file path for saving the figure.
+        axes: Axis names to plot, in column order of the recordings' arrays.
+        pos_ylim: Optional (ymin, ymax) for the position row, m.
+        vel_ylim: Optional (ymin, ymax) for the velocity row, m/s.
+        cmd_ylim: Optional (ymin, ymax) for the command row, m/s.
+
+    Returns:
+        The path of the saved figure.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ref = recordings[0]
+    for rec in recordings[1:]:
+        gap = float(np.linalg.norm(rec.positions[0] - ref.positions[0]))
+        if gap > 0.05:
+            print(f"[WARN] {rec.name} starts {gap * 100:.0f} cm from {ref.name} "
+                  f"({np.round(rec.positions[0], 2).tolist()} vs {np.round(ref.positions[0], 2).tolist()} m): "
+                  "the responses are not directly comparable")
+
+    # one shared target line if every recording holds the same constant target
+    shared_target = all(
+        np.ptp(rec.targets, axis=0).max() == 0 and np.allclose(rec.targets[0], ref.targets[0]) for rec in recordings
+    )
+
+    rows = (
+        ("positions", "{} Position", "pos_{} [m]", pos_ylim),
+        ("velocities", "v{} Velocity", "vel_{} [m/s]", vel_ylim),
+        ("cmd_velocities", "v{} Command", "cmd_v{} [m/s]", cmd_ylim),
+    )
+    n_axes = len(axes)
+    fig, ax_arr = plt.subplots(len(rows), n_axes, figsize=(5 * n_axes, 10), sharex=True, squeeze=False)
+
+    for r, (attr, title, ylabel, ylim) in enumerate(rows):
+        for i, name in enumerate(axes):
+            ax = ax_arr[r, i]
+            first = r == 0 and i == 0  # labels on one subplot only: they feed the single figure legend
+            for j, rec in enumerate(recordings):
+                ax.plot(rec.times, getattr(rec, attr)[:, i], "--" if rec.source == "sim" else "-",
+                        color=f"C{j}", lw=1.3, gid=f"{rec.source}:{rec.name}",
+                        label=f"{rec.source}: {rec.name}" if first else None)
+                if r == 0 and not shared_target:
+                    ax.plot(rec.times, rec.targets[:, i], ":", color=f"C{j}", lw=1.2, gid="target",
+                            label=f"target ({rec.source}: {rec.name})" if first else None)
+            if r == 0 and shared_target:
+                ax.axhline(ref.targets[0, i], color="k", linestyle=":", lw=1.2, gid="target",
+                           label="target" if first else None)
+            if r > 0:
+                ax.axhline(0, color="k", lw=0.5)
+            ax.set_title(title.format(name.upper() if r == 0 else name), fontsize=10)
+            ax.set_ylabel(ylabel.format(name))
+            ax.grid(True, alpha=0.3)
+            if ylim is not None:
+                ax.set_ylim(ylim)
+            if r == len(rows) - 1:
+                ax.set_xlabel("Time [s]")
+
+    handles, labels = ax_arr[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(len(handles), 4), fontsize=9, framealpha=0.9)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"[INFO] Saved sim/real comparison plot to {out_path}")
+    return out_path
+
+
 def build_plot_parser() -> argparse.ArgumentParser:
     """Build CLI parser for standalone plotting from recorded telemetry."""
     parser = argparse.ArgumentParser(
-        description="Generate step-response and target-error plots from recorded hover telemetry (CSV or Parquet)."
+        description="Plot recorded hover flights, sim (hover_sim.py) or real (exec_vel.py), CSV or Parquet: "
+        "step-response and target-error figures per recording, or one sim/real comparison with --compare."
     )
-    parser.add_argument("file", type=str, help="Path to telemetry .csv or .parquet file.")
+    parser.add_argument("files", nargs="+", type=str, help="Telemetry .parquet or .csv file(s).")
     parser.add_argument(
-        "--target",
-        nargs=3,
-        type=float,
-        default=[0.0, 0.0, 1.0],
-        metavar=("X", "Y", "Z"),
-        help="Target position in meters (default: 0.0 0.0 1.0).",
+        "--compare",
+        action="store_true",
+        help="Overlay all recordings (at least two) in one figure: position, velocity and velocity command.",
     )
     parser.add_argument(
         "--outdir",
         type=str,
         default=None,
-        help="Directory to save figures (defaults to the directory of the telemetry file).",
+        help="Directory to save figures (defaults to the directory of each telemetry file; "
+        "with --compare, of the first one).",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="With --compare: path of the figure (default: <outdir>/sim_real_comparison.png).",
     )
     parser.add_argument(
         "--ylim",
@@ -220,43 +394,61 @@ def build_plot_parser() -> argparse.ArgumentParser:
         metavar=("YMIN", "YMAX"),
         help="Custom y-axis limits for velocity subplots.",
     )
+    parser.add_argument(
+        "--cmd-ylim",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("YMIN", "YMAX"),
+        help="With --compare: custom y-axis limits for the velocity-command row.",
+    )
     return parser
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Standalone CLI entry point."""
     parser = build_plot_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.compare and len(args.files) < 2:
+        parser.error("--compare needs at least two recordings")
+    if args.out and not args.compare:
+        parser.error("--out applies to --compare only")
 
-    data = load_telemetry(args.file)
+    try:
+        recordings = [load_recording(path) for path in args.files]
+    except (ValueError, FileNotFoundError) as e:
+        parser.error(str(e))
 
-    times = data["time"]
-    positions = np.column_stack([data["pos_x"], data["pos_y"], data["pos_z"]])
-    velocities = np.column_stack([data["vel_x"], data["vel_y"], data["vel_z"]])
-    cmd_velocities = np.column_stack([data["cmd_vx"], data["cmd_vy"], data["cmd_vz"]])
-    targets = np.array(args.target)
+    if args.compare:
+        outdir = args.outdir or os.path.dirname(os.path.abspath(args.files[0]))
+        plot_comparison(
+            recordings,
+            out_path=args.out or os.path.join(outdir, "sim_real_comparison.png"),
+            pos_ylim=args.pos_ylim,
+            vel_ylim=args.vel_ylim,
+            cmd_ylim=args.cmd_ylim,
+        )
+        return
 
-    outdir = args.outdir or os.path.dirname(os.path.abspath(args.file))
-    step_resp_path = os.path.join(outdir, "step_response.png")
-    target_err_path = os.path.join(outdir, "target_error.png")
-
-    plot_step_response(
-        times=times,
-        positions=positions,
-        targets=targets,
-        velocities=velocities,
-        cmd_velocities=cmd_velocities,
-        out_path=step_resp_path,
-        pos_ylim=args.pos_ylim,
-        vel_ylim=args.vel_ylim,
-    )
-    plot_target_error(
-        times=times,
-        positions=positions,
-        targets=targets,
-        out_path=target_err_path,
-        ylim=args.ylim,
-    )
+    for path, rec in zip(args.files, recordings):
+        outdir = args.outdir or os.path.dirname(os.path.abspath(path))
+        plot_step_response(
+            times=rec.times,
+            positions=rec.positions,
+            targets=rec.targets,
+            velocities=rec.velocities,
+            cmd_velocities=rec.cmd_velocities,
+            out_path=os.path.join(outdir, f"{rec.name}_step_response.png"),
+            pos_ylim=args.pos_ylim,
+            vel_ylim=args.vel_ylim,
+        )
+        plot_target_error(
+            times=rec.times,
+            positions=rec.positions,
+            targets=rec.targets,
+            out_path=os.path.join(outdir, f"{rec.name}_target_error.png"),
+            ylim=args.ylim,
+        )
 
 
 if __name__ == "__main__":
