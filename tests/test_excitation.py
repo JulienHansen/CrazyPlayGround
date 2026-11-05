@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real", "system-identification"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real"))
 import excitation  # noqa: E402
 import measure_delay_noise  # noqa: E402
