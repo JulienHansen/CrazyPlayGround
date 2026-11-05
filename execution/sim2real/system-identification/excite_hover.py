@@ -13,9 +13,9 @@ directions that may not be symmetric. The P hold stays active on the two unexcit
 Every row records the sent command (vx/vy/vz), the step excitation (exc_v*), the setpoint echoed
 back by the firmware (echo_v* = ctrltarget.v*), and the measured velocity (vel_*).
 
-    python execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90
-    python execution/sim2real/measure_delay_noise.py flight.parquet
-    python execution/sim2real/plot_step_response.py flight.parquet --out flight.png
+    python execution/sim2real/system-identification/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90
+    python execution/sim2real/system-identification/measure_delay_noise.py flight.parquet
+    python execution/sim2real/system-identification/plot_step_response.py flight.parquet --out flight.png
 """
 
 import os
