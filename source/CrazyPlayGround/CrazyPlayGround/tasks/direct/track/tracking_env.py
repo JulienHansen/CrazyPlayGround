@@ -10,11 +10,13 @@ Three control modes are provided via sub-configs:
   - VelTrackingEnvCfg  action_space=3  (velocity setpoint)
   - AttTrackingEnvCfg  action_space=4  (roll, pitch, yaw_rate, thrust)
 
-Observation (22-D, identical across all modes):
-  rpos_1..4  (3 each)  — relative position to future waypoints in body frame
+Observation, identical across all modes, with F = future_traj_steps and A = action_space:
+  [obs_input_hist x (rpos_1..F, lin_vel_b, ang_vel_b, quat), action_input_hist x action(A)]
+  rpos_1..F  (3 each)  — relative position to future waypoints in body frame
   lin_vel_b  (3)       — body-frame linear velocity
   ang_vel_b  (3)       — body-frame angular velocity
   quat       (4)       — orientation [w, x, y, z]
+The defaults (F=4, obs_input_hist=1, action_input_hist=0) give 22-D.
 """
 
 from __future__ import annotations
@@ -58,7 +60,7 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     episode_length_s: float = 10.0
     decimation: int = 5
 
-    observation_space: int = 22
+    observation_space: int = 22  # recomputed in TrackingEnv.__init__
     state_space: int = 0
     debug_vis: bool = True
 
@@ -97,6 +99,8 @@ class TrackingEnvCfg(DirectRLEnvCfg):
 
     trajectory_type: str = "lemniscate"
     future_traj_steps: int = 4          # lookahead waypoints in observation
+    obs_input_hist: int = 1             # observation frames in the policy input; 1 = no stacking (#53)
+    action_input_hist: int = 0          # past actions in the policy input; 0 = none (#53)
     traj_step_size: float = 5.0         # sim steps between consecutive waypoints
     traj_origin: list = [0.0, 0.0, 1.5]
 
@@ -113,7 +117,7 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     lin_vel_reward_scale: float = -0.1
     ang_vel_reward_scale: float = -0.05
     effort_reward_scale: float = 0.0
-    action_smooth_reward_scale: float = 0.0
+    action_rate_reward_scale: float = 0.0  # weight on ||a_t - a_{t-1}||^2 (clamped actions); negative = penalty
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
 
@@ -138,15 +142,40 @@ class AttTrackingEnvCfg(TrackingEnvCfg):
     min_thrust_scale: float = 0.5
     max_thrust_scale: float = 1.8
 
+def check_cfg(cfg: TrackingEnvCfg):
+    """Reject knob values that can't work. Called by the env constructor, after Hydra overrides.
+
+    Later issues (#53-#56) append their checks to this list.
+    """
+    checks = [
+        (cfg.future_traj_steps >= 1, f"future_traj_steps must be >= 1, got {cfg.future_traj_steps}"),
+        (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
+        (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
+    ]
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+    # TODO(#53): remove once the observation/action history is built; until then a non-default
+    # value would size observation_space differently from what _get_observations returns.
+    if cfg.obs_input_hist != 1 or cfg.action_input_hist != 0:
+        raise NotImplementedError("obs_input_hist / action_input_hist other than 1 / 0 land in #53")
+
+
 class TrackingEnv(DirectRLEnv):
     cfg: TrackingEnvCfg
 
     def __init__(self, cfg: TrackingEnvCfg, render_mode: str | None = None, **kwargs):
+        # Hydra applies CLI overrides after the cfg is built, so validate and size the
+        # spaces here; a wrong size makes skrl silently reshape [N, D] into [N*x, D/x].
+        check_cfg(cfg)
+        cfg.observation_space = (
+            (3 * cfg.future_traj_steps + 10) * cfg.obs_input_hist + cfg.action_space * cfg.action_input_hist
+        )
         super().__init__(cfg, render_mode, **kwargs)
 
         action_dim = gym.spaces.flatdim(self.single_action_space)
         self._actions     = torch.zeros(self.num_envs, action_dim, device=self.device)
-        self._prev_actions = torch.zeros(self.num_envs, action_dim, device=self.device)
+        self._prev_actions = torch.zeros(self.num_envs, action_dim, device=self.device)  # for action_rate
         self._thrust      = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment      = torch.zeros(self.num_envs, 1, 3, device=self.device)
 
@@ -187,7 +216,7 @@ class TrackingEnv(DirectRLEnv):
 
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            for key in ["lin_vel", "ang_vel", "distance_to_goal"]
+            for key in ["lin_vel", "ang_vel", "distance_to_goal", "action_rate"]
         }
 
         self._body_id = self._robot.find_bodies("body")[0]
@@ -247,6 +276,17 @@ class TrackingEnv(DirectRLEnv):
 
         origin = self._traj_origin.unsqueeze(0) + self._terrain.env_origins[env_ids]  # [N, 3]
         return apply_traj_transform(raw, self._traj_scale[env_ids], self._traj_rot[env_ids], origin)
+
+    def _current_ref_w(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Reference the drone is scored against (reward, termination, metrics).
+
+        Args:
+            env_ids: environments to evaluate.
+
+        Returns:
+            (len(env_ids), 3) world-frame position of the first look-ahead waypoint, m.
+        """
+        return self._compute_traj(steps=1, env_ids=env_ids, step_size=self.cfg.traj_step_size)[:, 0, :]
 
     def _sample_traj_params(self, env_ids: torch.Tensor):
         """Sample per-episode trajectory parameters for the given envs."""
@@ -375,24 +415,20 @@ class TrackingEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        all_env_ids = torch.arange(self.num_envs, device=self.device)
-
-        current_wp = self._compute_traj(
-            steps=1,
-            env_ids=all_env_ids,
-            step_size=self.cfg.traj_step_size,
-        )[:, 0, :]  # [N, 3]
+        current_wp = self._current_ref_w(self._robot._ALL_INDICES)  # [N, 3]
 
         distance = torch.linalg.norm(current_wp - self._robot.data.root_pos_w, dim=1)
         r_pos = 1.0 - torch.tanh(distance / 0.8)
 
         lin_vel_sq = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel_sq = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
+        action_rate = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)
 
         rewards = {
             "distance_to_goal": r_pos * self.cfg.pos_reward_scale * self.step_dt,
             "lin_vel": lin_vel_sq * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel_sq * self.cfg.ang_vel_reward_scale * self.step_dt,
+            "action_rate": action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -403,12 +439,7 @@ class TrackingEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        all_env_ids = torch.arange(self.num_envs, device=self.device)
-        current_wp = self._compute_traj(
-            steps=1,
-            env_ids=all_env_ids,
-            step_size=self.cfg.traj_step_size,
-        )[:, 0, :]
+        current_wp = self._current_ref_w(self._robot._ALL_INDICES)
         tracking_error = torch.linalg.norm(current_wp - self._robot.data.root_pos_w, dim=1)
 
         too_low       = self._robot.data.root_pos_w[:, 2] < 0.1
@@ -421,14 +452,6 @@ class TrackingEnv(DirectRLEnv):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
 
-        all_env_ids = torch.arange(self.num_envs, device=self.device)
-        current_wp = self._compute_traj(
-            steps=1, env_ids=env_ids, step_size=self.cfg.traj_step_size
-        )[:, 0, :]
-        final_distance = torch.linalg.norm(
-            current_wp - self._robot.data.root_pos_w[env_ids], dim=1
-        ).mean()
-
         extras: dict = {}
         for key in self._episode_sums.keys():
             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
@@ -437,9 +460,9 @@ class TrackingEnv(DirectRLEnv):
         self.extras["log"] = {}
         self.extras["log"].update(extras)
         extras = {}
-        extras["Episode_Termination/died"]    = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        extras["Metrics/final_distance_to_goal"] = final_distance.item()
+        # tensors, not .item(): skrl logs only one-element tensors and silently drops floats
+        extras["Episode_Termination/died"]     = torch.count_nonzero(self.reset_terminated[env_ids])
+        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
         self.extras["log"].update(extras)
 
         self._sample_traj_params(env_ids)
