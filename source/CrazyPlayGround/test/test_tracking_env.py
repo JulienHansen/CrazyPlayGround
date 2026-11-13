@@ -1,6 +1,7 @@
 """Checks for the tracking env's observation/action history, command latency and action-rate
 penalty (#53), its sim-to-real randomisation: observation noise, wind, thrust/torque scaling (#54),
-in velocity (3-D action) and attitude (4-D action) mode, and the knobs-off defaults.
+and its tracking metrics and trajectory clock (#56), in velocity (3-D action) and attitude (4-D action)
+mode, and the knobs-off defaults.
 
 Run (from CrazyPlayGround/, needs Isaac Sim and a GPU):
     python -m pytest source/CrazyPlayGround/test/test_tracking_env.py -v
@@ -411,5 +412,123 @@ def test_knobs_off_no_extra_wrench(cfg_cls):
             assert not env._robot.instantaneous_wrench_composer.active
             torch.testing.assert_close(env._robot.permanent_wrench_composer.composed_force_as_torch[:, b], env._thrust[:, 0])
             torch.testing.assert_close(env._robot.permanent_wrench_composer.composed_torque_as_torch[:, b], env._moment[:, 0])
+    finally:
+        env.close()
+
+
+def ref_error(env, env_ids) -> torch.Tensor:
+    """(len(env_ids),) distance to the reference of the reward and the termination, m."""
+    return torch.linalg.norm(env._current_ref_w(env_ids) - env._robot.data.root_pos_w[env_ids], dim=1)
+
+
+@pytest.mark.parametrize("cfg_cls", MODES)
+def test_tracking_metrics_per_episode(cfg_cls):
+    env = make_env(cfg_cls, episode_length_s=0.1)
+    # the last step's error is only visible inside the reset, before the drone is moved back
+    final_errors = []
+    reset_idx = env._reset_idx
+
+    def spy(env_ids):
+        final_errors.append(ref_error(env, env_ids))
+        reset_idx(env_ids)
+
+    try:
+        start(env)
+        env._reset_idx = spy
+        T = int(env.max_episode_length) - 1  # steps until the time-out
+        ids = env._robot._ALL_INDICES
+        errors, efforts = [], []
+        for t in range(1, T + 1):
+            a = rand_cmd(env)
+            a[:, 0] = 3.0  # out of range: the effort uses the clamped command
+            env.step(a)
+            efforts.append(torch.sum(a.clamp(-1.0, 1.0).square(), dim=1))
+            if t < T:
+                assert not env.reset_buf.any()
+                errors.append(ref_error(env, ids))
+        assert env.reset_buf.all() and len(final_errors) == 1
+        e = torch.stack(errors + final_errors)  # (T, N)
+
+        m = env.extras["step_metrics"]
+        assert m["env_ids"].tolist() == list(range(N))
+        assert m["length"].tolist() == [T] * N
+        assert not m["died"].any()
+        torch.testing.assert_close(m["tracking_rmse"], e.square().mean(0).sqrt())
+        torch.testing.assert_close(m["tracking_mean_error"], e.mean(0))
+        torch.testing.assert_close(m["tracking_max_error"], e.max(0).values)
+        torch.testing.assert_close(m["effort"], torch.stack(efforts).mean(0))
+
+        log = env.extras["log"]
+        assert log["Metrics/crash_rate"].item() == 0.0
+        for key in ("tracking_rmse", "tracking_mean_error", "tracking_max_error", "effort"):
+            torch.testing.assert_close(log["Metrics/" + key], m[key].mean())  # all episodes full length
+
+        assert (env.episode_step == 0).all()
+        assert (env._effort_sum == 0).all()
+
+        # a shorter second episode: the error slots left over from the first must be ignored.
+        # All envs just reset at once, which randomises the time-out clocks: zero them, as start() does
+        env.episode_length_buf[:] = 0
+        errors, efforts, final_errors[:] = [], [], []
+        T2 = 3
+        for t in range(1, T2 + 1):
+            if t == T2:
+                env.episode_length_buf[:] = env.max_episode_length - 2  # time out at this step
+            a = rand_cmd(env)
+            env.step(a)
+            efforts.append(torch.sum(a.square(), dim=1))
+            if t < T2:
+                assert not env.reset_buf.any()
+                errors.append(ref_error(env, ids))
+        assert env.reset_buf.all() and len(final_errors) == 1
+        e = torch.stack(errors + final_errors)  # (T2, N)
+        m = env.extras["step_metrics"]
+        assert m["length"].tolist() == [T2] * N
+        torch.testing.assert_close(m["tracking_rmse"], e.square().mean(0).sqrt())
+        torch.testing.assert_close(m["tracking_mean_error"], e.mean(0))
+        torch.testing.assert_close(m["tracking_max_error"], e.max(0).values)
+        torch.testing.assert_close(m["effort"], torch.stack(efforts).mean(0))
+    finally:
+        env.close()
+
+
+def test_crash_counted_not_in_means():
+    env = make_env(VelTrackingEnvCfg)
+    crash_at = 3
+    try:
+        start(env)
+        env._get_dones = lambda: (
+            (env.episode_step == crash_at) & (env.env_idx == 0),
+            env.episode_length_buf >= env.max_episode_length - 1,
+        )
+        for t in range(1, crash_at + 1):
+            env.step(hover(env))
+            assert env.reset_buf.tolist() == [t == crash_at] + [False] * (N - 1)
+        m = env.extras["step_metrics"]
+        assert m["env_ids"].tolist() == [0]
+        assert m["died"].tolist() == [True]
+        assert m["length"].tolist() == [crash_at]
+        log = env.extras["log"]
+        assert log["Metrics/crash_rate"].item() == 1.0
+        # no full-length episode: the NaN means are left out of the log
+        assert [k for k in log if k.startswith("Metrics/")] == ["Metrics/crash_rate"]
+    finally:
+        env.close()
+
+
+def test_reference_ignores_episode_length_buf():
+    """play.py --eval_csv zeroes episode_length_buf after the reset; the reference must not jump away."""
+    env = make_env(VelTrackingEnvCfg)
+    try:
+        env.reset()
+        ids = env._robot._ALL_INDICES
+        assert env.episode_length_buf.any()  # the full reset randomised the episode clocks
+        assert (env.episode_step == 0).all()
+        # spawned on the trajectory's start, within the spawn noise (+-0.3 m in x, y, +-0.2 m in z)
+        start_w = env._compute_traj(steps=1, env_ids=ids, step_size=0.0)[:, 0]
+        assert (torch.linalg.norm(env._robot.data.root_pos_w - start_w, dim=1) < 0.5).all()
+        ref = env._current_ref_w(ids)
+        env.episode_length_buf[:] = 0
+        torch.testing.assert_close(env._current_ref_w(ids), ref)
     finally:
         env.close()

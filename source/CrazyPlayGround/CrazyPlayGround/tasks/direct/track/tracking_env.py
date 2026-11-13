@@ -38,6 +38,16 @@ top of the controller's thrust.
 Actuation randomisation: per episode, the thrust and moment that reach the body are the
 controller's output times random factors; the cascade PID still assumes nominal motors, so the
 policy has to absorb the mismatch.
+
+Clock: the trajectory follows ``episode_step``, the policy steps since the env's last reset, not
+``episode_length_buf``, which the first reset randomises to spread the time-outs. Every episode,
+the first one included, starts on the trajectory at its phase ``_traj_t0``, and zeroing
+``episode_length_buf`` (``play.py --eval_csv``) does not move the reference.
+
+Metrics: per episode, from the distance e between the drone and the reference used by the reward
+and the termination (``_current_ref_w``): ``tracking_rmse``, ``tracking_mean_error``,
+``tracking_max_error`` (m), ``effort`` (mean ||commanded action||^2), ``length`` (policy steps)
+and ``died``. See ``TrackingEnv._log_tracking_metrics``.
 """
 
 from __future__ import annotations
@@ -280,6 +290,12 @@ class TrackingEnv(DirectRLEnv):
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in ["lin_vel", "ang_vel", "distance_to_goal", "action_rate"]
         }
+        # trajectory clock (see the module docstring) and per-episode metric data
+        self.episode_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # tracking error e of each step, m; slot t - 1 holds step t. Slots past the episode's length
+        # keep values from the previous episode and are masked out in _log_tracking_metrics
+        self._error = torch.zeros(self.num_envs, int(self.max_episode_length), device=self.device)
+        self._effort_sum = torch.zeros(self.num_envs, device=self.device)  # sum of ||cmd||^2, cleared at reset
 
         self.delay_min_steps = cfg.action_latency_steps
         self.delay_max_steps = max(cfg.action_latency_steps, cfg.action_latency_max_steps)
@@ -331,6 +347,8 @@ class TrackingEnv(DirectRLEnv):
     def _compute_traj(self, steps: int, env_ids: torch.Tensor, step_size: float) -> torch.Tensor:
         """Compute `steps` consecutive waypoints for the given environments.
 
+        Time is ``episode_step`` (policy steps since reset) plus ``step_size`` sim steps per waypoint.
+
         Returns:
             [len(env_ids), steps, 3] world-frame positions.
         """
@@ -338,7 +356,7 @@ class TrackingEnv(DirectRLEnv):
         dt = self.cfg.sim.dt * self.cfg.decimation  # policy dt
 
         offsets = step_size * torch.arange(1, steps + 1, device=self.device).float()  # [steps]
-        t_base = self.episode_length_buf[env_ids].float().unsqueeze(1)                 # [N, 1]
+        t_base = self.episode_step[env_ids].float().unsqueeze(1)                       # [N, 1] steps since reset
         t_idx = t_base + offsets.unsqueeze(0)                                           # [N, steps]
 
         t = self._traj_t0[env_ids].unsqueeze(1) + self._traj_w[env_ids].unsqueeze(1) * t_idx * dt
@@ -402,11 +420,14 @@ class TrackingEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Record the commanded (clamped) action, then hand the controller the one sent
-        ``delay_steps`` steps ago (the hover command until the episode is that old)."""
+        ``delay_steps`` steps ago (the hover command until the episode is that old), and advance
+        the trajectory clock."""
         commanded = actions.clamp(-1.0, 1.0)
         self.cmd_history = torch.cat([self.cmd_history[:, 1:], commanded.unsqueeze(1)], dim=1)
         slot = self.cmd_history.shape[1] - 1 - self.delay_steps  # [N]
         self._actions = self.cmd_history[self.env_idx, slot]     # [N, A]: env i, slot[i]
+        # tick before step() runs _get_dones / _get_rewards, so episode_step == episode_length_buf there
+        self.episode_step += 1
 
         mode = self.cfg.control_mode
 
@@ -551,6 +572,13 @@ class TrackingEnv(DirectRLEnv):
         distance = torch.linalg.norm(current_wp - self._robot.data.root_pos_w, dim=1)
         r_pos = 1.0 - torch.tanh(distance / 0.8)
 
+        # tracking metrics (#56): same reference as reward and termination; logged in _reset_idx
+        # episode_step is already ticked: step t goes to slot t - 1. The clamp only matters if
+        # episode_length_buf is zeroed mid-episode, which lets an episode outlast the buffer
+        slot = (self.episode_step - 1).clamp(0, self._error.shape[1] - 1)
+        self._error[self.env_idx, slot] = distance
+        self._effort_sum += torch.sum(torch.square(self.cmd_history[:, -1]), dim=1)  # commanded, before latency
+
         lin_vel_sq = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel_sq = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
         # on the *commanded* actions: the delayed ones the controller gets would credit each change d steps late
@@ -596,6 +624,7 @@ class TrackingEnv(DirectRLEnv):
         extras["Episode_Termination/died"]     = torch.count_nonzero(self.reset_terminated[env_ids])
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
         self.extras["log"].update(extras)
+        self._log_tracking_metrics(env_ids)  # before super()._reset_idx zeroes episode_length_buf
 
         self._sample_traj_params(env_ids)
 
@@ -607,6 +636,11 @@ class TrackingEnv(DirectRLEnv):
             )
 
         self._actions[env_ids] = self._hover_cmd
+
+        # restart the trajectory clock before computing the spawn point below, and the effort sum
+        # (_error needs no clearing: its slots past episode_step are masked)
+        self.episode_step[env_ids] = 0
+        self._effort_sum[env_ids] = 0.0
 
         traj_start = self._compute_traj(
             steps=1, env_ids=env_ids, step_size=0.0
@@ -652,6 +686,39 @@ class TrackingEnv(DirectRLEnv):
             if not self._camera_initialised:
                 self._init_camera_env0()
                 self._camera_initialised = True
+
+    def _log_tracking_metrics(self, env_ids: torch.Tensor):
+        """Log the tracking metrics of the episodes ending now, before their reset.
+
+        Per-episode values go to ``extras["step_metrics"]`` (one row per entry of ``env_ids``,
+        crashed episodes included) for ``play.py --eval_csv``. The training means in
+        ``extras["log"]`` use only full-length episodes that timed out: crashes are counted by
+        ``Metrics/crash_rate``, and the episodes cut short by the randomised first reset would
+        bias the means.
+
+        Args:
+            env_ids: environments whose episode ends at this step.
+        """
+        length = self.episode_step[env_ids]
+        e = self._error[env_ids]  # (E, T)
+        valid = torch.arange(e.shape[1], device=self.device) < length.unsqueeze(1)  # this episode's steps
+        e = e * valid  # stale slots -> 0, so they add nothing to the sums nor to the max (e >= 0)
+        steps = valid.sum(1).clamp_min(1).float()  # 0 only at the initial reset, before any step
+        metrics = {
+            "tracking_rmse": (e.square().sum(1) / steps).sqrt(),
+            "tracking_mean_error": e.sum(1) / steps,
+            "tracking_max_error": e.amax(1),
+            "effort": self._effort_sum[env_ids] / length.clamp_min(1).float(),
+        }
+        died = self.reset_terminated[env_ids]
+        self.extras["step_metrics"] = {"env_ids": env_ids, "died": died, "length": length, **metrics}
+
+        self.extras["log"]["Metrics/crash_rate"] = died.float().mean()
+        full = self.reset_time_outs[env_ids] & ~died & (length == self.episode_length_buf[env_ids])
+        for key, value in metrics.items():
+            mean = value[full].mean()  # NaN when no episode in env_ids is full
+            if torch.isfinite(mean):  # a NaN would poison skrl's mean over the whole write interval
+                self.extras["log"]["Metrics/" + key] = mean
 
     def _draw_env0_traj(self):
         """Draw the full trajectory for env 0 as white lines."""
