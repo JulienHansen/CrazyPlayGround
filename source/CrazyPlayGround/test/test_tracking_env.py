@@ -1,5 +1,6 @@
 """Checks for the tracking env's observation/action history, command latency and action-rate
-penalty (#53), in velocity (3-D action) and attitude (4-D action) mode, and the knobs-off defaults.
+penalty (#53), its sim-to-real randomisation: observation noise, wind, thrust/torque scaling (#54),
+in velocity (3-D action) and attitude (4-D action) mode, and the knobs-off defaults.
 
 Run (from CrazyPlayGround/, needs Isaac Sim and a GPU):
     python -m pytest source/CrazyPlayGround/test/test_tracking_env.py -v
@@ -13,7 +14,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 import omni.usd  # noqa: E402
-from isaaclab.utils.math import subtract_frame_transforms  # noqa: E402
+from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms  # noqa: E402
 
 from CrazyPlayGround.tasks.direct.track.tracking_env import (  # noqa: E402
     AttTrackingEnvCfg,
@@ -89,6 +90,12 @@ def start(env):
         (AttTrackingEnvCfg, {"min_thrust_scale": 1.2}),
         (AttTrackingEnvCfg, {"max_thrust_scale": 0.9}),
         (AttTrackingEnvCfg, {"min_thrust_scale": 0.0}),
+        (VelTrackingEnvCfg, {"noise_corr": 1.0}),
+        (VelTrackingEnvCfg, {"noise_bias_std": -0.1}),
+        (VelTrackingEnvCfg, {"wind_force_range": (-0.01, 0.02)}),
+        (VelTrackingEnvCfg, {"wind_force_range": (0.03, 0.02)}),
+        (VelTrackingEnvCfg, {"thrust_scale_range": (0.0, 1.2)}),
+        (VelTrackingEnvCfg, {"torque_scale_range": (1.2, 1.1)}),
     ],
 )
 def test_invalid_knobs_raise(cfg_cls, knobs):
@@ -108,6 +115,7 @@ def test_defaults_are_a_single_obs_step(cfg_cls):
             obs, *_ = env.step(a)
             torch.testing.assert_close(obs["policy"], obs_step(env))
             torch.testing.assert_close(env._actions, a)  # no latency: the command just sent
+            assert not env._robot.instantaneous_wrench_composer.active  # no wind, no actuation scaling
     finally:
         env.close()
 
@@ -259,5 +267,149 @@ def test_att_history_resets_to_hover():
                 assert not env._att_ref.any() and not env._yaw_rate_ref.any()
             else:  # the first real command arrives
                 assert not torch.allclose(env._thrust_pwm, torch.full_like(env._thrust_pwm, hover_pwm))
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("rho", [0.0, 0.9])
+def test_noise_std_and_correlation(rho):
+    n_envs, std = 256, 0.1
+    env = make_env(VelTrackingEnvCfg, num_envs=n_envs, add_noise=True, noise_std=std, noise_corr=rho)
+    try:
+        # true step taken before start() zeroes the clocks: the waypoints depend on episode time
+        obs, s0 = start(env)
+        noise = [obs["policy"] - s0]                       # measured noise = obs - true step
+        for _ in range(20):
+            obs, *_ = env.step(hover(env))
+            noise.append(obs["policy"] - obs_step(env))
+        noise = torch.stack(noise) / std                   # [21 steps, envs, 22]; unit std if correct
+        assert abs(noise[0].std().item() - 1.0) < 0.1      # full strength right after reset
+        # regression of n_t+1 on n_t: slope = rho, residual = the fresh part, std sqrt(1 - rho^2).
+        # Residuals are independent, so ~110k samples give a standard error of ~0.003 on both.
+        rho_hat = ((noise[1:] * noise[:-1]).sum() / noise[:-1].square().sum()).item()
+        assert abs(rho_hat - rho) < 0.03
+        innovation = noise[1:] - rho * noise[:-1]
+        assert abs(innovation.std().item() - (1.0 - rho * rho) ** 0.5) < 0.03
+    finally:
+        env.close()
+
+
+def test_noise_bias_per_episode_and_true_rewards():
+    env = make_env(VelTrackingEnvCfg, add_noise=True, noise_std=0.01, noise_bias_std=0.5)
+    try:
+        start(env)
+        bias = env.obs_noise_bias.clone()
+        assert bias.abs().max() > 0
+        cfg = env.cfg
+        for _ in range(5):
+            before = env._episode_sums["distance_to_goal"].clone()
+            obs, *_ = env.step(hover(env))
+            # obs - true step = bias + white noise of std 0.01; 0.05 is 5 sigma
+            torch.testing.assert_close(obs["policy"] - obs_step(env), bias, atol=0.05, rtol=0)
+            # the reward sees the true position, not the (heavily biased) observation
+            d = torch.linalg.norm(env._current_ref_w(env._robot._ALL_INDICES) - env._robot.data.root_pos_w, dim=1)
+            expected = (1.0 - torch.tanh(d / 0.8)) * cfg.pos_reward_scale * env.step_dt
+            torch.testing.assert_close(env._episode_sums["distance_to_goal"] - before, expected)
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(hover(env))
+        assert not torch.equal(env.obs_noise_bias[0], bias[0])
+        torch.testing.assert_close(env.obs_noise_bias[1:], bias[1:])
+    finally:
+        env.close()
+
+
+def test_noise_knobs_need_add_noise(caplog):
+    env = make_env(VelTrackingEnvCfg, noise_corr=0.5, noise_bias_std=0.1)
+    try:
+        assert "no effect without add_noise" in caplog.text
+        obs, s0 = start(env)
+        torch.testing.assert_close(obs["policy"], s0)
+    finally:
+        env.close()
+
+
+def test_wind_strength_direction_frame_and_reset():
+    n_envs, lo, hi = 256, 0.01, 0.03
+    env = make_env(VelTrackingEnvCfg, num_envs=n_envs, wind_force_range=(lo, hi))
+    try:
+        start(env)
+        wind = env.wind_force_world.clone()
+        strength = wind.norm(dim=1)
+        assert ((strength >= lo - 1e-6) & (strength <= hi + 1e-6)).all()
+        direction = wind / strength[:, None]
+        # uniform over the sphere: mean direction ~ 0, and z (vertical) spread over [-1, 1]
+        assert direction.mean(0).abs().max() < 0.2
+        assert direction[:, 2].min() < -0.5 and direction[:, 2].max() > 0.5   # wind can push down and up
+        assert abs(direction[:, 2].abs().mean().item() - 0.5) < 0.1          # E|z| = 1/2 if uniform
+
+        for _ in range(3):
+            env.step(rand_cmd(env))                        # random commands tilt the drones
+        torch.testing.assert_close(env.wind_force_world, wind)   # constant within the episode
+
+        # what Isaac Lab will apply on the next physics step, in the body frame
+        env._apply_action()
+        wrench = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        expected_body = quat_apply_inverse(env._robot.data.body_link_quat_w[:, b], wind)
+        assert not torch.allclose(expected_body, wind)     # tilt makes the frame matter
+        torch.testing.assert_close(wrench.composed_force_as_torch[:, b], expected_body)
+        assert not wrench.composed_torque_as_torch.any()   # wind adds no torque
+        wrench.reset()                                     # undo the manual call
+
+        # env 0 resets: new wind; the others keep theirs
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(rand_cmd(env))
+        assert not torch.equal(env.wind_force_world[0], wind[0])
+        torch.testing.assert_close(env.wind_force_world[1:], wind[1:])
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("cfg_cls", MODES)
+def test_thrust_torque_scaling(cfg_cls):
+    lo, hi = 0.8, 1.2
+    env = make_env(cfg_cls, thrust_scale_range=(lo, hi), torque_scale_range=(lo, hi))
+    try:
+        start(env)
+        for s in (env.thrust_scale, env.torque_scale):          # drawn in range, and really drawn
+            assert ((s >= lo) & (s <= hi)).all() and not torch.allclose(s, torch.ones_like(s))
+        env.step(rand_cmd(env))
+
+        # what the next physics step adds on top of the controller output T (permanent composer)
+        env._apply_action()
+        composer = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        thrust, moment = env._thrust[:, 0], env._moment[:, 0]
+        extra_force, extra_torque = composer.composed_force_as_torch[:, b], composer.composed_torque_as_torch[:, b]
+        torch.testing.assert_close(extra_force, (env.thrust_scale[:, None] - 1) * thrust)
+        torch.testing.assert_close(extra_torque, (env.torque_scale[:, None] - 1) * moment)
+        # so the body feels scale x T in total
+        torch.testing.assert_close(thrust + extra_force, env.thrust_scale[:, None] * thrust)
+        composer.reset()                                          # undo the manual call
+
+        # env 0 resets: new scales; the others keep theirs for the whole episode
+        thrust_scale, torque_scale = env.thrust_scale.clone(), env.torque_scale.clone()
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(rand_cmd(env))
+        assert env.thrust_scale[0] != thrust_scale[0] and env.torque_scale[0] != torque_scale[0]
+        torch.testing.assert_close(env.thrust_scale[1:], thrust_scale[1:])
+        torch.testing.assert_close(env.torque_scale[1:], torque_scale[1:])
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("cfg_cls", MODES)
+def test_knobs_off_no_extra_wrench(cfg_cls):
+    env = make_env(cfg_cls)
+    try:
+        start(env)
+        b = env._body_id[0]
+        for _ in range(3):
+            env.step(rand_cmd(env))
+            env._apply_action()
+            # the body gets exactly the controller output, nothing on top
+            assert not env._robot.instantaneous_wrench_composer.active
+            torch.testing.assert_close(env._robot.permanent_wrench_composer.composed_force_as_torch[:, b], env._thrust[:, 0])
+            torch.testing.assert_close(env._robot.permanent_wrench_composer.composed_torque_as_torch[:, b], env._moment[:, 0])
     finally:
         env.close()
