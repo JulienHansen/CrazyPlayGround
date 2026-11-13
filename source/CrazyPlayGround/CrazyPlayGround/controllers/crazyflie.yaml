@@ -23,11 +23,11 @@ drone:
     ixx: 1.657e-5
     iyy: 1.657e-5
     izz: 2.900e-5
-  max_thrust: 0.638      # N  (4 × ~160 mN brushless motors, measured)
+  max_thrust: 0.48       # N  (4 × 0.12 N, firmware THRUST_MAX, CF2.1 brushed, 2.1+ props)
 
-  # Motor & frame geometry  (needed by QuadMixer)
+  # Motor & frame geometry  (arm_length is used by the motor chain)
   motor:
-    arm_length: 0.046      # m   — center-to-motor distance
+    arm_length: 0.046      # m   — center-to-motor distance (firmware ARM_LENGTH)
     k_thrust:   1.285e-8   # N·s²  — F = k_thrust · ω²  (sysid: Förster 2015)
     k_drag:     7.645e-11  # N·m·s² — τ = k_drag · ω²
     layout:     x          # 'x' — standard X-quad configuration
@@ -127,10 +127,10 @@ controllers:
     rate_kd:  [  2.5,   2.5,   0.0]
     rate_kff: [  0.0,   0.0,   0.0]
 
-    # ── Gyroscope low-pass filter ──────────────────────────────────────────
-    # Matches the Crazyflie firmware Butterworth LPF on the gyro (~80 Hz).
-    # Applied only to the derivative path of the rate loop.
-    # Set to 0 to disable.
+    # ── Derivative low-pass filter ─────────────────────────────────────────
+    # 1st-order IIR on the measured rate, D term only (P and I use the raw rate).
+    # Not the firmware's 80 Hz 2-pole gyro filter; without it the 500 Hz loop
+    # diverges with kd = 2.5. Set to 0 to disable.
     gyro_lpf_cutoff_hz: 20.0
 
     # ── Saturation limits ──────────────────────────────────────────────────
@@ -141,10 +141,16 @@ controllers:
     pitch_max_deg: 30.0
     yaw_max_delta: 0.0   # 0 = unlimited yaw rate
 
-    # ── Thrust  (Crazyflie PWM units: 0 – 65 535) ─────────────────────────
-    # thrust_cmd_scale is derived automatically from drone.max_thrust.
-    thrust_base:    30000.0   # Hover throttle estimate [PWM]
+    # ── Thrust  (per-motor firmware command units: 0 – 65 535) ────────────
+    # The same collective command goes to all 4 motors. thrust_cmd_scale
+    # (total N per unit) = drone.max_thrust / 65535; do not set it here.
+    thrust_base:    36000.0   # Firmware thrustBase; hover is mg/4/k ≈ 36 165
     thrust_min:     20000.0   # Minimum throttle [PWM]
     thrust_cmd_max: 65535.0   # Full-scale throttle [PWM]
     vel_thrust_scale: 1000.0  # (m/s²) → PWM conversion
+
+    # ── Motor chain  (firmware mixer, cap, thrust map, motor lag) ─────────
+    motor_tau:           0.072    # s  — brushed-motor time constant (CF2.1, Eschmann 2024)
+    motor_thrust_min:    0.0128   # N  — per motor; below this the firmware cuts the motor
+    motor_thrust2torque: 0.00699  # m  — yaw drag torque per N of thrust (THRUST2TORQUE)
 
