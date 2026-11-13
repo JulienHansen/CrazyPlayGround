@@ -16,7 +16,15 @@ Observation, identical across all modes, with F = future_traj_steps and A = acti
   lin_vel_b  (3)       — body-frame linear velocity
   ang_vel_b  (3)       — body-frame angular velocity
   quat       (4)       — orientation [w, x, y, z]
-The defaults (F=4, obs_input_hist=1, action_input_hist=0) give 22-D.
+The defaults (F=4, obs_input_hist=1, action_input_hist=0) give 22-D. Observation steps and actions are
+stacked oldest first; after a reset the observation window holds copies of the first step.
+
+Commands: the policy output is clamped to [-1, 1] (the commanded action) and pushed into a
+history buffer. The controller gets the command sent ``delay_steps`` policy steps ago, drawn per
+episode in [action_latency_steps, max(action_latency_steps, action_latency_max_steps)]. The
+action history in the observation and the action-rate penalty use the commanded actions. At reset
+the history is filled with the hover command: zeros for Pos/Vel, and for Att a thrust channel of
+(hover - min) / (max - min) thrust, so delayed steps mean hover, not free fall.
 """
 
 from __future__ import annotations
@@ -99,8 +107,10 @@ class TrackingEnvCfg(DirectRLEnvCfg):
 
     trajectory_type: str = "lemniscate"
     future_traj_steps: int = 4          # lookahead waypoints in observation
-    obs_input_hist: int = 1             # observation frames in the policy input; 1 = no stacking (#53)
-    action_input_hist: int = 0          # past actions in the policy input; 0 = none (#53)
+    obs_input_hist: int = 1             # K observation steps in the policy input, oldest first; 1 = no stacking
+    action_input_hist: int = 0          # last M commanded actions after the observation steps; 0 = none
+    action_latency_steps: int = 0       # policy steps between command and controller; min of the per-episode draw
+    action_latency_max_steps: int = 0   # 0 = fixed latency; otherwise max of the uniform per-episode draw
     traj_step_size: float = 5.0         # sim steps between consecutive waypoints
     traj_origin: list = [0.0, 0.0, 1.5]
 
@@ -117,7 +127,7 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     lin_vel_reward_scale: float = -0.1
     ang_vel_reward_scale: float = -0.05
     effort_reward_scale: float = 0.0
-    action_rate_reward_scale: float = 0.0  # weight on ||a_t - a_{t-1}||^2 (clamped actions); negative = penalty
+    action_rate_reward_scale: float = 0.0  # weight on ||a_t - a_{t-1}||^2 (commanded, before latency); negative = penalty
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
 
@@ -144,21 +154,28 @@ class AttTrackingEnvCfg(TrackingEnvCfg):
 
 def check_cfg(cfg: TrackingEnvCfg):
     """Reject knob values that can't work. Called by the env constructor, after Hydra overrides.
-
-    Later issues (#53-#56) append their checks to this list.
     """
     checks = [
         (cfg.future_traj_steps >= 1, f"future_traj_steps must be >= 1, got {cfg.future_traj_steps}"),
         (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
         (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
+        (cfg.action_latency_steps >= 0, f"action_latency_steps must be >= 0, got {cfg.action_latency_steps}"),
+        (
+            not cfg.action_latency_max_steps or cfg.action_latency_max_steps >= cfg.action_latency_steps,
+            f"action_latency_max_steps must be 0 or >= action_latency_steps ({cfg.action_latency_steps}), "
+            f"got {cfg.action_latency_max_steps}",
+        ),
     ]
+    if getattr(cfg, "control_mode", None) == "attitude":
+        # the hover command (history reset value) must be a reachable thrust in [0, 1]
+        lo, hi = cfg.min_thrust_scale, cfg.max_thrust_scale
+        checks.append(
+            (0.0 < lo <= 1.0 <= hi and lo < hi,
+             f"min/max_thrust_scale must satisfy 0 < min <= 1 <= max and min < max, got {lo} / {hi}")
+        )
     for ok, msg in checks:
         if not ok:
             raise ValueError(msg)
-    # TODO(#53): remove once the observation/action history is built; until then a non-default
-    # value would size observation_space differently from what _get_observations returns.
-    if cfg.obs_input_hist != 1 or cfg.action_input_hist != 0:
-        raise NotImplementedError("obs_input_hist / action_input_hist other than 1 / 0 land in #53")
 
 
 class TrackingEnv(DirectRLEnv):
@@ -168,14 +185,14 @@ class TrackingEnv(DirectRLEnv):
         # Hydra applies CLI overrides after the cfg is built, so validate and size the
         # spaces here; a wrong size makes skrl silently reshape [N, D] into [N*x, D/x].
         check_cfg(cfg)
-        cfg.observation_space = (
-            (3 * cfg.future_traj_steps + 10) * cfg.obs_input_hist + cfg.action_space * cfg.action_input_hist
-        )
+        obs_step_dim = 3 * cfg.future_traj_steps + 10  # one observation step (22-D with F=4)
+        cfg.observation_space = obs_step_dim * cfg.obs_input_hist + cfg.action_space * cfg.action_input_hist
         super().__init__(cfg, render_mode, **kwargs)
+        n, dev = self.num_envs, self.device
+        self._obs_step_dim = obs_step_dim
 
         action_dim = gym.spaces.flatdim(self.single_action_space)
-        self._actions     = torch.zeros(self.num_envs, action_dim, device=self.device)
-        self._prev_actions = torch.zeros(self.num_envs, action_dim, device=self.device)  # for action_rate
+        self._actions     = torch.zeros(self.num_envs, action_dim, device=self.device)  # delayed, sent to the controller
         self._thrust      = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment      = torch.zeros(self.num_envs, 1, 3, device=self.device)
 
@@ -198,6 +215,12 @@ class TrackingEnv(DirectRLEnv):
             self._min_thrust = min_s * self._hover_thrust
             self._max_thrust = max_s * self._hover_thrust
 
+        # command that holds the drone in place, used to fill the command history at reset:
+        # zero position delta / velocity, and for Att zero attitude and yaw rate with hover thrust
+        self._hover_cmd = torch.zeros(action_dim, device=dev)
+        if self.cfg.control_mode == "attitude":
+            self._hover_cmd[3] = (self._hover_thrust - self._min_thrust) / (self._max_thrust - self._min_thrust)
+
         if self.cfg.control_mode == "position":
             self._target_pos = torch.zeros(self.num_envs, 3, device=self.device)
 
@@ -218,6 +241,18 @@ class TrackingEnv(DirectRLEnv):
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in ["lin_vel", "ang_vel", "distance_to_goal", "action_rate"]
         }
+
+        self.delay_min_steps = cfg.action_latency_steps
+        self.delay_max_steps = max(cfg.action_latency_steps, cfg.action_latency_max_steps)
+        self.obs_window = torch.zeros(n, cfg.obs_input_hist, obs_step_dim, device=dev)
+        # True for envs just reset: _get_observations refills their window (see its docstring)
+        self.obs_window_fresh = torch.ones(n, dtype=torch.bool, device=dev)
+        # last commanded actions, newest last; feeds the action history, the latency and the
+        # action-rate penalty. Length >= 2 so the penalty always has a previous command.
+        buf_len = max(cfg.action_input_hist, self.delay_max_steps + 1, 2)
+        self.cmd_history = self._hover_cmd.expand(n, buf_len, action_dim).clone()
+        self.delay_steps = torch.full((n,), self.delay_min_steps, dtype=torch.long, device=dev)
+        self.env_idx = torch.arange(n, device=dev)
 
         self._body_id = self._robot.find_bodies("body")[0]
 
@@ -319,8 +354,12 @@ class TrackingEnv(DirectRLEnv):
             self._traj_t0[env_ids] = 0.0
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self._prev_actions = self._actions.clone()
-        self._actions = actions.clone().clamp(-1.0, 1.0)
+        """Record the commanded (clamped) action, then hand the controller the one sent
+        ``delay_steps`` steps ago (the hover command until the episode is that old)."""
+        commanded = actions.clamp(-1.0, 1.0)
+        self.cmd_history = torch.cat([self.cmd_history[:, 1:], commanded.unsqueeze(1)], dim=1)
+        slot = self.cmd_history.shape[1] - 1 - self.delay_steps  # [N]
+        self._actions = self.cmd_history[self.env_idx, slot]     # [N, A]: env i, slot[i]
 
         mode = self.cfg.control_mode
 
@@ -386,6 +425,15 @@ class TrackingEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
+        """Push the current observation step into the window and append the action history.
+
+        Envs just reset (``obs_window_fresh``) get K copies of their first step, so the window
+        never mixes two episodes. This happens here, not in ``_reset_idx``, because ``step()``
+        resets before it observes.
+
+        Returns:
+            {"policy": (num_envs, K * obs_step_dim + M * A)}: observation steps then commanded actions, oldest first.
+        """
         all_env_ids = torch.arange(self.num_envs, device=self.device)
 
         waypoints_w = self._compute_traj(
@@ -403,7 +451,7 @@ class TrackingEnv(DirectRLEnv):
             )
             rpos_list.append(rpos_b)
 
-        obs = torch.cat(
+        obs_step = torch.cat(
             rpos_list
             + [
                 self._robot.data.root_lin_vel_b,  # (3)
@@ -412,7 +460,14 @@ class TrackingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
-        return {"policy": obs}
+        new = obs_step.unsqueeze(1)
+        window = torch.cat([self.obs_window[:, 1:], new], dim=1)
+        self.obs_window = torch.where(self.obs_window_fresh[:, None, None], new.expand_as(window), window)
+        self.obs_window_fresh[:] = False
+        # the M newest commands: M slots starting at slot L - M (M = 0 -> empty, adds nothing)
+        m = self.cfg.action_input_hist
+        act_hist = self.cmd_history.narrow(1, self.cmd_history.shape[1] - m, m)
+        return {"policy": torch.cat([self.obs_window.flatten(1), act_hist.flatten(1)], dim=-1)}
 
     def _get_rewards(self) -> torch.Tensor:
         current_wp = self._current_ref_w(self._robot._ALL_INDICES)  # [N, 3]
@@ -422,7 +477,8 @@ class TrackingEnv(DirectRLEnv):
 
         lin_vel_sq = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel_sq = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
-        action_rate = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)
+        # on the *commanded* actions: the delayed ones the controller gets would credit each change d steps late
+        action_rate = torch.sum(torch.square(self.cmd_history[:, -1] - self.cmd_history[:, -2]), dim=1)
 
         rewards = {
             "distance_to_goal": r_pos * self.cfg.pos_reward_scale * self.step_dt,
@@ -474,8 +530,7 @@ class TrackingEnv(DirectRLEnv):
                 self.episode_length_buf, high=int(self.max_episode_length)
             )
 
-        self._actions[env_ids] = 0.0
-        self._prev_actions[env_ids] = 0.0
+        self._actions[env_ids] = self._hover_cmd
 
         traj_start = self._compute_traj(
             steps=1, env_ids=env_ids, step_size=0.0
@@ -496,6 +551,14 @@ class TrackingEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._ctrl.reset(env_ids)
+
+        # clear the command history (hover command, not zeros, in Att mode), draw this
+        # episode's latency, and flag the observation window for a refill
+        self.cmd_history[env_ids] = self._hover_cmd
+        self.delay_steps[env_ids] = torch.randint(
+            self.delay_min_steps, self.delay_max_steps + 1, (len(env_ids),), device=self.device
+        )
+        self.obs_window_fresh[env_ids] = True
 
         if self.cfg.debug_vis and (0 in env_ids.tolist()):
             self._draw_env0_traj()
