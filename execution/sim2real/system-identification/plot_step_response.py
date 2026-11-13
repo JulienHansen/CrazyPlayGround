@@ -1,6 +1,6 @@
 """Mean step response of excite_hover.py and excite_hover_sim.py flights, real and sim on the same axes.
 
-    python execution/sim2real/plot_step_response.py flight.parquet [sim_flight.parquet ...] [--out fig.png]
+    python execution/sim2real/system-identification/plot_step_response.py flight.parquet [sim_flight.parquet ...] [--out fig.png]
 
 One column per excited axis, every recording overlaid in its own color, labelled real or sim from
 the Parquet footer. Top: the PUSH steps (from rest) windowed and normalized as in

@@ -13,9 +13,9 @@ directions that may not be symmetric. The P hold stays active on the two unexcit
 Every row records the sent command (vx/vy/vz), the step excitation (exc_v*), the setpoint echoed
 back by the firmware (echo_v* = ctrltarget.v*), and the measured velocity (vel_*).
 
-    python execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90
-    python execution/sim2real/measure_delay_noise.py flight.parquet
-    python execution/sim2real/plot_step_response.py flight.parquet --out flight.png
+    python execution/sim2real/system-identification/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90
+    python execution/sim2real/system-identification/measure_delay_noise.py flight.parquet
+    python execution/sim2real/system-identification/plot_step_response.py flight.parquet --out flight.png
 """
 
 import os
@@ -33,7 +33,9 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 
 # Make the `common` package importable; appended so it cannot shadow installed modules.
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "single_drone_exec"))
+# This file lives in execution/sim2real/system-identification/, so go up three levels to execution/.
+_EXECUTION_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.join(_EXECUTION_DIR, "single_drone_exec"))
 from common.flight_recorder import CrazyflieStateBase  # noqa: E402
 from common.utils import emergency_land, land_once, wait_until, add_run_args  # noqa: E402
 from excitation import (INTERVAL, EXC_START_S, step_signal, excitation_command,  # noqa: E402
