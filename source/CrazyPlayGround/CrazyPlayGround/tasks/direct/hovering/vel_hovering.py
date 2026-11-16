@@ -397,12 +397,12 @@ class QuadcopterEnv(DirectRLEnv):
         distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_pos_w, dim=1)
         distance_to_goal_mapped = self._distance_reward(distance_to_goal)
         # on the *commanded* actions: the delayed ones the controller gets would credit each change d steps late
-        action_rate = torch.sum(torch.square(self.cmd_history[:, -1] - self.cmd_history[:, -2]), dim=1)
+        action_rate_sq = torch.sum(torch.square(self.cmd_history[:, -1] - self.cmd_history[:, -2]), dim=1)
         rewards = {
             "lin_vel": lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
             "distance_to_goal": distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
-            "action_rate": action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
+            "action_rate": action_rate_sq * self.cfg.action_rate_reward_scale * self.step_dt,
         }
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         for key, value in rewards.items():
