@@ -95,11 +95,9 @@ logger = logging.getLogger("CrazyflieRL")
 def read_obs_hist(checkpoint_path: Optional[str]) -> Optional[Tuple[int, int]]:
     """(obs_input_hist, action_input_hist) from the training run's env.yaml, or None.
 
-    An exported checkpoint <name>.pt carries its run's env.yaml as <name>_params/env.yaml beside
-    it; inside a run, train.py writes <run>/params/env.yaml next to <run>/checkpoints/. The first
-    of the two that exists is read. Its `observation_space` is stale (dumped before the env
-    recomputes it), so read the two knobs instead, with a regex because yaml.safe_load rejects
-    the file's !!python/tuple tags.
+    Reads <name>_params/env.yaml beside an exported <name>.pt, else <run>/params/env.yaml. Takes
+    the two knobs, not the stale `observation_space`, by regex: yaml.safe_load rejects the
+    file's !!python/tuple tags.
     """
     if not checkpoint_path:
         return None
@@ -120,11 +118,9 @@ def resolve_obs_hist(checkpoint_path: Optional[str], flag_k: Optional[int],
                      flag_m: Optional[int]) -> Tuple[int, int]:
     """Frames K and past actions M the policy was trained with.
 
-    The checkpoint only fixes the input width (frame size x K + action size x M), and equal
-    widths load silently (hover: K=1, M=2 and K=2, M=0 both give 12), so env.yaml (see
-    read_obs_hist) wins and a flag that disagrees with it is an error. Without env.yaml (a .pt
-    copied without its <name>_params/ folder, a run before WP1) the flags decide, then the
-    plain K=1, M=0.
+    The checkpoint fixes only the input width, and equal widths load silently (hover: K=1, M=2
+    and K=2, M=0 both give 12), so env.yaml wins and a flag that disagrees raises. Without
+    env.yaml the flags decide, defaulting to K=1, M=0.
     """
     trained = read_obs_hist(checkpoint_path)
     if trained is None:

@@ -31,14 +31,16 @@ logger = logging.getLogger("CrazyflieRL")
 POS_STALE_TIMEOUT_S    = 0.5   # max seconds without position callback
 POS_VARIANCE_THRESHOLD = 0.5   # kalman variance [m²]
 
-# ── Trajectory parameters (must match VelTrackingEnvCfg) ──────────────────────
-TRAJ_W         = 1.0             # angular speed multiplier
-TRAJ_SCALE     = [2.0, 2.0, 1.0] # [m] XY and Z scale
-TRAJ_ORIGIN    = [0.0, 0.0, 1.5] # world-frame origin [m]
+# ── Trajectory parameters (within VelTrackingEnvCfg's randomisation ranges) ───
+TRAJ_W         = 0.8             # speed multiplier
+TRAJ_SCALE     = [1.5, 1.5, 1.0] # [m] XY and Z scale
+TRAJ_ORIGIN    = [0.0, 0.0, 1.0] # world-frame origin [m]; z = 1 m (TRAJ_C = 0: flat); policy sees only relative positions
 TRAJ_C         = 0.0             # lemniscate z-coupling parameter
 FUTURE_STEPS   = 4               # lookahead waypoints in observation
 TRAJ_STEP_SIZE = 5.0             # sim-steps between consecutive waypoints
 CONTROL_DT     = 0.01            # policy step (s) — must match decimation*sim_dt (5*0.002)
+GOTO_SPEED        = 0.5          # [m/s] mean speed of the HLC go_to the trajectory start
+GOTO_MIN_DURATION_S = 2.0        # shortest go_to, even when already close
 
 # ── Velocity action params ─────────────────────────────────────────────────────
 MAX_VELOCITY = 3.0  # m/s  (must match VelTrackingEnvCfg.max_velocity)
@@ -53,10 +55,22 @@ ACT_DIM      = 3                      # vx, vy, vz in [-1, 1]
 def _lemniscate(t: float, c: float = 0.0):
     """Lemniscate of Bernoulli. Returns unnormalised (unit-amplitude) x, y, z."""
     denom = 1.0 + math.sin(t) ** 2
-    x = math.cos(t) / denom
-    y = math.sin(t) * math.cos(t) / denom
-    z = c * math.sin(2.0 * t)
+    x = math.cos(t) / denom                # in [-1, 1]: ±1 at t = 0, pi
+    y = math.sin(t) * math.cos(t) / denom  # in [-1/(2√2), 1/(2√2)] ≈ ±0.354, at sin²t = 1/3
+    z = 0.0
     return x, y, z
+
+
+def trajectory_start_world() -> torch.Tensor:
+    """Reference position at step 0, where TrackingEnv spawns the drone (_compute_traj, step_size=0).
+
+    Returns:
+        (3,) world frame, m.
+    """
+    x, y, z = _lemniscate(0.0, c=TRAJ_C)
+    return (torch.tensor([x, y, z], dtype=torch.float32, device=device)
+            * torch.tensor(TRAJ_SCALE, dtype=torch.float32, device=device)
+            + torch.tensor(TRAJ_ORIGIN, dtype=torch.float32, device=device))
 
 
 def compute_waypoints_world(step: int) -> torch.Tensor:
@@ -147,11 +161,14 @@ class Policy(GaussianMixin, Model):
 class CrazyflieController:
     """Runs a trained trajectory-tracking velocity-control RL agent on the Crazyflie."""
 
-    def __init__(self, uri: str, agent: PPO, obs_input_hist: int = 1, action_input_hist: int = 0):
+    def __init__(self, uri: str, agent: PPO, obs_input_hist: int = 1, action_input_hist: int = 0,
+                 takeoff_height: Optional[float] = None):
         self.uri   = uri
         self.cf    = Crazyflie()
         self.agent = agent
         self.k, self.m = obs_input_hist, action_input_hist  # frames K, past actions M (see resolve_obs_hist)
+        # HLC takeoff height (m); the policy then flies to the trajectory at TRAJ_ORIGIN z
+        self.takeoff_height = float(TRAJ_ORIGIN[2]) if takeoff_height is None else float(takeoff_height)
 
         self.current_pos     = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel_w   = torch.zeros(3, dtype=torch.float32, device=device)
@@ -272,8 +289,8 @@ class CrazyflieController:
         emergency_land(self)  # hands over from the low-level setpoints first, or land() is ignored
 
     def control_loop(self):
-        """Phase 1: HLC takeoff. Phase 2: NN velocity-control trajectory tracking."""
-        TAKEOFF_HEIGHT   = float(TRAJ_ORIGIN[2])
+        """Phase 1: HLC takeoff, then go_to the trajectory start. Phase 2: NN velocity-control tracking."""
+        TAKEOFF_HEIGHT   = self.takeoff_height
         TAKEOFF_DURATION = 3.0
         STABILIZE_PAUSE  = 1.0
 
@@ -297,6 +314,19 @@ class CrazyflieController:
         self.cf.high_level_commander.takeoff(TAKEOFF_HEIGHT, TAKEOFF_DURATION)
         time.sleep(TAKEOFF_DURATION + STABILIZE_PAUSE)
         logger.info(f"Takeoff complete. Current pos: {self.current_pos}")
+
+        # ── Phase 1b: HLC go_to the trajectory start ─────────────────────────
+        # TrackingEnv spawns each episode within 0.3 m of the reference at t = 0 and ends it past
+        # reset_thres (0.8 m): start the policy there, with the trajectory clock at step 0.
+        start_w = trajectory_start_world()
+        with self.lock:
+            dist = (start_w - self.current_pos).norm().item()
+        goto_duration = max(GOTO_MIN_DURATION_S, dist / GOTO_SPEED)
+        logger.info(f"Go to trajectory start {[round(v, 2) for v in start_w.tolist()]} "
+                    f"({dist:.2f} m, {goto_duration:.1f} s) ...")
+        self.cf.high_level_commander.go_to(*start_w.tolist(), 0.0, goto_duration)
+        time.sleep(goto_duration + STABILIZE_PAUSE)
+        logger.info(f"At trajectory start. Current pos: {self.current_pos}")
 
         # ── Phase 2: NN velocity control ──────────────────────────────────────
         logger.info("NN velocity-control trajectory tracking active.")
@@ -401,14 +431,20 @@ def main():
                              "for a checkpoint without either.")
     parser.add_argument("--action-input-hist", type=nonnegative_int, default=None,
                         help="Past commanded actions M the policy was trained with. Same rule as K.")
+    parser.add_argument("--takeoff-height", type=float, default=None,
+                        help=f"High-level-commander takeoff height in m, 0.2-2.0 (default: the trajectory's "
+                             f"z, {TRAJ_ORIGIN[2]}). The policy then climbs or descends to the trajectory.")
     args = parser.parse_args()
+    if args.takeoff_height is not None and not 0.2 <= args.takeoff_height <= 2.0:
+        parser.error(f"--takeoff-height must be between 0.2 m and 2.0 m, got {args.takeoff_height}")
 
     try:
         k, m = resolve_obs_hist(args.checkpoint, args.obs_input_hist, args.action_input_hist)
     except ValueError as e:
         parser.error(str(e))
     agent = load_agent(args.checkpoint, device, OBS_STEP_DIM * k + ACT_DIM * m)
-    controller = CrazyflieController(uri=args.uri, agent=agent, obs_input_hist=k, action_input_hist=m)
+    controller = CrazyflieController(uri=args.uri, agent=agent, obs_input_hist=k, action_input_hist=m,
+                                     takeoff_height=args.takeoff_height)
 
     try:
         controller.start()

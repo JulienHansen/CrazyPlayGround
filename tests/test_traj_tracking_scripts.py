@@ -7,6 +7,7 @@ The fake radio is the one of `test_hover_scripts.py`; only the log block names d
 """
 
 import importlib.util
+import math
 import os
 import sys
 import time
@@ -198,3 +199,37 @@ def test_emergency_landing_lands_without_cutting_the_motors(monkeypatch, caplog)
     assert cf.calls_to("send_notify_setpoint_stop") == [()]
     assert cf.calls_to("land") == [(0.0, 2.0)]
     assert cf.calls_to("send_stop_setpoint") == []
+
+
+def test_takeoff_height_flag(monkeypatch):
+    """--takeoff-height sets the HLC takeoff only; the default stays the trajectory's z."""
+    mod = load_script(monkeypatch)
+    for height, expected in ((None, mod.TRAJ_ORIGIN[2]), (0.5, 0.5)):
+        cf = TrajFakeCf(3, pos=moving)
+        mod.Crazyflie = lambda **kwargs: cf
+        controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3), takeoff_height=height)
+        controller._start_logging()
+        controller.control_loop()
+        assert [args[0] for args in cf.calls_to("takeoff")] == [pytest.approx(expected)]
+    for bad in ("0.1", "2.5"):
+        monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", "x.pt", "--takeoff-height", bad])
+        with pytest.raises(SystemExit):
+            mod.main()
+
+
+def test_goes_to_the_trajectory_start_before_the_policy(monkeypatch):
+    """As TrackingEnv's spawn: the policy starts at the reference of step 0, not where it took off."""
+    mod = load_script(monkeypatch)
+    cf = TrajFakeCf(3, pos=lambda n: (0.0, 0.0, 0.5))
+    mod.Crazyflie = lambda **kwargs: cf
+    controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3), takeoff_height=0.5)
+    controller._start_logging()
+    controller.control_loop()
+    names = [name for name, _ in cf.sent]
+    assert names.index("takeoff") < names.index("go_to") < names.index("send_velocity_world_setpoint")
+    (go_to,) = cf.calls_to("go_to")
+    start = [mod.TRAJ_SCALE[0] + mod.TRAJ_ORIGIN[0], mod.TRAJ_ORIGIN[1], mod.TRAJ_ORIGIN[2]]  # lemniscate(0) = (1, 0, 0)
+    assert list(go_to[:4]) == pytest.approx(start + [0.0])
+    dist = math.dist(start, (0.0, 0.0, 0.5))
+    assert go_to[4] == pytest.approx(max(mod.GOTO_MIN_DURATION_S, dist / mod.GOTO_SPEED))
+
