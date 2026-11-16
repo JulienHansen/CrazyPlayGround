@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import time
 import threading
@@ -16,6 +17,10 @@ from cflib.crazyflie.log import LogConfig
 from skrl.models.torch import Model, GaussianMixin
 from skrl.agents.torch.ppo import PPO, PPO_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
+
+# Make the `common` package importable; appended so it cannot shadow installed modules.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.utils import positive_int, nonnegative_int, resolve_obs_hist
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] {message}",
@@ -37,6 +42,10 @@ CONTROL_DT     = 0.01            # policy step (s) — must match decimation*sim
 
 # ── Velocity action params ─────────────────────────────────────────────────────
 MAX_VELOCITY = 3.0  # m/s  (must match VelTrackingEnvCfg.max_velocity)
+
+# ── Policy input (must match TrackingEnv._get_observations) ───────────────────
+OBS_STEP_DIM = 3 * FUTURE_STEPS + 10  # one frame: rpos_1..4 (12) | lin_vel_b | ang_vel_b | quat = 22
+ACT_DIM      = 3                      # vx, vy, vz in [-1, 1]
 
 
 # ── Trajectory utilities ───────────────────────────────────────────────────────
@@ -94,7 +103,7 @@ def quat_inv(q, eps=1e-9):
 
 def build_observation(step: int, pos: torch.Tensor, vel_w: torch.Tensor,
                       quat: torch.Tensor, ang_vel_b: torch.Tensor) -> torch.Tensor:
-    """Build the 22-D observation matching TrackingEnv._get_observations().
+    """Build one 22-D frame (OBS_STEP_DIM) matching TrackingEnv._get_observations().
 
     Layout: rpos_1..4 (3×4=12) | lin_vel_b (3) | ang_vel_b (3) | quat (4) = 22
     """
@@ -138,10 +147,11 @@ class Policy(GaussianMixin, Model):
 class CrazyflieController:
     """Runs a trained trajectory-tracking velocity-control RL agent on the Crazyflie."""
 
-    def __init__(self, uri: str, agent: PPO):
+    def __init__(self, uri: str, agent: PPO, obs_input_hist: int = 1, action_input_hist: int = 0):
         self.uri   = uri
         self.cf    = Crazyflie()
         self.agent = agent
+        self.k, self.m = obs_input_hist, action_input_hist  # frames K, past actions M (see resolve_obs_hist)
 
         self.current_pos     = torch.zeros(3, dtype=torch.float32, device=device)
         self.current_vel_w   = torch.zeros(3, dtype=torch.float32, device=device)
@@ -298,6 +308,9 @@ class CrazyflieController:
 
         # ── Phase 2: NN velocity control ──────────────────────────────────────
         logger.info("NN velocity-control trajectory tracking active.")
+        # As TrackingEnv: last K frames (primed with copies of the first), then last M clamped actions (zeros first)
+        window = None
+        act_hist = torch.zeros(self.m, ACT_DIM, device=device)
         step = 0
         while self.cf.is_connected() and self.running:
             start_time = time.time()
@@ -323,11 +336,15 @@ class CrazyflieController:
                 ang  = self.current_ang_vel.clone()
 
             obs = build_observation(step, pos, vel, quat, ang)
+            window = obs.expand(self.k, -1) if window is None else torch.cat([window[1:], obs[None]])
+            policy_input = torch.cat([window.flatten(), act_hist.flatten()])
 
             with torch.no_grad():
-                _, outputs = self.agent.act(obs.unsqueeze(0), None, timestep=0, timesteps=1)
+                _, outputs = self.agent.act(policy_input.unsqueeze(0), None, timestep=0, timesteps=1)
                 action = outputs["mean_actions"].squeeze(0)
                 action = action.clamp(-1.0, 1.0)
+            if self.m:  # cat([act_hist[1:], a]) would grow an empty (M=0) history to one row
+                act_hist = torch.cat([act_hist[1:], action[None]])
 
             vel_cmd = action * MAX_VELOCITY
             logger.info(f"Step={step} | vel_cmd={[f'{v:.2f}' for v in vel_cmd.tolist()]} | pos={[f'{v:.2f}' for v in pos.tolist()]}")
@@ -360,9 +377,8 @@ class CrazyflieController:
 
 # ── Agent loading / main ───────────────────────────────────────────────────────
 
-def load_agent(checkpoint_path: Optional[str], device: torch.device) -> PPO:
-    obs_space = 22
-    act_space = 3
+def load_agent(checkpoint_path: Optional[str], device: torch.device, obs_space: int = OBS_STEP_DIM) -> PPO:
+    act_space = ACT_DIM
     policy = Policy(observation_space=obs_space, action_space=act_space, device=device)
     models  = {"policy": policy}
     cfg     = PPO_CFG(
@@ -387,10 +403,19 @@ def main():
                         help="Path to the trained model checkpoint")
     parser.add_argument("--uri", type=str, default="radio://0/40/2M/E7E7E7E7E8",
                         help="Crazyflie radio URI")
+    parser.add_argument("--obs-input-hist", type=positive_int, default=None,
+                        help="Observation frames K the policy was trained with. Read from the run's "
+                             "params/env.yaml when present; only needed for a checkpoint outside its run.")
+    parser.add_argument("--action-input-hist", type=nonnegative_int, default=None,
+                        help="Past commanded actions M the policy was trained with. Same rule as K.")
     args = parser.parse_args()
 
-    agent = load_agent(args.checkpoint, device)
-    controller = CrazyflieController(uri=args.uri, agent=agent)
+    try:
+        k, m = resolve_obs_hist(args.checkpoint, args.obs_input_hist, args.action_input_hist)
+    except ValueError as e:
+        parser.error(str(e))
+    agent = load_agent(args.checkpoint, device, OBS_STEP_DIM * k + ACT_DIM * m)
+    controller = CrazyflieController(uri=args.uri, agent=agent, obs_input_hist=k, action_input_hist=m)
 
     try:
         controller.start()

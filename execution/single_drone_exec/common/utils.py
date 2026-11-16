@@ -1,8 +1,10 @@
 import argparse
 import logging
 import math
+import os
+import re
 import time
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -85,6 +87,51 @@ def nonnegative_int(text: str) -> int:
     if value < 0:
         raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
     return value
+
+
+logger = logging.getLogger("CrazyflieRL")
+
+
+def read_obs_hist(checkpoint_path: Optional[str]) -> Optional[Tuple[int, int]]:
+    """(obs_input_hist, action_input_hist) from the training run's params/env.yaml, or None.
+
+    train.py writes <run>/params/env.yaml next to <run>/checkpoints/. Its `observation_space`
+    is stale (dumped before the env recomputes it), so read the two knobs instead, with a
+    regex because yaml.safe_load rejects the file's !!python/tuple tags.
+    """
+    if not checkpoint_path:
+        return None
+    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint_path)))
+    path = os.path.join(run_dir, "params", "env.yaml")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        text = f.read()
+    k = re.search(r"^obs_input_hist:\s*(\d+)\s*$", text, re.MULTILINE)
+    m = re.search(r"^action_input_hist:\s*(\d+)\s*$", text, re.MULTILINE)
+    return (int(k.group(1)), int(m.group(1))) if k and m else None
+
+
+def resolve_obs_hist(checkpoint_path: Optional[str], flag_k: Optional[int],
+                     flag_m: Optional[int]) -> Tuple[int, int]:
+    """Frames K and past actions M the policy was trained with.
+
+    The checkpoint only fixes the input width (frame size x K + action size x M), and equal
+    widths load silently (hover: K=1, M=2 and K=2, M=0 both give 12), so env.yaml wins and a
+    flag that disagrees with it is an error. Without env.yaml (copied .pt, run before WP1)
+    the flags decide, then the plain K=1, M=0.
+    """
+    trained = read_obs_hist(checkpoint_path)
+    if trained is None:
+        k, m = (1 if flag_k is None else flag_k), (0 if flag_m is None else flag_m)
+        logger.info(f"No obs_input_hist/action_input_hist in the run's env.yaml: K={k}, M={m} from the flags")
+        return k, m
+    for flag, name, value in ((flag_k, "--obs-input-hist", trained[0]),
+                              (flag_m, "--action-input-hist", trained[1])):
+        if flag is not None and flag != value:
+            raise ValueError(f"{name} {flag} disagrees with the training run's env.yaml ({value})")
+    logger.info(f"K={trained[0]}, M={trained[1]} from the training run's env.yaml")
+    return trained
 
 
 def add_run_args(parser) -> None:
