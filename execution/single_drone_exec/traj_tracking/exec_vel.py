@@ -20,7 +20,7 @@ from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.utils import positive_int, nonnegative_int, resolve_obs_hist
+from common.utils import emergency_land, land_once, positive_int, nonnegative_int, resolve_obs_hist
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] {message}",
@@ -160,6 +160,7 @@ class CrazyflieController:
 
         self.position_received = False
         self.running = True
+        self.landing = False  # set by land_once: the flight lands once
         self._last_pos_time: float = 0.0
         self._pos_variance = torch.zeros(3, dtype=torch.float32, device=device)
         self.lock = threading.Lock()
@@ -268,16 +269,7 @@ class CrazyflieController:
             ], dtype=torch.float32, device=device)
 
     def _emergency_land(self):
-        logger.warning("EMERGENCY LANDING triggered")
-        self.running = False
-        try:
-            self.cf.high_level_commander.land(0.0, 2.0)
-        except Exception as e:
-            logger.error(f"Emergency land failed: {e}")
-            try:
-                self.cf.commander.send_stop_setpoint()
-            except Exception:
-                pass
+        emergency_land(self)  # hands over from the low-level setpoints first, or land() is ignored
 
     def control_loop(self):
         """Phase 1: HLC takeoff. Phase 2: NN velocity-control trajectory tracking."""
@@ -357,7 +349,7 @@ class CrazyflieController:
             elapsed = time.time() - start_time
             time.sleep(max(0, CONTROL_DT - elapsed))
 
-        self.cf.commander.send_stop_setpoint()
+        land_once(self)  # at once, never send_stop_setpoint: it cuts the motors mid-air
         logger.info("Control loop stopped")
 
     def start(self):
@@ -369,7 +361,7 @@ class CrazyflieController:
         self.running = False
         time.sleep(0.2)
         logger.info("Landing...")
-        self.cf.high_level_commander.land(0.0, 2.0)
+        land_once(self)  # no-op once the control loop has landed
         time.sleep(2.5)
         self.cf.close_link()
         logger.info("Link closed")

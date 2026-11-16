@@ -154,3 +154,47 @@ def test_cli_sizes_policy_from_env_yaml(tmp_path, monkeypatch):
             mod.main()
     assert len(widths) == 3
 
+
+# ── Landing: hand over to the high-level commander, never cut the motors ───────
+
+def test_end_of_flight_lands_once_without_cutting_the_motors(monkeypatch):
+    """The loop's end and stop() both land; land() follows the notify, so the firmware obeys it."""
+    mod = load_script(monkeypatch)
+    cf = TrajFakeCf(10, pos=moving)
+    mod.Crazyflie = lambda **kwargs: cf
+    controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3))
+    controller._start_logging()
+    controller.control_loop()
+    assert [name for name, _ in cf.sent[-3:]] == ["send_velocity_world_setpoint", "send_notify_setpoint_stop", "land"]
+    controller.stop()  # Ctrl+C after the loop ended: no second land
+    assert cf.calls_to("land") == [(0.0, 2.0)]
+    assert cf.calls_to("send_stop_setpoint") == [], "a motor cut in flight drops the drone"
+
+
+class NoisyFakeCf(TrajFakeCf):
+    """Kalman position variance above POS_VARIANCE_THRESHOLD from control step `bad_from` on."""
+
+    def __init__(self, steps, bad_from, **kwargs):
+        super().__init__(steps, **kwargs)
+        self.bad_from = bad_from
+
+    def packet(self, name):
+        if name == "quality" and self.calls >= self.bad_from:
+            return {"kalman.varPX": 1.0, "kalman.varPY": 1e-3, "kalman.varPZ": 1e-3}
+        return super().packet(name)
+
+
+def test_emergency_landing_lands_without_cutting_the_motors(monkeypatch, caplog):
+    mod = load_script(monkeypatch)
+    cf = NoisyFakeCf(50, bad_from=5, pos=moving)
+    mod.Crazyflie = lambda **kwargs: cf
+    controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3))
+    controller._start_logging()
+    controller.control_loop()
+    assert any("EMERGENCY LANDING" in m for m in caplog.messages)
+    assert len(cf.calls_to("send_velocity_world_setpoint")) < 50
+    assert [name for name, _ in cf.sent[-2:]] == ["send_notify_setpoint_stop", "land"]
+    controller.stop()
+    assert cf.calls_to("send_notify_setpoint_stop") == [()]
+    assert cf.calls_to("land") == [(0.0, 2.0)]
+    assert cf.calls_to("send_stop_setpoint") == []
