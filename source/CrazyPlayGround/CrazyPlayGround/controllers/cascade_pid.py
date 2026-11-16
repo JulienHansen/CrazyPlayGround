@@ -106,7 +106,6 @@ class CascadePIDController:
         params: Optional[dict] = None,
         # physics — can be set later via set_physical_params()
         mass: float = 1.0,
-        inertia: list[float] | None = None,
         max_thrust: float = 0.48,
         arm_length: float = 0.046,
     ) -> None:
@@ -126,9 +125,6 @@ class CascadePIDController:
 
         # ── Physical params ──────────────────────────────────────────────────
         self.mass    = torch.tensor(mass,    device=self.device, dtype=torch.float32)
-        inertia      = inertia or [1.0, 1.0, 1.0]
-        self.inertia = torch.tensor(inertia, device=self.device, dtype=torch.float32)
-        self._inertia_tensor: Optional[torch.Tensor] = None
 
         # ── Gains ────────────────────────────────────────────────────────────
         def _g(loop: str, term: str) -> torch.Tensor:
@@ -283,23 +279,14 @@ class CascadePIDController:
             device=device,
             params=params,
             mass=phys.mass,
-            inertia=[phys.inertia.ixx, phys.inertia.iyy, phys.inertia.izz],
             max_thrust=phys.max_thrust,
             arm_length=phys.motor.arm_length,
         )
 
-        # Mass sets the hover thrust (motor reset, thrust_base if not given);
-        # PhysX handles the rigid-body dynamics, so the inertia is informational.
-        _dev = torch.device(device)
-        diag = torch.tensor(
-            [phys.inertia.ixx, phys.inertia.iyy, phys.inertia.izz],
-            dtype=torch.float32, device=_dev,
-        )
-        J = torch.diag(diag).unsqueeze(0).expand(num_envs, -1, -1).contiguous()
-        ctrl.set_physical_params(
-            mass=torch.tensor(phys.mass, dtype=torch.float32),
-            inertia_tensor=J,
-        )
+        # Mass sets the hover thrust (motor reset, thrust_base if not given).
+        # Inertia is not needed: PhysX integrates the rigid-body dynamics with the
+        # mass properties of the robot asset (USD).
+        ctrl.set_physical_params(mass=torch.tensor(phys.mass, dtype=torch.float32))
         return ctrl
 
     # ── Physics setters ──────────────────────────────────────────────────────
@@ -307,18 +294,11 @@ class CascadePIDController:
     def set_physical_params(
         self,
         mass: Optional[torch.Tensor] = None,
-        inertia_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         if mass is not None:
             self.mass = _as_tensor(mass, self.device, torch.float32).view(())
             if not self._thrust_base_from_params:
                 self.thrust_base_cmd = (self.mass.item() * 9.81) / max(self.thrust_cmd_scale, 1e-6)
-        if inertia_tensor is not None:
-            inertia_tensor = _as_tensor(inertia_tensor, self.device, torch.float32)
-            if inertia_tensor.dim() == 2:
-                inertia_tensor = inertia_tensor.unsqueeze(0)
-            self._inertia_tensor = inertia_tensor
-            self.inertia = torch.diagonal(inertia_tensor, dim1=-2, dim2=-1).mean(dim=0)
 
     def set_rate_gains(
         self,
