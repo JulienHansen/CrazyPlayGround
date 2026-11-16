@@ -197,6 +197,7 @@ def check_cfg(cfg: TrackingEnvCfg):
             f"action_latency_max_steps must be 0 or >= action_latency_steps ({cfg.action_latency_steps}), "
             f"got {cfg.action_latency_max_steps}",
         ),
+        (cfg.noise_std >= 0.0, f"noise_std must be >= 0, got {cfg.noise_std}"),
         (0.0 <= cfg.noise_corr < 1.0, f"noise_corr must be in [0, 1), got {cfg.noise_corr}"),
         (cfg.noise_bias_std >= 0.0, f"noise_bias_std must be >= 0, got {cfg.noise_bias_std}"),
         (0.0 <= wind_lo <= wind_hi, f"wind_force_range must satisfy 0 <= min <= max, got {cfg.wind_force_range}"),
