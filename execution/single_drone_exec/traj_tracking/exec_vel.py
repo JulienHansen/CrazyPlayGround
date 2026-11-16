@@ -20,7 +20,8 @@ from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.utils import emergency_land, land_once, positive_int, nonnegative_int, resolve_obs_hist
+from common.utils import (ARENA_FENCE, emergency_land, fly_back_and_land, land_once, positive_int,
+                          nonnegative_int, resolve_obs_hist)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(format="{asctime} [{levelname}] {message}",
@@ -356,6 +357,11 @@ class CrazyflieController:
                 vel  = self.current_vel_w.clone()
                 quat = self.current_quat.clone()
                 ang  = self.current_ang_vel.clone()
+
+            breach = ARENA_FENCE.breach(pos, vel)
+            if breach:
+                fly_back_and_land(self, ARENA_FENCE, breach, pos, POS_STALE_TIMEOUT_S)
+                break
 
             obs = build_observation(step, pos, vel, quat, ang)
             window = obs.expand(self.k, -1) if window is None else torch.cat([window[1:], obs[None]])

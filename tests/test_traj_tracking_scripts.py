@@ -32,6 +32,7 @@ def load_script(monkeypatch):
     spec.loader.exec_module(mod)
     fast_time = types.SimpleNamespace(time=time.time, perf_counter=time.perf_counter, sleep=lambda s: None)
     monkeypatch.setattr(mod, "time", fast_time)
+    monkeypatch.setattr(sys.modules["common.utils"], "time", fast_time)  # the fly-back's hover waits
     monkeypatch.setattr(mod, "device", torch.device("cpu"))
     monkeypatch.setattr(LogConfig, "start", lambda logconf: logconf.fake_cf.fire(logconf))
     return mod
@@ -233,3 +234,67 @@ def test_goes_to_the_trajectory_start_before_the_policy(monkeypatch):
     dist = math.dist(start, (0.0, 0.0, 0.5))
     assert go_to[4] == pytest.approx(max(mod.GOTO_MIN_DURATION_S, dist / mod.GOTO_SPEED))
 
+
+# ── Geofence: brake, fly back to SAFE_HOVER_POS, hover, land ───────────────────
+
+class DivingFakeCf(TrajFakeCf):
+    """World velocity `vel_w` (m/s) in place of the fake's slow constant one."""
+
+    def __init__(self, steps, vel_w, **kwargs):
+        super().__init__(steps, **kwargs)
+        self.vel_w = vel_w
+
+    def packet(self, name):
+        if name == "vel":
+            return dict(zip(("stateEstimate.vx", "stateEstimate.vy", "stateEstimate.vz"), self.vel_w))
+        return super().packet(name)
+
+
+def _fly_to_breach(mod, cf):
+    mod.Crazyflie = lambda **kwargs: cf
+    controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3))
+    controller._start_logging()
+    controller.control_loop()
+    return controller
+
+
+def _assert_flew_back(mod, cf, brake):
+    names = [name for name, _ in cf.sent]
+    assert names[-5:] == ["send_notify_setpoint_stop", "go_to", "go_to", "send_notify_setpoint_stop", "land"]
+    _, brake_go_to, safe_go_to = cf.calls_to("go_to")  # the first one flies to the trajectory start
+    fence = mod.ARENA_FENCE
+    assert list(brake_go_to) == pytest.approx(brake + [0.0, fence.brake_s])
+    assert list(safe_go_to[:4]) == pytest.approx(list(fence.safe_hover_pos) + [0.0])
+    dist = math.dist(brake, fence.safe_hover_pos)
+    assert safe_go_to[4] == pytest.approx(max(fence.min_fly_back_s, dist / fence.fly_back_speed))
+    assert cf.calls_to("land") == [(0.0, 2.0)]
+    assert cf.calls_to("send_stop_setpoint") == [], "a motor cut in flight drops the drone"
+
+
+def test_ceiling_breach_flies_back_to_safe_hover(monkeypatch, caplog):
+    mod = load_script(monkeypatch)
+    cf = TrajFakeCf(500, pos=lambda n: (0.2, -0.1, 1.0 + 0.1 * n))  # above ARENA_FENCE.hi z = 1.8 from step 9
+    controller = _fly_to_breach(mod, cf)
+    assert len(cf.calls_to("send_velocity_world_setpoint")) == 9
+    assert any("outside the fence" in m for m in caplog.messages)
+    _assert_flew_back(mod, cf, brake=[0.2, -0.1, mod.ARENA_FENCE.hi[2]])
+    controller.stop()  # Ctrl+C after landing: no second land
+    assert cf.calls_to("land") == [(0.0, 2.0)]
+
+
+def test_fast_descent_trips_before_the_floor(monkeypatch):
+    """At 1.5 m/s down, the lookahead trips at z = 0.4 m, still 0.1 m above ARENA_FENCE.lo z."""
+    mod = load_script(monkeypatch)
+    cf = DivingFakeCf(500, vel_w=(0.0, 0.0, -1.5), pos=lambda n: (0.2, -0.1, 0.4))
+    _fly_to_breach(mod, cf)
+    assert cf.calls_to("send_velocity_world_setpoint") == []
+    _assert_flew_back(mod, cf, brake=[0.2, -0.1, 0.4])
+
+
+def test_trajectory_lies_inside_the_fence(monkeypatch):
+    mod = load_script(monkeypatch)
+    period = round(2 * math.pi / (mod.TRAJ_W * mod.CONTROL_DT))
+    pts = torch.cat([mod.compute_waypoints_world(step) for step in range(0, period, 10)])
+    fence = mod.ARENA_FENCE
+    assert (pts >= torch.tensor(fence.lo)).all() and (pts <= torch.tensor(fence.hi)).all()
+    assert fence.breach(torch.tensor(fence.safe_hover_pos), torch.zeros(3)) is None
