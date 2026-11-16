@@ -93,17 +93,21 @@ logger = logging.getLogger("CrazyflieRL")
 
 
 def read_obs_hist(checkpoint_path: Optional[str]) -> Optional[Tuple[int, int]]:
-    """(obs_input_hist, action_input_hist) from the training run's params/env.yaml, or None.
+    """(obs_input_hist, action_input_hist) from the training run's env.yaml, or None.
 
-    train.py writes <run>/params/env.yaml next to <run>/checkpoints/. Its `observation_space`
-    is stale (dumped before the env recomputes it), so read the two knobs instead, with a
-    regex because yaml.safe_load rejects the file's !!python/tuple tags.
+    An exported checkpoint <name>.pt carries its run's env.yaml as <name>_params/env.yaml beside
+    it; inside a run, train.py writes <run>/params/env.yaml next to <run>/checkpoints/. The first
+    of the two that exists is read. Its `observation_space` is stale (dumped before the env
+    recomputes it), so read the two knobs instead, with a regex because yaml.safe_load rejects
+    the file's !!python/tuple tags.
     """
     if not checkpoint_path:
         return None
-    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint_path)))
-    path = os.path.join(run_dir, "params", "env.yaml")
-    if not os.path.exists(path):
+    ckpt = os.path.abspath(checkpoint_path)
+    candidates = (os.path.join(os.path.splitext(ckpt)[0] + "_params", "env.yaml"),
+                  os.path.join(os.path.dirname(os.path.dirname(ckpt)), "params", "env.yaml"))
+    path = next((p for p in candidates if os.path.exists(p)), None)
+    if path is None:
         return None
     with open(path) as f:
         text = f.read()
@@ -117,9 +121,10 @@ def resolve_obs_hist(checkpoint_path: Optional[str], flag_k: Optional[int],
     """Frames K and past actions M the policy was trained with.
 
     The checkpoint only fixes the input width (frame size x K + action size x M), and equal
-    widths load silently (hover: K=1, M=2 and K=2, M=0 both give 12), so env.yaml wins and a
-    flag that disagrees with it is an error. Without env.yaml (copied .pt, run before WP1)
-    the flags decide, then the plain K=1, M=0.
+    widths load silently (hover: K=1, M=2 and K=2, M=0 both give 12), so env.yaml (see
+    read_obs_hist) wins and a flag that disagrees with it is an error. Without env.yaml (a .pt
+    copied without its <name>_params/ folder, a run before WP1) the flags decide, then the
+    plain K=1, M=0.
     """
     trained = read_obs_hist(checkpoint_path)
     if trained is None:

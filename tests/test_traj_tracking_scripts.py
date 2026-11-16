@@ -16,7 +16,7 @@ import pytest
 import torch
 from cflib.crazyflie.log import LogConfig
 
-from test_hover_scripts import (ACTION, ENV_YAML, FakeAgent, FakeCf, _Commands, _run_dir,
+from test_hover_scripts import (ACTION, ENV_YAML, FakeAgent, FakeCf, _Commands, _export_dir, _run_dir,
                                 _save_checkpoint, _StopBeforeFlight)
 
 HERE = os.path.dirname(__file__)
@@ -141,8 +141,16 @@ def test_cli_sizes_policy_from_env_yaml(tmp_path, monkeypatch):
         mod.main()
     assert widths[-1] == FRAME * 4 and (made[-1]["obs_input_hist"], made[-1]["action_input_hist"]) == (4, 0)
 
+    # an exported checkpoint: K and M from <name>_params/env.yaml beside it, not the K=1, M=0 fallback
+    exported = _export_dir(tmp_path, "best_k3m2", ENV_YAML.format(k=3, m=2))
+    monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", exported])
+    with pytest.raises(_StopBeforeFlight):
+        mod.main()
+    assert widths[-1] == FRAME * 3 + 3 * 2 and (made[-1]["obs_input_hist"], made[-1]["action_input_hist"]) == (3, 2)
+
     for bad in (["--obs-input-hist", "3"], ["--obs-input-hist", "0"], ["--action-input-hist", "-1"]):
         monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt] + bad)
         with pytest.raises(SystemExit):
             mod.main()
-    assert len(widths) == 2
+    assert len(widths) == 3
+

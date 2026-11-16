@@ -401,8 +401,9 @@ def main():
     parser.add_argument("--target", type=float, nargs=3, default=None,
                         help="Initial target [x, y, z] in world frame. If not set, hovers above takeoff pos.")
     parser.add_argument("--obs-input-hist", type=positive_int, default=None,
-                        help="Observation frames K the policy was trained with. Read from the run's "
-                             "params/env.yaml when present; only needed for a checkpoint outside its run.")
+                        help="Observation frames K the policy was trained with. Read from <name>_params/env.yaml "
+                             "beside an exported <name>.pt, or the run's params/env.yaml; only needed "
+                             "for a checkpoint without either.")
     parser.add_argument("--action-input-hist", type=nonnegative_int, default=None,
                         help="Past commanded actions M the policy was trained with. Same rule as K.")
     add_run_args(parser)
