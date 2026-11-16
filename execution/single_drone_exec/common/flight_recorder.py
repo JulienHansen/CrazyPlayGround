@@ -41,6 +41,12 @@ class FlightRecorder:
     own obs/action/cmd column names, so columns stay human-readable (e.g.
     "vx, vy, vz") regardless of control mode. Motor PWM columns default to the
     same 4-motor names across scripts since that shape never varies.
+
+    A row that cannot be built (wrong length, missing declared column) is
+    skipped on its own; a batch that cannot be written is dropped as a whole.
+    Either way recording goes on for the rest of the flight: `skipped` counts
+    the rows lost, `written` the rows in the file, and close() logs an error
+    if any row was lost or the file ends up empty.
     """
 
     BASE_FIELDS = ["step", "control_time", "obs_age_s"] + _STATE_FIELDS
@@ -112,7 +118,8 @@ class FlightRecorder:
         self._writer: Optional[pq.ParquetWriter] = None
         self._buffer: List[Dict[str, object]] = []
         self._thread: Optional[threading.Thread] = None
-        self.skipped = 0  # rows that raised while being written or logged
+        self.skipped = 0  # rows lost: a row that raised while built or logged, or every row of a batch that failed to write
+        self.written = 0  # rows in the Parquet file
 
     def start(self) -> None:
         """Open the Parquet writer (if recording) and launch the recorder thread."""
@@ -131,6 +138,7 @@ class FlightRecorder:
 
     def _drain_loop(self) -> None:
         # None is the stop sentinel put by close(): rows queued before it are all written.
+        # _flush_buffer never raises, so the final flush cannot kill this thread.
         while (sample := self._queue.get()) is not None:
             try:
                 if self._writer and sample["step"] % self.record_every == 0:
@@ -140,10 +148,14 @@ class FlightRecorder:
                 if sample["step"] % self.log_every == 0:
                     self._log(sample)
             except Exception:  # one bad row must not stop recording and status lines for the flight
-                self.skipped += 1
-                if self.skipped == 1:
-                    self.logger.exception(f"Recorder failed at step {sample.get('step')}; skipping bad rows")
+                self._report_failure(sample.get("step"), 1)
         self._flush_buffer()
+
+    def _report_failure(self, step: object, n_rows: int) -> None:
+        """Count `n_rows` lost rows; log the traceback of the first failure only. Call from an except block."""
+        if self.skipped == 0:
+            self.logger.exception(f"Recorder failed at step {step}; skipping bad rows")
+        self.skipped += n_rows
 
     def _log(self, sample: Dict[str, object]) -> None:
         (px, py, pz), (vx, vy, vz) = sample["pos"], sample["vel"]
@@ -173,15 +185,26 @@ class FlightRecorder:
         row.update(zip(self.action_fields, sample["action"], strict=True))
         row.update(zip(self.cmd_fields, sample["cmd"], strict=True))
         row.update(zip(self.motor_fields, sample["motor"], strict=True))
+        row.update(zip(self.extra_fields, sample.get("extra", ()), strict=True))
+        # every declared column must be in the row, or the whole batch would fail to write
+        if len(row) != len(self._fieldnames):
+            missing = [name for name in self._fieldnames if name not in row]
+            raise KeyError(f"row lacks declared columns {missing}")
         return row
 
     def _flush_buffer(self) -> None:
+        """Write the buffered rows as one row group. Never raises: a failed batch is counted and dropped."""
         rows, self._buffer = self._buffer, []  # a batch that fails to write is dropped, not retried on every flush
         if not rows:
             return
-        columns = {name: [row[name] for row in rows] for name in self._fieldnames}
-        table = pa.Table.from_pydict(columns, schema=self._schema)
-        self._writer.write_table(table)
+        try:
+            columns = {name: [row[name] for row in rows] for name in self._fieldnames}
+            table = pa.Table.from_pydict(columns, schema=self._schema)
+            self._writer.write_table(table)
+        except Exception:
+            self._report_failure(rows[0]["step"], len(rows))
+            return
+        self.written += len(rows)
 
     def close(self) -> None:
         if self._thread is not None:
@@ -193,6 +216,8 @@ class FlightRecorder:
         if self._writer is not None:
             self._writer.close()
             self._writer = None
+            if self.written == 0:
+                self.logger.error(f"Recording {self.record_path} holds no rows")
 
 
 class StateSnapshot(NamedTuple):
