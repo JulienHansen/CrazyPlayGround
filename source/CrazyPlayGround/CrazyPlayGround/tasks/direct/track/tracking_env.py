@@ -422,13 +422,13 @@ class TrackingEnv(DirectRLEnv):
 
         lin_vel_sq = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel_sq = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
-        action_rate = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)
+        action_rate_sq = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)
 
         rewards = {
             "distance_to_goal": r_pos * self.cfg.pos_reward_scale * self.step_dt,
             "lin_vel": lin_vel_sq * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel_sq * self.cfg.ang_vel_reward_scale * self.step_dt,
-            "action_rate": action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
+            "action_rate": action_rate_sq * self.cfg.action_rate_reward_scale * self.step_dt,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
