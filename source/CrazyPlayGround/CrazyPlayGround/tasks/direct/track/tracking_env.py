@@ -582,7 +582,8 @@ class TrackingEnv(DirectRLEnv):
 
         lin_vel_sq = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel_sq = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
-        action_rate_sq = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)
+        # on the *commanded* actions: the delayed ones the controller gets would credit each change d steps late
+        action_rate_sq = torch.sum(torch.square(self.cmd_history[:, -1] - self.cmd_history[:, -2]), dim=1)
 
         rewards = {
             "distance_to_goal": r_pos * self.cfg.pos_reward_scale * self.step_dt,
