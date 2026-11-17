@@ -91,6 +91,7 @@ def start(env):
         (AttTrackingEnvCfg, {"min_thrust_scale": 1.2}),
         (AttTrackingEnvCfg, {"max_thrust_scale": 0.9}),
         (AttTrackingEnvCfg, {"min_thrust_scale": 0.0}),
+        (VelTrackingEnvCfg, {"noise_std": -0.01}),
         (VelTrackingEnvCfg, {"noise_corr": 1.0}),
         (VelTrackingEnvCfg, {"noise_bias_std": -0.1}),
         (VelTrackingEnvCfg, {"wind_force_range": (-0.01, 0.02)}),

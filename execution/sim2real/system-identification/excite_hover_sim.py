@@ -6,10 +6,10 @@ max_velocity), tracked by the cascade PID at its velocity level, the sim twin of
 velocity PID. The recording has excite_hover.py's columns, so measure_delay_noise.py and
 plot_step_response.py read real and simulated flights alike.
 
-    python execution/sim2real/excite_hover_sim.py --record-path flights/sim_excite_x.parquet \
+    python execution/sim2real/system-identification/excite_hover_sim.py --record-path flights/sim_excite_x.parquet \
         --exc-axis x --exc-amp 0.2 --duration 90 --headless [env.action_latency_steps=4 ...]
-    python execution/sim2real/measure_delay_noise.py flights/sim_excite_x.parquet
-    python execution/sim2real/plot_step_response.py flights/excite_x.parquet flights/sim_excite_x.parquet
+    python execution/sim2real/system-identification/measure_delay_noise.py flights/sim_excite_x.parquet
+    python execution/sim2real/system-identification/plot_step_response.py flights/excite_x.parquet flights/sim_excite_x.parquet
 
 Trailing key=value arguments are Hydra overrides of the env, e.g. the env.* line that
 measure_delay_noise.py prints. Row k holds the state read before command k, as on the drone, and

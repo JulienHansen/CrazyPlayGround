@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real", "system-identification"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real"))
 import measure_delay_noise as mdn  # noqa: E402
 

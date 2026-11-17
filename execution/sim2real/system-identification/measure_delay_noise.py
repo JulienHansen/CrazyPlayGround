@@ -1,7 +1,7 @@
 """Step-response delay, dead time, time constant and sensor noise of hover flights.
 
-    python execution/sim2real/excite_hover.py --record-path flight.parquet --duration 90
-    python execution/sim2real/measure_delay_noise.py flight.parquet [more.parquet ...]
+    python execution/sim2real/system-identification/excite_hover.py --record-path flight.parquet --duration 90
+    python execution/sim2real/system-identification/measure_delay_noise.py flight.parquet [more.parquet ...]
 
 Input: any Parquet recording from excite_hover.py with one row per 10 ms control step holding
 `step`, `control_time`, the step excitation `exc_vx, exc_vy, exc_vz`, the firmware-echoed
@@ -153,7 +153,7 @@ def main(argv=None):
 
     if not fits:
         print("delay and noise: NOT REPORTED, no excited axis. Fly for example\n"
-              "  execution/sim2real/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90")
+              "  execution/sim2real/system-identification/excite_hover.py --record-path flight.parquet --exc-axis x --duration 90")
         return
     ds = [r["d"] for r in fits]
     print(f"env.action_latency_steps={min(ds)} env.action_latency_max_steps={max(ds) if max(ds) > min(ds) else 0} "

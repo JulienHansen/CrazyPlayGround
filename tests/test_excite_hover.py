@@ -13,7 +13,7 @@ from cflib.crazyflie.log import LogConfig
 
 from test_hover_scripts import FakeCf, POS, _StopBeforeFlight
 
-SIM2REAL = os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real")
+SIM2REAL = os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real", "system-identification")
 sys.path.append(SIM2REAL)
 import excitation  # noqa: E402
 import excite_hover  # noqa: E402
