@@ -101,13 +101,23 @@ class InertiaConfig:
 
 @dataclass
 class MotorConfig:
-    """Motor and frame geometry for the QuadMixer."""
+    """Motor and frame geometry (``drone.motor`` in the YAML), used by the motor chain."""
     arm_length: float   # m    — center-to-motor distance
     k_thrust:   float   # N·s²  — thrust coeff  (F = k_thrust · ω²)
     k_drag:     float   # N·m·s² — drag coeff   (τ = k_drag   · ω²)
     layout:     str     # 'x' or '+' quad configuration
     speed_min:  float   # rad/s — minimum motor speed (clamped)
     speed_max:  float   # rad/s — maximum motor speed (clamped)
+    tau:           float  # s — motor time constant (first-order lag)
+    thrust_min:    float  # N — per-motor thrust below which the firmware cuts the motor
+    thrust2torque: float  # m — yaw drag torque per newton of thrust
+
+
+@dataclass
+class FirmwareConfig:
+    """Firmware integer formats (``drone.firmware`` in the YAML), used by the motor chain."""
+    motor_cmd_max:   float  # motor command full scale (uint16)
+    control_cmd_max: float  # saturation of the roll/pitch/yaw control outputs (int16)
 
 
 @dataclass
@@ -117,6 +127,7 @@ class DronePhysicsConfig:
     inertia: InertiaConfig
     max_thrust: float   # Total maximum thrust (all motors combined) [N]
     motor: Optional[MotorConfig] = field(default=None)
+    firmware: Optional[FirmwareConfig] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +199,16 @@ def load_config(path: str | Path) -> DroneConfig:
             layout=str(motor_raw.get("layout", "x")),
             speed_min=float(motor_raw.get("speed_min", 0.0)),
             speed_max=float(motor_raw.get("speed_max", float("inf"))),
+            tau=float(motor_raw["tau"]),
+            thrust_min=float(motor_raw["thrust_min"]),
+            thrust2torque=float(motor_raw["thrust2torque"]),
+        )
+    firmware_raw = d.get("firmware", None)
+    firmware: Optional[FirmwareConfig] = None
+    if firmware_raw is not None:
+        firmware = FirmwareConfig(
+            motor_cmd_max=float(firmware_raw["motor_cmd_max"]),
+            control_cmd_max=float(firmware_raw["control_cmd_max"]),
         )
     physics = DronePhysicsConfig(
         name=str(d["name"]),
@@ -199,6 +220,7 @@ def load_config(path: str | Path) -> DroneConfig:
         ),
         max_thrust=float(d["max_thrust"]),
         motor=motor,
+        firmware=firmware,
     )
 
     # --- Attitude controller ---

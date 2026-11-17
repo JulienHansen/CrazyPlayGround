@@ -7,7 +7,7 @@ import torch
 
 from .utils.math_utils import quat_apply_inverse, euler_xyz_from_quat, expand_to
 from .pid import PID_Vectorized
-from .motor_chain import CMD_MAX, CrazyflieMotorChain
+from .motor_chain import CrazyflieMotorChain
 
 DEG2RAD = math.pi / 180.0
 
@@ -31,7 +31,7 @@ DEFAULT_LIMITS: dict = {
     "yaw_max_delta": 0.0,
     "thrust_base":   36_000.0,
     "thrust_min":    20_000.0,
-    "thrust_cmd_max": 65_535.0,
+    # thrust_cmd_max defaults to drone.firmware.motor_cmd_max
 }
 
 
@@ -96,6 +96,11 @@ class CascadePIDController:
         Override any gain or limit.  See ``DEFAULT_GAINS`` / ``DEFAULT_LIMITS``
         for available keys.  Values from a YAML ``cascade_pid`` section can
         be passed directly.
+    max_thrust, arm_length, motor_tau, motor_thrust_min, motor_thrust2torque, motor_cmd_max, control_cmd_max : float
+        Keyword-only, no defaults: ``drone.max_thrust`` [N, all 4 motors],
+        ``drone.motor.{arm_length [m], tau [s], thrust_min [N], thrust2torque [m]}`` and
+        ``drone.firmware.{motor_cmd_max, control_cmd_max}`` from crazyflie.yaml.
+        ``from_drone_config`` passes them.
     """
 
     def __init__(
@@ -106,8 +111,15 @@ class CascadePIDController:
         params: Optional[dict] = None,
         # physics — can be set later via set_physical_params()
         mass: float = 1.0,
-        max_thrust: float = 0.48,
-        arm_length: float = 0.046,
+        *,
+        # drone and motor parameters, from crazyflie.yaml (drone.max_thrust, drone.motor)
+        max_thrust: float,
+        arm_length: float,
+        motor_tau: float,
+        motor_thrust_min: float,
+        motor_thrust2torque: float,
+        motor_cmd_max: float,
+        control_cmd_max: float,
     ) -> None:
         self.dt      = float(dt)
         self.device  = torch.device(device)
@@ -196,11 +208,11 @@ class CascadePIDController:
                                          DEFAULT_LIMITS["yaw_max_delta"])
 
         # ── Thrust scaling ───────────────────────────────────────────────────
-        thrust_cmd_max           = float(params.get("thrust_cmd_max", DEFAULT_LIMITS["thrust_cmd_max"]))
+        thrust_cmd_max           = float(params.get("thrust_cmd_max", motor_cmd_max))
         self.vel_thrust_scale    = float(params.get("vel_thrust_scale", params.get("thrust_scale", 1000.0)))
         # total newtons per unit of collective command: the same command goes to all 4 motors,
         # each giving max_thrust / 4 at 65535, so F_total = 4 · cmd · max_thrust / (4 · 65535)
-        self.thrust_cmd_scale    = float(max_thrust) / CMD_MAX
+        self.thrust_cmd_scale    = float(max_thrust) / float(motor_cmd_max)
         self.thrust_base_cmd     = float(params.get("thrust_base",  params.get("thrustBase",  DEFAULT_LIMITS["thrust_base"])))
         self.thrust_min_cmd      = float(params.get("thrust_min",   params.get("thrustMin",   DEFAULT_LIMITS["thrust_min"])))
         self.thrust_max_cmd      = float(params.get("thrust_max",   thrust_cmd_max))
@@ -212,10 +224,12 @@ class CascadePIDController:
             dt=self.dt,
             device=self.device,
             max_thrust_total=max_thrust,
-            thrust_min=float(params.get("motor_thrust_min", 0.0128)),
+            thrust_min=motor_thrust_min,
             arm_length=arm_length,
-            thrust2torque=float(params.get("motor_thrust2torque", 0.00699)),
-            tau=float(params.get("motor_tau", 0.072)),
+            thrust2torque=motor_thrust2torque,
+            tau=motor_tau,
+            motor_cmd_max=motor_cmd_max,
+            control_cmd_max=control_cmd_max,
         )
 
         # ── Derivative low-pass filter ────────────────────────────────────────
@@ -271,7 +285,9 @@ class CascadePIDController:
         params = getattr(drone_config, "cascade_pid", None) or {}
         phys   = drone_config.physics
         if phys.motor is None:
-            raise ValueError("drone.motor (arm_length) is required by the motor chain")
+            raise ValueError("drone.motor (arm_length, tau, thrust_min, thrust2torque) is required by the motor chain")
+        if phys.firmware is None:
+            raise ValueError("drone.firmware (motor_cmd_max, control_cmd_max) is required by the motor chain")
 
         ctrl = cls(
             dt=dt,
@@ -281,6 +297,11 @@ class CascadePIDController:
             mass=phys.mass,
             max_thrust=phys.max_thrust,
             arm_length=phys.motor.arm_length,
+            motor_tau=phys.motor.tau,
+            motor_thrust_min=phys.motor.thrust_min,
+            motor_thrust2torque=phys.motor.thrust2torque,
+            motor_cmd_max=phys.firmware.motor_cmd_max,
+            control_cmd_max=phys.firmware.control_cmd_max,
         )
 
         # Mass sets the hover thrust (motor reset, thrust_base if not given).

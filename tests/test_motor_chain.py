@@ -23,7 +23,21 @@ YAML = os.path.join(PKG, "controllers", "crazyflie.yaml")
 
 
 def chain(n=1, tau=0.0):
-    return CrazyflieMotorChain(num_envs=n, dt=DT, tau=tau)
+    """Motor chain with the parameters of crazyflie.yaml; the expected values above stay
+    hardcoded on purpose, as an independent check of those parameters."""
+    phys = load_config(YAML).physics
+    return CrazyflieMotorChain(
+        num_envs=n,
+        dt=DT,
+        device="cpu",
+        max_thrust_total=phys.max_thrust,
+        thrust_min=phys.motor.thrust_min,
+        arm_length=phys.motor.arm_length,
+        thrust2torque=phys.motor.thrust2torque,
+        tau=tau,
+        motor_cmd_max=phys.firmware.motor_cmd_max,
+        control_cmd_max=phys.firmware.control_cmd_max,
+    )
 
 
 def wrench(c, thrust_cmd, alpha):

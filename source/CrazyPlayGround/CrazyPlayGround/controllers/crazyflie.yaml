@@ -23,16 +23,26 @@ drone:
     ixx: 1.657e-5
     iyy: 1.657e-5
     izz: 2.900e-5
-  max_thrust: 0.48       # N  (4 × 0.12 N, firmware THRUST_MAX, CF2.1 brushed, 2.1+ props)
+  # Firmware values below are from crazyflie-firmware src/platform/interface/platform_defaults_cf2.h,
+  # CONFIG_CRAZYFLIE_21_PLUS (CF2.1 brushed, 2.1+ props). Not identified on our drones.
+  max_thrust: 0.48       # N  — total, 4 × THRUST_MAX (0.12 N per motor)
 
-  # Motor & frame geometry  (arm_length is used by the motor chain)
+  # Motor & frame geometry  (arm_length, tau, thrust_min, thrust2torque: used by the motor chain)
   motor:
     arm_length: 0.046      # m   — center-to-motor distance (firmware ARM_LENGTH)
+    tau:           0.072   # s   — brushed-motor time constant (Eschmann 2024; not a firmware value)
+    thrust_min:    0.0128  # N   — per motor; below this the firmware cuts the motor (THRUST_MIN, motors.c)
+    thrust2torque: 0.00699 # m   — yaw drag torque per N of thrust (firmware THRUST2TORQUE)
     k_thrust:   1.285e-8   # N·s²  — F = k_thrust · ω²  (sysid: Förster 2015)
     k_drag:     7.645e-11  # N·m·s² — τ = k_drag · ω²
     layout:     x          # 'x' — standard X-quad configuration
     speed_min:  0.0        # rad/s
     speed_max:  2618.0     # rad/s  (~25 000 RPM)
+
+  # Firmware integer formats (crazyflie-firmware 2026.08), used by the motor chain
+  firmware:
+    motor_cmd_max:   65535 # motor command full scale, uint16 (power_distribution_quadrotor.c UINT16_MAX)
+    control_cmd_max: 32767 # saturation of the roll/pitch/yaw control outputs, int16 (saturateSignedInt16)
 
 controllers:
 
@@ -149,8 +159,4 @@ controllers:
     thrust_cmd_max: 65535.0   # Full-scale throttle [PWM]
     vel_thrust_scale: 1000.0  # (m/s²) → PWM conversion
 
-    # ── Motor chain  (firmware mixer, cap, thrust map, motor lag) ─────────
-    motor_tau:           0.072    # s  — brushed-motor time constant (CF2.1, Eschmann 2024)
-    motor_thrust_min:    0.0128   # N  — per motor; below this the firmware cuts the motor
-    motor_thrust2torque: 0.00699  # m  — yaw drag torque per N of thrust (THRUST2TORQUE)
 
