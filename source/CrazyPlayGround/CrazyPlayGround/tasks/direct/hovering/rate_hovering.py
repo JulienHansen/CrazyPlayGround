@@ -1,15 +1,14 @@
-"""Body-rate-controlled hovering environment.
+"""Body-rate-controlled hovering: action [p, q, r, T] in [-1, 1]^4 into the rate loop of the cascade PID.
 
-Identical to att_hovering except the action is [roll_rate, pitch_rate, yaw_rate, thrust_normalized]
-fed directly into the body-rate loop, bypassing position, velocity, and attitude PIDs.
-The agent directly commands the drone's angular rates and thrust.
-
-This is the lowest-level RL control interface: only the rate PID (which converts
-rate setpoints to moments) and the motor mixer sit below the agent.
+Rates = a[:3] * max_body_rate; thrust = T_min + (a[3] + 1) / 2 * (T_max - T_min), with
+T_min/T_max = min/max_thrust_scale * m*g. So a = 0 is a 1.15 * m*g climb, not hover, and
+empty action-history slots hold ``history_fill_value`` (-10), which the controller never sees.
+Defaults are the plain task: no noise, no DR; only the motor tau is drawn per episode.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import pathlib as _pathlib
 
@@ -34,6 +33,8 @@ _DEFAULT_DRONE_CONFIG = str(
     _pathlib.Path(__file__).resolve().parents[3] / "controllers" / "crazyflie.yaml"
 )
 
+logger = logging.getLogger(__name__)
+
 class QuadcopterEnvWindow(BaseEnvWindow):
     """Window manager for the Quadcopter environment."""
 
@@ -57,6 +58,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     max_body_rate = math.pi  # rad/s (~180 deg/s) max angular rate per axis
     min_thrust_scale = 0.5   # fraction of hover thrust
     max_thrust_scale = 1.8   # fraction of hover thrust
+    history_fill_value: float = -10.0  # "no command" in empty action slots; outside [-1, 1], never sent to the controller
 
     ui_window_class_type = QuadcopterEnvWindow
 
@@ -96,11 +98,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ang_vel_reward_scale = -0.05
     distance_to_goal_reward_scale = 20.0
 
-    add_noise = True
-    noise_std = 0.05
+    add_noise = False
+    noise_std = 0.01
 
     # ── Domain randomization ──────────────────────────────────────
-    domain_rand = True
+    domain_rand = False
     # max-thrust variability (battery / propellers / motor wear).
     rand_thrust_scale_range = (0.85, 1.15)
     # Per-episode additive bias on commanded thrust as a fraction of hover thrust
@@ -111,13 +113,33 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # (0.072, 0.072) fixes it (e.g. for evaluation)
     motor_tau_range = (0.055, 0.090)
 
+
+def check_cfg(cfg: QuadcopterEnvCfg):
+    """Reject knob values that can't work. Called by the env constructor, after Hydra overrides."""
+    tau_lo, tau_hi = cfg.motor_tau_range
+    checks = [
+        (cfg.max_body_rate > 0.0, f"max_body_rate must be > 0, got {cfg.max_body_rate}"),
+        (
+            0.0 < cfg.min_thrust_scale <= 1.0 <= cfg.max_thrust_scale,
+            "thrust scales must satisfy 0 < min_thrust_scale <= 1 <= max_thrust_scale, "
+            f"got ({cfg.min_thrust_scale}, {cfg.max_thrust_scale})",
+        ),
+        (0.0 <= tau_lo <= tau_hi, f"motor_tau_range must satisfy 0 <= min <= max, got {cfg.motor_tau_range}"),
+        (
+            not -1.0 <= cfg.history_fill_value <= 1.0,
+            f"history_fill_value must lie outside the action range [-1, 1], got {cfg.history_fill_value}",
+        ),
+    ]
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
     def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
-        tau_lo, tau_hi = cfg.motor_tau_range
-        if not 0.0 <= tau_lo <= tau_hi:
-            raise ValueError(f"motor_tau_range must satisfy 0 <= min <= max, got {cfg.motor_tau_range}")
+        # Hydra applies CLI overrides after the cfg is built, so validate here, not in the cfg
+        check_cfg(cfg)
         super().__init__(cfg, render_mode, **kwargs)
 
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
@@ -267,9 +289,10 @@ class QuadcopterEnv(DirectRLEnv):
         self.extras["log"] = dict()
         self.extras["log"].update(extras)
         extras = dict()
-        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+        # tensors, not .item(): skrl logs only one-element tensors and silently drops floats
+        extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids])
+        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
+        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal
         self.extras["log"].update(extras)
 
         self._robot.reset(env_ids)
