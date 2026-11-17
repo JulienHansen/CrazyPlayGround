@@ -1,7 +1,7 @@
 """Checks for the tracking env's observation/action history, command latency and action-rate
 penalty (#53), its sim-to-real randomisation: observation noise, wind, thrust/torque scaling (#54),
-and its tracking metrics and trajectory clock (#56), in velocity (3-D action) and attitude (4-D action)
-mode, and the knobs-off defaults.
+its tracking metrics and trajectory clock (#56), and its distance-reward shapes (#69), in velocity
+(3-D action) and attitude (4-D action) mode, and the knobs-off defaults.
 
 Run (from CrazyPlayGround/, needs Isaac Sim and a GPU):
     python -m pytest source/CrazyPlayGround/test/test_tracking_env.py -v
@@ -98,6 +98,10 @@ def start(env):
         (VelTrackingEnvCfg, {"wind_force_range": (0.03, 0.02)}),
         (VelTrackingEnvCfg, {"thrust_scale_range": (0.0, 1.2)}),
         (VelTrackingEnvCfg, {"torque_scale_range": (1.2, 1.1)}),
+        (VelTrackingEnvCfg, {"distance_reward_shape": "gauss"}),
+        (VelTrackingEnvCfg, {"distance_reward_length": 0.0}),
+        (VelTrackingEnvCfg, {"distance_reward_shape": "multiexp", "distance_reward_scales": ()}),
+        (VelTrackingEnvCfg, {"distance_reward_shape": "multiexp", "distance_reward_scales": (1.0, 0.0)}),
     ],
 )
 def test_invalid_knobs_raise(cfg_cls, knobs):
@@ -247,6 +251,42 @@ def test_action_rate_penalises_commanded_action(cfg_cls):
         torch.testing.assert_close(
             env._episode_sums["action_rate"][0], scale * (c[0] - env._hover_cmd).square().sum() * env.step_dt
         )
+    finally:
+        env.close()
+
+
+def test_default_distance_reward_is_tanh_08():
+    """The defaults keep the reward of earlier runs: 1 - tanh(d / 0.8)."""
+    cfg = VelTrackingEnvCfg()
+    assert (cfg.distance_reward_shape, cfg.distance_reward_length) == ("tanh", 0.8)
+
+
+@pytest.mark.parametrize("shape", ["tanh", "exp", "multiexp"])
+@pytest.mark.parametrize("cfg_cls", MODES)
+def test_distance_reward_shapes(cfg_cls, shape):
+    length, scales = 0.2, (1.0, 0.5, 0.1)  # not the defaults, so a hard-coded 0.8 or default scales would fail
+    env = make_env(cfg_cls, distance_reward_shape=shape, distance_reward_length=length, distance_reward_scales=scales)
+    try:
+        start(env)
+        cfg = env.cfg
+        for _ in range(3):
+            before = env._episode_sums["distance_to_goal"].clone()
+            env.step(rand_cmd(env))
+            # recomputed from the sim state: no reset in between, and episode_step ticks before the reward
+            d = torch.linalg.norm(env._current_ref_w(env._robot._ALL_INDICES) - env._robot.data.root_pos_w, dim=1)
+            mapped = {
+                "tanh": 1.0 - torch.tanh(d / length),
+                "exp": torch.exp(-d / length),
+                "multiexp": torch.stack([torch.exp(-d / (length * s)) for s in scales]).mean(0),
+            }[shape]
+            torch.testing.assert_close(
+                env._episode_sums["distance_to_goal"] - before, mapped * cfg.pos_reward_scale * env.step_dt
+            )
+        # every shape is 1 on the reference and decreases with the distance
+        d = torch.tensor([0.0, 0.05, 0.2, 1.0], device=env.device)
+        r = env._distance_reward(d)
+        torch.testing.assert_close(r[0], torch.tensor(1.0, device=env.device))
+        assert torch.all(r[1:] < r[:-1])
     finally:
         env.close()
 
