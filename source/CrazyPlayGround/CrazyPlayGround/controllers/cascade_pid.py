@@ -7,6 +7,7 @@ import torch
 
 from .utils.math_utils import quat_apply_inverse, euler_xyz_from_quat, expand_to
 from .pid import PID_Vectorized
+from .motor_chain import CrazyflieMotorChain
 
 DEG2RAD = math.pi / 180.0
 
@@ -28,9 +29,9 @@ DEFAULT_LIMITS: dict = {
     "roll_max":      20.0 * DEG2RAD,
     "pitch_max":     20.0 * DEG2RAD,
     "yaw_max_delta": 0.0,
-    "thrust_base":   30_000.0,
+    "thrust_base":   36_000.0,
     "thrust_min":    20_000.0,
-    "thrust_cmd_max": 65_535.0,
+    # thrust_cmd_max defaults to drone.firmware.motor_cmd_max
 }
 
 
@@ -75,9 +76,13 @@ class CascadePIDController:
     position  → pos_pid  → [vel setpoint]
     velocity  → vel_pid  → [roll/pitch/thrust cmd]
     attitude  → att_pid  → [body-rate setpoint]
-    rate      → rate_pid → [moment N·m]
+    rate      → rate_pid → [α_ref rad/s²]
+    α_ref, thrust cmd → CrazyflieMotorChain (firmware mixer, cap, thrust map,
+                        motor lag) → [thrust N, moment N·m]
 
     The controller can be entered at any level via ``command_level``.
+    Thrust commands are per-motor firmware units (0–65535, the same value on
+    every motor); ``thrust_cmd_scale`` converts total newtons to that unit.
 
     Parameters
     ----------
@@ -91,6 +96,11 @@ class CascadePIDController:
         Override any gain or limit.  See ``DEFAULT_GAINS`` / ``DEFAULT_LIMITS``
         for available keys.  Values from a YAML ``cascade_pid`` section can
         be passed directly.
+    max_thrust, arm_length, motor_tau, motor_thrust_min, motor_thrust2torque, motor_cmd_max, control_cmd_max : float
+        Keyword-only, no defaults: ``drone.max_thrust`` [N, all 4 motors],
+        ``drone.motor.{arm_length [m], tau [s], thrust_min [N], thrust2torque [m]}`` and
+        ``drone.firmware.{motor_cmd_max, control_cmd_max}`` from crazyflie.yaml.
+        ``from_drone_config`` passes them.
     """
 
     def __init__(
@@ -101,7 +111,15 @@ class CascadePIDController:
         params: Optional[dict] = None,
         # physics — can be set later via set_physical_params()
         mass: float = 1.0,
-        inertia: list[float] | None = None,
+        *,
+        # drone and motor parameters, from crazyflie.yaml (drone.max_thrust, drone.motor)
+        max_thrust: float,
+        arm_length: float,
+        motor_tau: float,
+        motor_thrust_min: float,
+        motor_thrust2torque: float,
+        motor_cmd_max: float,
+        control_cmd_max: float,
     ) -> None:
         self.dt      = float(dt)
         self.device  = torch.device(device)
@@ -119,9 +137,6 @@ class CascadePIDController:
 
         # ── Physical params ──────────────────────────────────────────────────
         self.mass    = torch.tensor(mass,    device=self.device, dtype=torch.float32)
-        inertia      = inertia or [1.0, 1.0, 1.0]
-        self.inertia = torch.tensor(inertia, device=self.device, dtype=torch.float32)
-        self._inertia_tensor: Optional[torch.Tensor] = None
 
         # ── Gains ────────────────────────────────────────────────────────────
         def _g(loop: str, term: str) -> torch.Tensor:
@@ -193,20 +208,35 @@ class CascadePIDController:
                                          DEFAULT_LIMITS["yaw_max_delta"])
 
         # ── Thrust scaling ───────────────────────────────────────────────────
-        thrust_cmd_max           = float(params.get("thrust_cmd_max", DEFAULT_LIMITS["thrust_cmd_max"]))
+        thrust_cmd_max           = float(params.get("thrust_cmd_max", motor_cmd_max))
         self.vel_thrust_scale    = float(params.get("vel_thrust_scale", params.get("thrust_scale", 1000.0)))
-        thrust_cmd_scale         = params.get("thrust_cmd_scale", None)
-        self.thrust_cmd_scale    = float(thrust_cmd_scale) if thrust_cmd_scale is not None else 1.0
+        # total newtons per unit of collective command: the same command goes to all 4 motors,
+        # each giving max_thrust / 4 at 65535, so F_total = 4 · cmd · max_thrust / (4 · 65535)
+        self.thrust_cmd_scale    = float(max_thrust) / float(motor_cmd_max)
         self.thrust_base_cmd     = float(params.get("thrust_base",  params.get("thrustBase",  DEFAULT_LIMITS["thrust_base"])))
         self.thrust_min_cmd      = float(params.get("thrust_min",   params.get("thrustMin",   DEFAULT_LIMITS["thrust_min"])))
         self.thrust_max_cmd      = float(params.get("thrust_max",   thrust_cmd_max))
         self._thrust_base_from_params = "thrust_base" in params or "thrustBase" in params
 
-        # ── Gyroscope low-pass filter ─────────────────────────────────────────
-        # Matches the Crazyflie firmware's gyro LPF (Butterworth ~80 Hz).
-        # Smooths angular-rate measurements before derivative computation to
-        # prevent kd from amplifying discrete simulation steps.
-        # Set gyro_lpf_cutoff_hz: 0 in the YAML to disable.
+        # ── Motor chain (firmware mixer, cap, thrust map, motor lag) ─────────
+        self.motor_chain = CrazyflieMotorChain(
+            num_envs=num_envs,
+            dt=self.dt,
+            device=self.device,
+            max_thrust_total=max_thrust,
+            thrust_min=motor_thrust_min,
+            arm_length=arm_length,
+            thrust2torque=motor_thrust2torque,
+            tau=motor_tau,
+            motor_cmd_max=motor_cmd_max,
+            control_cmd_max=control_cmd_max,
+        )
+
+        # ── Derivative low-pass filter ────────────────────────────────────────
+        # 1st-order IIR on the rate measurement, used by the D term only (P and I
+        # use the raw rate). Not the firmware's filter: without it, kd amplifies
+        # the discrete 500 Hz steps. Set gyro_lpf_cutoff_hz: 0 to disable.
+        # TODO: firmware 80 Hz 2-pole gyro LPF on P/I/D (filter.c lpf2pApply)
         _gyro_lpf_hz = float(params.get("gyro_lpf_cutoff_hz", 80.0))
         if _gyro_lpf_hz > 0.0:
             self._gyro_lpf_alpha = math.exp(-2.0 * math.pi * _gyro_lpf_hz * self.dt)
@@ -254,6 +284,10 @@ class CascadePIDController:
         """
         params = getattr(drone_config, "cascade_pid", None) or {}
         phys   = drone_config.physics
+        if phys.motor is None:
+            raise ValueError("drone.motor (arm_length, tau, thrust_min, thrust2torque) is required by the motor chain")
+        if phys.firmware is None:
+            raise ValueError("drone.firmware (motor_cmd_max, control_cmd_max) is required by the motor chain")
 
         ctrl = cls(
             dt=dt,
@@ -261,27 +295,19 @@ class CascadePIDController:
             device=device,
             params=params,
             mass=phys.mass,
-            inertia=[phys.inertia.ixx, phys.inertia.iyy, phys.inertia.izz],
+            max_thrust=phys.max_thrust,
+            arm_length=phys.motor.arm_length,
+            motor_tau=phys.motor.tau,
+            motor_thrust_min=phys.motor.thrust_min,
+            motor_thrust2torque=phys.motor.thrust2torque,
+            motor_cmd_max=phys.firmware.motor_cmd_max,
+            control_cmd_max=phys.firmware.control_cmd_max,
         )
 
-        # Set the full inertia tensor (enables gyroscopic-accurate moment calc)
-        _dev = torch.device(device)
-        diag = torch.tensor(
-            [phys.inertia.ixx, phys.inertia.iyy, phys.inertia.izz],
-            dtype=torch.float32, device=_dev,
-        )
-        J = torch.diag(diag).unsqueeze(0).expand(num_envs, -1, -1).contiguous()
-        ctrl.set_physical_params(
-            mass=torch.tensor(phys.mass, dtype=torch.float32),
-            inertia_tensor=J,
-        )
-
-        # Derive thrust_cmd_scale from max_thrust if not explicitly set in params
-        if "thrust_cmd_scale" not in params:
-            thrust_cmd_max = float(params.get("thrust_cmd_max", DEFAULT_LIMITS["thrust_cmd_max"]))
-            if phys.max_thrust > 0.0 and thrust_cmd_max > 0.0:
-                ctrl.thrust_cmd_scale = phys.max_thrust / thrust_cmd_max
-
+        # Mass sets the hover thrust (motor reset, thrust_base if not given).
+        # Inertia is not needed: PhysX integrates the rigid-body dynamics with the
+        # mass properties of the robot asset (USD).
+        ctrl.set_physical_params(mass=torch.tensor(phys.mass, dtype=torch.float32))
         return ctrl
 
     # ── Physics setters ──────────────────────────────────────────────────────
@@ -289,18 +315,11 @@ class CascadePIDController:
     def set_physical_params(
         self,
         mass: Optional[torch.Tensor] = None,
-        inertia_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         if mass is not None:
             self.mass = _as_tensor(mass, self.device, torch.float32).view(())
             if not self._thrust_base_from_params:
                 self.thrust_base_cmd = (self.mass.item() * 9.81) / max(self.thrust_cmd_scale, 1e-6)
-        if inertia_tensor is not None:
-            inertia_tensor = _as_tensor(inertia_tensor, self.device, torch.float32)
-            if inertia_tensor.dim() == 2:
-                inertia_tensor = inertia_tensor.unsqueeze(0)
-            self._inertia_tensor = inertia_tensor
-            self.inertia = torch.diagonal(inertia_tensor, dim1=-2, dim2=-1).mean(dim=0)
 
     def set_rate_gains(
         self,
@@ -330,8 +349,16 @@ class CascadePIDController:
 
     # ── Reset ────────────────────────────────────────────────────────────────
 
+    def set_motor_tau(self, tau, env_ids: Optional[torch.Tensor] = None) -> None:
+        """Set the motor time constant [s], a float or one value per env in ``env_ids``."""
+        self.motor_chain.set_tau(tau, env_ids)
+
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> None:
-        """Reset all integrators.  Pass ``env_ids`` to reset only a subset."""
+        """Reset all integrators and put the motors at hover thrust.
+
+        Pass ``env_ids`` to reset only a subset.
+        """
+        self.motor_chain.reset(env_ids, self.mass.item() * 9.81 / 4.0)
         if env_ids is None:
             self.pos_pid.reset(); self.vel_pid.reset(); self.att_pid.reset()
             self._rate_integral       = None
@@ -431,10 +458,8 @@ class CascadePIDController:
             update_posvel=update_posvel, update_att=update_att,
         )
 
-        moment = self._rate_pid_to_moment(self._rate_sp, ang_vel)
-        thrust = self._thrust_cmd * self.thrust_cmd_scale
-
-        return thrust, moment
+        alpha_ref = self._rate_pid_alpha(self._rate_sp, ang_vel)
+        return self.motor_chain(self._thrust_cmd, alpha_ref)
 
     # ── Internal buffer management ───────────────────────────────────────────
 
@@ -510,23 +535,22 @@ class CascadePIDController:
         att_error     = _wrap_angle_rad(self._att_sp - att_actual)
         self._rate_sp = self.att_pid(att_error, self.att_dt)
 
-    # ── Rate PID → moment ────────────────────────────────────────────────────
+    # ── Rate PID → α_ref ─────────────────────────────────────────────────────
 
-    def _rate_pid_to_moment(
+    def _rate_pid_alpha(
         self,
         rate_sp:   torch.Tensor,
         rate_meas: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Convert body-rate setpoint to moment [N·m].
+        """Rate PID, with derivative on measurement to avoid derivative kick.
 
-        Uses *derivative on measurement* to avoid derivative kick.
-        Full Euler rigid-body equation:
+        Args:
+            rate_sp: ``(num_envs, 3)`` body-rate setpoint, body frame [rad/s].
+            rate_meas: ``(num_envs, 3)`` measured body rate, body frame [rad/s].
 
-            τ = J·α_ref + ω × (J·ω)
-
-        where α_ref is the PID angular-acceleration output and the
-        gyroscopic term ω × (J·ω) compensates for the coupling between axes.
+        Returns:
+            ``(num_envs, 3)`` α_ref [rad/s²]. Its value in degrees is the firmware's
+            rate-PID output in motor-command units (same gains, deg/s errors).
         """
         if self._rate_integral is None or self._rate_integral.shape != rate_sp.shape:
             self._rate_integral = torch.zeros_like(rate_sp)
@@ -554,25 +578,11 @@ class CascadePIDController:
         rate_meas_dot        = (self._rate_meas_filtered - self._prev_rate_meas) / self.dt
         self._prev_rate_meas = self._rate_meas_filtered.clone()
 
-        omega_dot = (
+        return (
             self.rate_kp * rate_error
             + self.rate_ki * self._rate_integral
             - self.rate_kd * rate_meas_dot
         )
-
-        if self._inertia_tensor is not None:
-            J = self._inertia_tensor
-            if J.shape[0] == 1 and omega_dot.shape[0] > 1:
-                J = J.expand(omega_dot.shape[0], -1, -1)
-            # τ = J·α_ref + ω × (J·ω)
-            Jw     = torch.bmm(J, rate_meas.unsqueeze(-1)).squeeze(-1)       # [N, 3]
-            gyro   = torch.linalg.cross(rate_meas, Jw, dim=-1)               # ω × (J·ω)
-            moment = torch.bmm(J, omega_dot.unsqueeze(-1)).squeeze(-1) + gyro
-        else:
-            # Diagonal inertia approximation (no gyroscopic coupling)
-            moment = self.inertia.view(1, 3) * omega_dot
-
-        return moment
 
     # ── Yaw setpoint ─────────────────────────────────────────────────────────
 

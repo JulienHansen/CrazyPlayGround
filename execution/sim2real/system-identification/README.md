@@ -75,10 +75,10 @@ Sanity check (`--exc-axis x --exc-amp 0.2 --duration 40`): 4000 rows, `ended_at_
 What the estimator measures in sim:
 
 - `d` / `radio ms` is `env.action_latency_steps` exactly: `echo_v*` is the setpoint the controller used, after the env's command delay. With the default 0 there is no radio delay.
-- `dead ms` is the simulated plant from that setpoint to 5 % of the step (cascade PID and rigid body; no motor dynamics), plus the one step of the row's state read, the same as on the drone. It does not depend on the latency.
+- `dead ms` is the simulated plant from that setpoint to 5 % of the step (cascade PID, firmware motor chain and rigid body), plus the one step of the row's state read, the same as on the drone. It does not depend on the latency.
 - `noise` is ~0: `vel_*` is the true sim state, `env.add_noise` only perturbs the policy observation.
 
-Compare against flights recorded with the current `excite_hover.py` and the same flags: older recordings used other cycles. Known plant gaps: no motor dynamics, no integral limit on the velocity PID, `thrust_base` 30000 against the real hover thrust.
+Compare against flights recorded with the current `excite_hover.py` and the same flags: older recordings used other cycles. Known plant gaps: no integral limit on the velocity PID; the motor time constant (72 ms by default) is not yet fitted to these flights. Recordings simulated before the motor chain (no motor lag, `thrust_base` 30000) are not comparable.
 
 ### Real vs sim figure
 

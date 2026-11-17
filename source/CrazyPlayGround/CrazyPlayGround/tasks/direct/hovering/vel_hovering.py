@@ -155,6 +155,9 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # scale x the controller output (battery sag, worn props, build differences).
     thrust_scale_range: tuple[float, float] = (1.0, 1.0)
     torque_scale_range: tuple[float, float] = (1.0, 1.0)
+    # motor time constant [s] of the firmware motor chain, drawn uniformly per episode;
+    # (0.072, 0.072) fixes it (e.g. for evaluation)
+    motor_tau_range: tuple[float, float] = (0.055, 0.090)
     # distance-to-goal reward shape; all are 1 at the goal, so the term's weight keeps its meaning:
     # "tanh" = 1 - tanh(d / L), almost flat near the goal (94 % of max at 5 cm with L = 0.8);
     # "exp"  = exp(-d / L), steeper near the goal (slope 1 / L at d = 0)
@@ -173,6 +176,7 @@ def check_cfg(cfg: QuadcopterEnvCfg):
     wind_lo, wind_hi = cfg.wind_force_range
     thrust_lo, thrust_hi = cfg.thrust_scale_range
     torque_lo, torque_hi = cfg.torque_scale_range
+    tau_lo, tau_hi = cfg.motor_tau_range
     checks = [
         (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
         (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
@@ -187,6 +191,7 @@ def check_cfg(cfg: QuadcopterEnvCfg):
         (0.0 <= wind_lo <= wind_hi, f"wind_force_range must satisfy 0 <= min <= max, got {cfg.wind_force_range}"),
         (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
         (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
+        (0.0 <= tau_lo <= tau_hi, f"motor_tau_range must satisfy 0 <= min <= max, got {cfg.motor_tau_range}"),
         (
             cfg.distance_reward_shape in ("tanh", "exp", "multiexp"),
             f"distance_reward_shape must be 'tanh', 'exp' or 'multiexp', got {cfg.distance_reward_shape!r}",
@@ -508,6 +513,7 @@ class QuadcopterEnv(DirectRLEnv):
         # actuation scales (uniform_(1, 1) gives exactly 1, so the defaults need no branch)
         self.thrust_scale[env_ids] = torch.empty(n, device=dev).uniform_(*self.cfg.thrust_scale_range)
         self.torque_scale[env_ids] = torch.empty(n, device=dev).uniform_(*self.cfg.torque_scale_range)
+        self._ctrl.set_motor_tau(torch.empty(n, device=dev).uniform_(*self.cfg.motor_tau_range), env_ids)
         self.obs_window_fresh[env_ids] = True
 
     def _log_step_response(self, env_ids: torch.Tensor):

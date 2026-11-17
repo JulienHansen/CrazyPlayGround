@@ -107,11 +107,17 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     rand_thrust_bias_range = (-0.10, 0.10)
     # Per-episode multiplier on the body-rate setpoint
     rand_rate_scale_range = (0.90, 1.10)
+    # Motor time constant [s], drawn per episode whatever domain_rand says;
+    # (0.072, 0.072) fixes it (e.g. for evaluation)
+    motor_tau_range = (0.055, 0.090)
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
     def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
+        tau_lo, tau_hi = cfg.motor_tau_range
+        if not 0.0 <= tau_lo <= tau_hi:
+            raise ValueError(f"motor_tau_range must satisfy 0 <= min <= max, got {cfg.motor_tau_range}")
         super().__init__(cfg, render_mode, **kwargs)
 
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
@@ -287,6 +293,9 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._ctrl.reset(env_ids)
+        self._ctrl.set_motor_tau(
+            torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.motor_tau_range), env_ids
+        )
 
         # Sample new domain-randomization values for the reset envs.
         if self.cfg.domain_rand:
