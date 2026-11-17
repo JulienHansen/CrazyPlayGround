@@ -150,6 +150,10 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     reset_thres: float = 0.8    # tracking error [m] that kills episode
 
     pos_reward_scale: float = 20.0
+    # position reward r(d) in [0, 1], 1 on the reference; same knobs as Vel-Hovering (#69)
+    distance_reward_shape: str = "tanh"  # "tanh": 1 - tanh(d/L), "exp": exp(-d/L), "multiexp": mean_k exp(-d/(L*s_k))
+    distance_reward_length: float = 0.8  # L in metres, shared by all shapes
+    distance_reward_scales: tuple[float, ...] = (1.0, 0.25, 0.0625)  # "multiexp" only: sigma = L*s = 0.8, 0.2, 0.05 m
     lin_vel_reward_scale: float = -0.1
     ang_vel_reward_scale: float = -0.05
     effort_reward_scale: float = 0.0
@@ -213,6 +217,15 @@ def check_cfg(cfg: TrackingEnvCfg):
         (0.0 <= wind_lo <= wind_hi, f"wind_force_range must satisfy 0 <= min <= max, got {cfg.wind_force_range}"),
         (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
         (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
+        (
+            cfg.distance_reward_shape in ("tanh", "exp", "multiexp"),
+            f"distance_reward_shape must be 'tanh', 'exp' or 'multiexp', got {cfg.distance_reward_shape!r}",
+        ),
+        (cfg.distance_reward_length > 0.0, f"distance_reward_length must be > 0, got {cfg.distance_reward_length}"),
+        (
+            len(cfg.distance_reward_scales) > 0 and all(s > 0.0 for s in cfg.distance_reward_scales),
+            f"distance_reward_scales must be non-empty and all > 0, got {cfg.distance_reward_scales}",
+        ),
     ]
     if getattr(cfg, "control_mode", None) == "attitude":
         # the hover command (history reset value) must be a reachable thrust in [0, 1]
@@ -571,7 +584,7 @@ class TrackingEnv(DirectRLEnv):
         current_wp = self._current_ref_w(self._robot._ALL_INDICES)  # [N, 3]
 
         distance = torch.linalg.norm(current_wp - self._robot.data.root_pos_w, dim=1)
-        r_pos = 1.0 - torch.tanh(distance / 0.8)
+        r_pos = self._distance_reward(distance)
 
         # tracking metrics (#56): same reference as reward and termination; logged in _reset_idx
         # episode_step is already ticked: step t goes to slot t - 1. The clamp only matters if
@@ -596,6 +609,20 @@ class TrackingEnv(DirectRLEnv):
         for key, value in rewards.items():
             self._episode_sums[key] += value
         return reward
+
+    def _distance_reward(self, distance: torch.Tensor) -> torch.Tensor:
+        """(num_envs,) distance to the reference [m] -> (num_envs,) reward in [0, 1], 1 on the reference.
+
+        "multiexp" averages exp(-d / (L * s)) over ``distance_reward_scales``: wide kernels keep a gradient
+        far away, narrow ones reward precision near the reference.
+        """
+        length = self.cfg.distance_reward_length
+        if self.cfg.distance_reward_shape == "exp":
+            return torch.exp(-distance / length)
+        if self.cfg.distance_reward_shape == "multiexp":
+            scales = torch.tensor(self.cfg.distance_reward_scales, device=distance.device)
+            return torch.exp(-distance[:, None] / (length * scales)).mean(1)
+        return 1.0 - torch.tanh(distance / length)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
