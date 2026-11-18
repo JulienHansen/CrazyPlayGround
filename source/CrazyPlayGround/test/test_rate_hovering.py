@@ -1,5 +1,6 @@
 """Checks for Rate-Hovering: config validation, the plain-task defaults, tensor logging, the
-distance reward shapes, the distance-length curriculum and the step-response metrics.
+distance reward shapes, the distance-length curriculum, the step-response metrics, and the
+observation/action history, action latency with its warm-up hold, and action-rate penalty.
 
 Run (conda env DragonFly, from CrazyPlayGround/):
     python -m pytest source/CrazyPlayGround/test/test_rate_hovering.py -v
@@ -18,7 +19,8 @@ from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms  # n
 from CrazyPlayGround.tasks.direct.hovering.rate_hovering import QuadcopterEnv, QuadcopterEnvCfg  # noqa: E402
 from CrazyPlayGround.tasks.direct.hovering.step_response import step_response  # noqa: E402
 
-N = 4
+N, K, M = 4, 3, 2
+FILL = -10.0  # history_fill_value: "no command" in empty action slots
 # the step-response means logged under Metrics/* (d0 and rise_10_90 stay in step_metrics only)
 METRIC_KEYS = ("tau", "overshoot", "settling_time", "steady_state_error", "effort")
 
@@ -69,6 +71,20 @@ def frame(env) -> torch.Tensor:
     return torch.cat([data.root_lin_vel_b, goal_b, rot, data.root_ang_vel_b], dim=-1)
 
 
+def window(seq, t, n):
+    """seq[t-n+1..t] stacked oldest first on dim 1; indices below 0 clamp to seq[0]."""
+    return torch.stack([seq[max(i, 0)] for i in range(t - n + 1, t + 1)], dim=1)
+
+
+def split(obs):
+    p = obs["policy"]
+    return p[:, : 18 * K].view(N, K, 18), p[:, 18 * K :].view(N, M, 4)
+
+
+def fill(env):
+    return torch.full((N, 4), FILL, device=env.device)
+
+
 def rand_cmd(env):
     """A different command for every env and axis, inside the clamp range."""
     return torch.empty(N, 4, device=env.device).uniform_(-1.0, 1.0)
@@ -90,6 +106,10 @@ def step_terms(env, cmd):
         {"max_thrust_scale": 0.9},
         {"motor_tau_range": (0.09, 0.05)},
         {"motor_tau_range": (-0.01, 0.05)},
+        {"obs_input_hist": 0},
+        {"action_input_hist": -1},
+        {"action_latency_steps": -1},
+        {"action_latency_steps": 3, "action_latency_max_steps": 2},
         {"history_fill_value": 0.0},
         {"history_fill_value": -1.0},
         {"history_fill_value": 1.0},
@@ -118,6 +138,8 @@ def test_defaults_are_plain_hovering():
     assert cfg.distance_reward_shape == "tanh"
     assert cfg.distance_reward_length == 0.8
     assert cfg.distance_reward_curriculum_ratio == 0.0
+    assert (cfg.obs_input_hist, cfg.action_input_hist) == (1, 0)
+    assert (cfg.action_latency_steps, cfg.action_latency_max_steps, cfg.action_rate_reward_scale) == (0, 0, 0.0)
     env = make_env()
     try:
         # the default reward is the old hard-coded 1 - tanh(d / 0.8)
@@ -126,8 +148,12 @@ def test_defaults_are_plain_hovering():
         assert env.single_observation_space["policy"].shape == (18,)
         obs, _ = env.reset()
         torch.testing.assert_close(obs["policy"], frame(env))
-        obs, *_ = env.step(torch.full((N, 4), -0.2, device=env.device))
+        cmd = torch.full((N, 4), -0.2, device=env.device)
+        obs, *_ = env.step(cmd)
         torch.testing.assert_close(obs["policy"], frame(env))
+        # no latency, no hold: the controller gets the command of this very step
+        assert not env.delay_steps.any() and not env._hold.any() and env._hold_ids.numel() == 0
+        torch.testing.assert_close(env._actions, cmd)
         assert torch.all(env._dr_thrust_scale == 1.0)
         assert torch.all(env._dr_thrust_bias_n == 0.0)
         assert torch.all(env._dr_rate_scale == 1.0)
@@ -164,13 +190,20 @@ def test_log_values_are_tensors():
 )
 def test_reward_terms(shape, knobs):
     length = 0.2  # not the default, so a hard-coded 0.8 would fail
-    env = make_env(distance_reward_shape=shape, distance_reward_length=length, **knobs)
+    env = make_env(
+        distance_reward_shape=shape, distance_reward_length=length, action_rate_reward_scale=-0.5, **knobs
+    )
     try:
         env.reset()
         env.episode_length_buf[:] = 0
         cfg, data, dt = env.cfg, env._robot.data, env.step_dt
+        prev = None
         for _ in range(3):
-            reward, terms = step_terms(env, rand_cmd(env))
+            cmd = rand_cmd(env)
+            reward, terms = step_terms(env, cmd)
+            rate = torch.zeros(N, device=env.device) if prev is None else (cmd - prev).square().sum(1)
+            torch.testing.assert_close(terms["action_rate"], rate * cfg.action_rate_reward_scale * dt)
+            prev = cmd
             # the reward is exactly the sum of the logged terms (nothing added off the books)
             torch.testing.assert_close(reward, sum(terms.values()))
             # each term recomputed from the sim state (no env reset in between, so same state)
@@ -316,5 +349,191 @@ def test_partial_first_episodes_not_averaged():
             assert torch.all(call["episode_length_buf"] == env.max_episode_length - 1)
             assert not m["died"].any() and log["Metrics/crash_rate"].item() == 0.0
             assert not {"Metrics/" + k for k in METRIC_KEYS} & log.keys()  # in step_metrics, not in the means
+    finally:
+        env.close()
+
+
+def test_stacking_timesteps_and_reset():
+    env = make_env(obs_input_hist=K, action_input_hist=M)
+    try:
+        # space follows the late (Hydra-style) override
+        assert env.single_observation_space["policy"].shape == (18 * K + 4 * M,)
+
+        obs, _ = env.reset()
+        env.episode_length_buf[:] = 0  # full reset randomises it; no timeout inside the test
+        F = [frame(env)]  # F[t]: state after step t
+        A = [fill(env)]   # A[t]: clamped command of step t; A[0] = "no command" before the episode
+        frames, acts = split(obs)
+        torch.testing.assert_close(frames, window(F, 0, K))  # K copies of the first frame
+        assert torch.all(acts == FILL)                       # no command yet: the fill, not 0 (a climb)
+
+        for t in range(1, 6):
+            a = torch.full((N, 4), 0.05 * t, device=env.device)
+            a[:, 0] = 5.0 * (-1) ** t  # out of range -> must be clamped to +-1
+            obs, *_ = env.step(a)
+            assert not env.reset_buf.any()
+            F.append(frame(env))
+            A.append(a.clamp(-1.0, 1.0))
+            frames, acts = split(obs)
+            torch.testing.assert_close(frames, window(F, t, K))
+            torch.testing.assert_close(acts, window(A, t, M))
+            torch.testing.assert_close(frames[:, -1], F[t])  # newest last
+            torch.testing.assert_close(acts[:, -1], A[t])    # the command just sent
+        assert not torch.equal(F[5], F[4])                   # frames really change over time
+
+        # force env 0 to time out on the next step; envs 1.. must keep their history
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        a = torch.full((N, 4), -0.2, device=env.device)
+        obs, *_ = env.step(a)
+        assert env.reset_buf.tolist() == [True] + [False] * (N - 1)
+        F.append(frame(env))
+        A.append(a.clamp(-1.0, 1.0))
+        t = len(F) - 1
+        frames, acts = split(obs)
+        torch.testing.assert_close(frames[0], F[t][0].expand(K, 18))  # refilled with the new episode's frame
+        assert torch.all(acts[0] == FILL)                              # old episode's commands cleared to the fill
+        torch.testing.assert_close(frames[1:], window(F, t, K)[1:])
+        torch.testing.assert_close(acts[1:], window(A, t, M)[1:])
+    finally:
+        env.close()
+
+
+def test_latency_fixed_and_reset():
+    d = 2
+    env = make_env(action_input_hist=M, action_latency_steps=d)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        zero = torch.zeros(N, 4, device=env.device)
+        A = [fill(env)]  # A[t]: command of step t; A[0] = before the episode
+        for t in range(1, 7):
+            A.append(rand_cmd(env))
+            obs, *_ = env.step(A[t])
+            # steps 1..d: hold, the controller gets 0 (never the fill); then the command of step t - d
+            torch.testing.assert_close(env._actions, zero if t <= d else A[t - d])
+            torch.testing.assert_close(obs["policy"][:, 18:].view(N, M, 4), window(A, t, M))  # obs: commanded
+
+        # env 0 times out at step 7; its old commands must never reach the controller
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        A.append(rand_cmd(env))
+        env.step(A[7])
+        assert env.reset_buf.tolist() == [True] + [False] * (N - 1)
+        B = [fill(env)]  # env 0's new episode, same indexing
+        for s in range(1, 5):
+            A.append(rand_cmd(env))
+            B.append(A[-1])
+            env.step(A[-1])
+            torch.testing.assert_close(env._actions[0], zero[0] if s <= d else B[s - d][0])
+            torch.testing.assert_close(env._actions[1:], A[7 + s - d][1:])
+    finally:
+        env.close()
+
+
+def test_latency_randomised_per_episode():
+    lo, hi = 1, 4
+    env = make_env(action_latency_steps=lo, action_latency_max_steps=hi)
+    try:
+        seen = set()
+        for _ in range(20):  # 80 draws: P(some value never drawn) < 1e-9
+            env.reset()
+            assert ((env.delay_steps >= lo) & (env.delay_steps <= hi)).all()
+            seen |= set(env.delay_steps.tolist())
+        assert seen == set(range(lo, hi + 1))
+
+        env.episode_length_buf[:] = 0
+        delay = env.delay_steps.tolist()
+        A = [fill(env)]
+        for t in range(1, 8):
+            A.append(rand_cmd(env))
+            env.step(A[t])
+            zero = torch.zeros(4, device=env.device)
+            expected = torch.stack([zero if t <= delay[i] else A[t - delay[i]][i] for i in range(N)])
+            torch.testing.assert_close(env._actions, expected)
+            assert env._hold.tolist() == [t <= delay[i] for i in range(N)]
+    finally:
+        env.close()
+
+
+def test_warmup_hold():
+    d = 3
+    env = make_env(action_latency_steps=d)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        spawn = env._robot.data.root_pos_w.clone()
+        torch.testing.assert_close(spawn, env._spawn_pos_w)
+        A = [fill(env)]
+        for t in range(1, d + 1):
+            A.append(rand_cmd(env))
+            before = {k: v.clone() for k, v in env._episode_sums.items()}
+            _, reward, *_ = env.step(A[t])
+            assert env._hold.all()
+            # frozen at spawn by an exact m*g, whatever the policy commands
+            torch.testing.assert_close(env._robot.data.root_pos_w, spawn, atol=1e-4, rtol=0.0)
+            torch.testing.assert_close(env._robot.data.root_lin_vel_w, torch.zeros(N, 3, device=env.device), atol=1e-3, rtol=0.0)
+            torch.testing.assert_close(env._thrust[:, 0, 2], env._hold_force)
+            assert not env._moment.any()
+            assert not reward.any()
+            for key in before:
+                torch.testing.assert_close(env._episode_sums[key], before[key], msg=key)
+        # hold force = weight of the simulated drone
+        g = torch.tensor(env.sim.cfg.gravity).norm().item()
+        torch.testing.assert_close(env._hold_force, env._robot.root_physx_view.get_masses().sum(1).to(env.device) * g)
+
+        # step d + 1: the controller gets the first command, the drone flies and the reward is back
+        A.append(rand_cmd(env))
+        _, reward, *_ = env.step(A[d + 1])
+        assert not env._hold.any()
+        torch.testing.assert_close(env._actions, A[1])
+        assert reward.all()
+
+        # a mid-run reset of env 0 restarts the hold for env 0 only
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(rand_cmd(env))
+        assert env.reset_buf.tolist() == [True] + [False] * (N - 1)
+        new_spawn = env._spawn_pos_w[0].clone()
+        for _ in range(d):
+            _, reward, *_ = env.step(rand_cmd(env))
+            assert env._hold.tolist() == [True] + [False] * (N - 1)
+            assert reward[0] == 0.0 and reward[1:].all()
+            torch.testing.assert_close(env._robot.data.root_pos_w[0], new_spawn, atol=1e-4, rtol=0.0)
+        env.step(rand_cmd(env))
+        assert not env._hold.any()
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("d", [0, 2])
+def test_action_rate_penalises_commanded_action(d):
+    scale = -0.5
+    env = make_env(action_latency_steps=d, action_rate_reward_scale=scale)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        A = [fill(env)]
+        for t in range(1, 7):
+            A.append(rand_cmd(env))
+            before = env._episode_sums["action_rate"].clone()
+            env.step(A[t])
+            # 0 at step 1 (the previous slot is the fill) and during the hold; then on the commanded actions
+            if t == 1 or t <= d:
+                penalty = torch.zeros(N, device=env.device)
+            else:
+                penalty = scale * (A[t] - A[t - 1]).square().sum(1) * env.step_dt
+            torch.testing.assert_close(env._episode_sums["action_rate"] - before, penalty)
+
+        # env 0 resets at step 7; its first steps of the new episode see no jump from the fill
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(rand_cmd(env))
+        assert env.reset_buf[0]
+        assert env._episode_sums["action_rate"][0] == 0.0
+        prev = None
+        for s in range(1, d + 3):
+            c = rand_cmd(env)
+            before = env._episode_sums["action_rate"][0].item()
+            env.step(c)
+            expected = 0.0 if s == 1 or s <= d else (scale * (c[0] - prev[0]).square().sum() * env.step_dt).item()
+            assert env._episode_sums["action_rate"][0].item() - before == pytest.approx(expected, abs=1e-7)
+            prev = c
     finally:
         env.close()
