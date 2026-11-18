@@ -1,5 +1,5 @@
 """Checks for Rate-Hovering: config validation, the plain-task defaults, tensor logging, the
-distance reward shapes and the distance-length curriculum.
+distance reward shapes, the distance-length curriculum and the step-response metrics.
 
 Run (conda env DragonFly, from CrazyPlayGround/):
     python -m pytest source/CrazyPlayGround/test/test_rate_hovering.py -v
@@ -16,11 +16,14 @@ import omni.usd  # noqa: E402
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms  # noqa: E402
 
 from CrazyPlayGround.tasks.direct.hovering.rate_hovering import QuadcopterEnv, QuadcopterEnvCfg  # noqa: E402
+from CrazyPlayGround.tasks.direct.hovering.step_response import step_response  # noqa: E402
 
 N = 4
+# the step-response means logged under Metrics/* (d0 and rise_10_90 stay in step_metrics only)
+METRIC_KEYS = ("tau", "overshoot", "settling_time", "steady_state_error", "effort")
 
 
-def make_env(num_envs: int = N, **knobs) -> QuadcopterEnv:
+def make_env(num_envs: int = N, crashes: bool = False, **knobs) -> QuadcopterEnv:
     omni.usd.get_context().new_stage()
     cfg = QuadcopterEnvCfg()
     cfg.scene.num_envs = num_envs
@@ -28,12 +31,34 @@ def make_env(num_envs: int = N, **knobs) -> QuadcopterEnv:
     for key, value in knobs.items():  # set after the cfg is built, as Hydra does
         setattr(cfg, key, value)
     env = QuadcopterEnv(cfg)
+    if crashes:
+        return env
     # Drones spawn up to 2.0 m, the env's kill height, so a command can reset an env
     # mid-test. Keep only the timeout.
     env._get_dones = lambda: (
         torch.zeros_like(env.reset_terminated), env.episode_length_buf >= env.max_episode_length - 1
     )
     return env
+
+
+def spy_step_response(env) -> list[dict]:
+    """Record each _log_step_response call: the trajectory it reads, then the metrics and log it leaves."""
+    calls = []
+    log_step_response = env._log_step_response
+
+    def spy(env_ids):
+        traj = env._traj_pos_w[env_ids].clone()
+        episode_length_buf = env.episode_length_buf[env_ids].clone()
+        log_step_response(env_ids)
+        calls.append({
+            "traj": traj,
+            "episode_length_buf": episode_length_buf,
+            "step_metrics": {k: v.clone() for k, v in env.extras["step_metrics"].items()},
+            "log": dict(env.extras["log"]),
+        })
+
+    env._log_step_response = spy  # _reset_idx calls self._log_step_response, so the instance attribute wins
+    return calls
 
 
 def frame(env) -> torch.Tensor:
@@ -121,8 +146,11 @@ def test_log_values_are_tensors():
             "Episode_Termination/time_out",
             "Metrics/final_distance_to_goal",
             "Curriculum/distance_reward_length",
+            "Metrics/crash_rate",
         } <= log.keys()
         assert "Curriculum/progress" not in log  # the curriculum is off by default
+        # the first reset ends no episode, so it has no step-response mean
+        assert not {"Metrics/" + k for k in METRIC_KEYS} & log.keys()
         for key, value in log.items():
             assert isinstance(value, torch.Tensor) and value.numel() == 1, key
     finally:
@@ -194,5 +222,99 @@ def test_curriculum_progress_logged():
             assert isinstance(log[key], torch.Tensor) and log[key].numel() == 1, key
         assert log["Curriculum/progress"].item() == pytest.approx(0.5)
         assert log["Curriculum/distance_reward_length"].item() == pytest.approx(env._distance_reward_length())
+    finally:
+        env.close()
+
+
+def test_step_metrics_recorded():
+    env = make_env(episode_length_s=1.0)  # 100 steps
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0  # full-length episodes, as play.py --eval_csv does
+        spawn, goal = env._robot.data.root_pos_w.clone(), env._desired_pos_w.clone()
+        torch.testing.assert_close(env._spawn_pos_w, spawn)
+        calls = spy_step_response(env)
+        steps = env.max_episode_length - 1  # the timeout fires on this step
+        pos, effort_sum = [], torch.zeros(N, device=env.device)
+        for _ in range(steps):
+            cmd = 1.5 * rand_cmd(env)  # partly outside [-1, 1]: the effort uses the clamped command
+            env.step(cmd)
+            pos.append(env._robot.data.root_pos_w.clone())
+            effort_sum += cmd.clamp(-1.0, 1.0).square().sum(1)
+        assert len(calls) == 1  # one reset, of every env, at the timeout
+        traj, m, log = calls[0]["traj"], calls[0]["step_metrics"], calls[0]["log"]
+
+        # one row per step: the position after it (the last one is overwritten by the reset)
+        torch.testing.assert_close(traj[:, : steps - 1], torch.stack(pos[:-1], dim=1))
+        length = torch.full((N,), steps, device=env.device)
+        assert torch.equal(m["env_ids"].sort().values, torch.arange(N, device=env.device))
+        assert torch.equal(m["length"], length) and not m["died"].any()
+        torch.testing.assert_close(m["start_pos_w"], spawn)
+        torch.testing.assert_close(m["goal_pos_w"], goal)
+        torch.testing.assert_close(m["d0"], torch.linalg.norm(goal - spawn, dim=1))
+        torch.testing.assert_close(m["effort"], effort_sum / steps)
+        for key, value in step_response(traj, spawn, goal, length, env.step_dt).items():
+            torch.testing.assert_close(m[key], value, equal_nan=True, msg=key)
+
+        # every episode is full length, so each logged mean is the NaN-skipping mean over all of them
+        assert log["Metrics/crash_rate"].item() == 0.0
+        for key in METRIC_KEYS:
+            mean = m[key].nanmean()
+            if torch.isfinite(mean):
+                torch.testing.assert_close(log["Metrics/" + key], mean)
+            else:  # a threshold no episode crossed: no NaN in the log
+                assert "Metrics/" + key not in log
+        assert {"Metrics/steady_state_error", "Metrics/effort"} <= log.keys()  # never NaN
+        for key, value in log.items():
+            assert isinstance(value, torch.Tensor) and value.numel() == 1, key
+
+        # the buffers restart with the next episode, from its new random spawn
+        assert torch.all(env._traj_rollout_idx == 0) and torch.all(env._effort_sum == 0.0)
+        assert not torch.allclose(env._spawn_pos_w, spawn)
+    finally:
+        env.close()
+
+
+def test_crashes_counted_not_averaged():
+    env = make_env(crashes=True, episode_length_s=3.0)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        calls = spy_step_response(env)
+        # zero rates and the minimum thrust, 0.5 m*g: every drone sinks below the 0.1 m kill height
+        fall = torch.tensor([0.0, 0.0, 0.0, -1.0], device=env.device).repeat(N, 1)
+        crashed = set()
+        for _ in range(env.max_episode_length - 2):  # stop before any timeout
+            env.step(fall)
+            crashed = {i for call in calls for i in call["step_metrics"]["env_ids"].tolist()}
+            if len(crashed) == N:
+                break
+        assert crashed == set(range(N))
+        for call in calls:
+            m, log = call["step_metrics"], call["log"]
+            assert m["died"].all() and torch.all(m["length"] < env.max_episode_length - 1)
+            assert log["Metrics/crash_rate"].item() == 1.0
+            assert not {"Metrics/" + k for k in METRIC_KEYS} & log.keys()  # crashes are not averaged
+    finally:
+        env.close()
+
+
+def test_partial_first_episodes_not_averaged():
+    env = make_env(episode_length_s=1.0)
+    try:
+        env.reset()
+        start = torch.arange(1, N + 1, device=env.device) * 10  # a randomised first reset, without the chance of 0
+        env.episode_length_buf[:] = start
+        calls = spy_step_response(env)
+        for _ in range(env.max_episode_length - 1 - int(start.min())):  # until the last env times out
+            env.step(rand_cmd(env))
+        assert sorted(i for call in calls for i in call["step_metrics"]["env_ids"].tolist()) == list(range(N))
+        for call in calls:
+            m, log = call["step_metrics"], call["log"]
+            # the trajectory started at the reset, so it is shorter than the episode counter says
+            assert torch.equal(m["length"], env.max_episode_length - 1 - start[m["env_ids"]])
+            assert torch.all(call["episode_length_buf"] == env.max_episode_length - 1)
+            assert not m["died"].any() and log["Metrics/crash_rate"].item() == 0.0
+            assert not {"Metrics/" + k for k in METRIC_KEYS} & log.keys()  # in step_metrics, not in the means
     finally:
         env.close()
