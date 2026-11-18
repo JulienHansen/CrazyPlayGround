@@ -98,7 +98,6 @@ def start(env):
         (VelTrackingEnvCfg, {"wind_force_range": (0.03, 0.02)}),
         (VelTrackingEnvCfg, {"thrust_scale_range": (0.0, 1.2)}),
         (VelTrackingEnvCfg, {"torque_scale_range": (1.2, 1.1)}),
-        (VelTrackingEnvCfg, {"distance_reward_shape": "gauss"}),
         (VelTrackingEnvCfg, {"distance_reward_length": 0.0}),
         (VelTrackingEnvCfg, {"distance_reward_shape": "multiexp", "distance_reward_scales": ()}),
         (VelTrackingEnvCfg, {"distance_reward_shape": "multiexp", "distance_reward_scales": (1.0, 0.0)}),
