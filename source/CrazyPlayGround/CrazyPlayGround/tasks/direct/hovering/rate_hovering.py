@@ -16,14 +16,17 @@ Distance curriculum (``distance_reward_curriculum_ratio > 0``): L decays exponen
 
 Metrics: step response spawn -> goal (``step_response.py``) in ``Metrics/*`` and ``extras["step_metrics"]``; effort = mean ||c||^2 from 0.
 
-History and latency (all off by default). Observation, oldest first:
-    [obs_input_hist x 18-D frame, action_input_hist x 4 last commanded actions]
-At reset the frame window is refilled with copies of the first frame and the action slots
-hold ``history_fill_value``. The command sent at step t reaches the controller at t + d, with
-d drawn per episode from [action_latency_steps, action_latency_max_steps]. Warm-up hold: for
-the first d steps there is no command to fly, so the drone is frozen at spawn by an exact m*g
-force (controller bypassed, reward 0); at step d the controller gets c_0. The action-rate
-penalty ||c_t - c_{t-1}||^2 is on the commanded actions and is 0 at step 0.
+History and latency (off by default). Observation, oldest first: [obs_input_hist x 18-D frame,
+action_input_hist x 4 last commands]; at reset, copies of the first frame and ``history_fill_value``.
+Command c_t reaches the controller at t + d, d ~ U{action_latency_steps, action_latency_max_steps}
+per episode. For the first d steps the drone is held at spawn by an exact m*g force (no controller,
+wind or actuation scaling; reward 0). Action rate: ||c_t - c_{t-1}||^2 on commands, 0 at step 0.
+
+Sim-to-real randomisation (off by default), drawn per episode:
+- Noise (``add_noise``): o~ = o + noise_std * n_t + b, n_t = rho * n_{t-1} + sqrt(1 - rho^2) * eps_t,
+  b ~ N(0, noise_bias_std^2); ``true_state`` stays clean.
+- Wind: constant world-frame force, |F| ~ U(wind_force_range), uniform direction (m*g ~ 0.265 N).
+- Actuation: body gets k_T * T, k_tau * tau, k ~ U(thrust/torque_scale_range); PID assumes nominal.
 """
 
 from __future__ import annotations
@@ -142,23 +145,26 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     action_latency_steps: int = 0
     action_latency_max_steps: int = 0      # > action_latency_steps: drawn per episode; 0 = fixed
     action_rate_reward_scale: float = 0.0  # weight on ||c_t - c_{t-1}||^2; negative = penalty
+    # observation noise shape; only used with add_noise=True (std is noise_std above)
+    noise_corr: float = 0.0      # AR(1) correlation per policy step, in [0, 1); 0 = white
+    noise_bias_std: float = 0.0  # std of a constant offset per channel, drawn per episode
 
-    # ── Domain randomization ──────────────────────────────────────
-    domain_rand = False
-    # max-thrust variability (battery / propellers / motor wear).
-    rand_thrust_scale_range = (0.85, 1.15)
-    # Per-episode additive bias on commanded thrust as a fraction of hover thrust
-    rand_thrust_bias_range = (-0.10, 0.10)
-    # Per-episode multiplier on the body-rate setpoint
-    rand_rate_scale_range = (0.90, 1.10)
-    # Motor time constant [s], drawn per episode whatever domain_rand says;
-    # (0.072, 0.072) fixes it (e.g. for evaluation)
-    motor_tau_range = (0.055, 0.090)
+    # domain randomization: every *_range below is drawn uniformly per episode
+    # wind [N], constant world-frame force, uniform direction; (0, 0) = off; weight ~0.265 N
+    wind_force_range: tuple[float, float] = (0.0, 0.0)
+    # scale the controller's thrust and torque
+    thrust_scale_range: tuple[float, float] = (1.0, 1.0) # fraction of hover thrust
+    torque_scale_range: tuple[float, float] = (1.0, 1.0) # fraction of hover torque
+    # motor time constant [s] of the firmware motor chain
+    motor_tau_range: tuple[float, float] = (0.055, 0.090)
 
 
 def check_cfg(cfg: QuadcopterEnvCfg):
     """Reject knob values that can't work. Called by the env constructor, after Hydra overrides."""
     tau_lo, tau_hi = cfg.motor_tau_range
+    wind_lo, wind_hi = cfg.wind_force_range
+    thrust_lo, thrust_hi = cfg.thrust_scale_range
+    torque_lo, torque_hi = cfg.torque_scale_range
     checks = [
         (cfg.max_body_rate > 0.0, f"max_body_rate must be > 0, got {cfg.max_body_rate}"),
         (
@@ -167,6 +173,11 @@ def check_cfg(cfg: QuadcopterEnvCfg):
             f"got ({cfg.min_thrust_scale}, {cfg.max_thrust_scale})",
         ),
         (0.0 <= tau_lo <= tau_hi, f"motor_tau_range must satisfy 0 <= min <= max, got {cfg.motor_tau_range}"),
+        (0.0 <= cfg.noise_corr < 1.0, f"noise_corr must be in [0, 1), got {cfg.noise_corr}"),
+        (cfg.noise_bias_std >= 0.0, f"noise_bias_std must be >= 0, got {cfg.noise_bias_std}"),
+        (0.0 <= wind_lo <= wind_hi, f"wind_force_range must satisfy 0 <= min <= max, got {cfg.wind_force_range}"),
+        (0.0 < thrust_lo <= thrust_hi, f"thrust_scale_range must satisfy 0 < min <= max, got {cfg.thrust_scale_range}"),
+        (0.0 < torque_lo <= torque_hi, f"torque_scale_range must satisfy 0 < min <= max, got {cfg.torque_scale_range}"),
         (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
         (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
         (cfg.action_latency_steps >= 0, f"action_latency_steps must be >= 0, got {cfg.action_latency_steps}"),
@@ -207,6 +218,8 @@ def check_cfg(cfg: QuadcopterEnvCfg):
     for ok, msg in checks:
         if not ok:
             raise ValueError(msg)
+    if not cfg.add_noise and (cfg.noise_corr or cfg.noise_bias_std):
+        logger.warning("noise_corr and noise_bias_std have no effect without add_noise=True")
 
 class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
@@ -257,9 +270,6 @@ class QuadcopterEnv(DirectRLEnv):
         self._rate_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._thrust_pwm = torch.zeros(self.num_envs, 1, device=self.device)
 
-        self._dr_thrust_scale = torch.ones(self.num_envs, device=self.device)
-        self._dr_thrust_bias_n = torch.zeros(self.num_envs, device=self.device)
-        self._dr_rate_scale = torch.ones(self.num_envs, device=self.device)
         self._distance_reward_scales = torch.tensor(self.cfg.distance_reward_scales, device=self.device)
 
         self.delay_min_steps = cfg.action_latency_steps
@@ -279,6 +289,17 @@ class QuadcopterEnv(DirectRLEnv):
         # exact weight from the simulated masses (all links), so the hold cancels gravity exactly
         gravity = torch.tensor(self.sim.cfg.gravity).norm().item()
         self._hold_force = self._robot.root_physx_view.get_masses().sum(dim=1).to(dev) * gravity  # [N], N
+
+        # sim-to-real randomisation, redrawn at every reset (see _reset_idx)
+        self.true_state = torch.zeros(n, BASE_OBS_DIM, device=dev)  # clean 18-D frame, before the DR noise and bias
+
+        self.obs_noise_state = torch.randn(n, BASE_OBS_DIM, device=dev)
+        self.obs_noise_bias = torch.zeros(n, BASE_OBS_DIM, device=dev)
+        self.wind_force_world = torch.zeros(n, 3, device=dev)  # (num_envs, 3), world frame, N
+        self.thrust_scale = torch.ones(n, device=dev)
+        self.torque_scale = torch.ones(n, device=dev)
+        # skip the extra composer call entirely when nothing is randomised (tuple: Hydra may give a list)
+        self.randomize_actuation = (tuple(cfg.thrust_scale_range), tuple(cfg.torque_scale_range)) != ((1.0, 1.0),) * 2
 
         self.set_debug_vis(self.cfg.debug_vis)
 
@@ -309,19 +330,20 @@ class QuadcopterEnv(DirectRLEnv):
             self._hold_ids = self._hold_cmd.nonzero().squeeze(-1)  # once per policy step, not per physics step
         self._actions = torch.where(self._hold_cmd.unsqueeze(-1), 0.0, delayed)
 
-        # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s,
-        # with per-env DR multiplier on the rate setpoint.
-        self._rate_ref = (
-            self._actions[:, :3] * self.cfg.max_body_rate * self._dr_rate_scale.unsqueeze(-1)
-        )
+        # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s
+        self._rate_ref = self._actions[:, :3] * self.cfg.max_body_rate
 
+        # nominal setpoint; the thrust scale acts on the body only (_apply_action)
         thrust_normalized = (self._actions[:, 3] + 1.0) * 0.5  # map [-1,1] -> [0,1]
-        thrust_ref_n = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
-        thrust_ref_n = thrust_ref_n * self._dr_thrust_scale + self._dr_thrust_bias_n
-        thrust_ref_n = thrust_ref_n.clamp(min=0.0)
-        self._thrust_pwm = (thrust_ref_n / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
+        thrust_ref = self._min_thrust + thrust_normalized * (self._max_thrust - self._min_thrust)
+        self._thrust_pwm = (thrust_ref / self._ctrl.thrust_cmd_scale).unsqueeze(-1)
 
     def _apply_action(self):
+        """Controller thrust and moment x actuation scale, plus wind; held envs get exactly m*g.
+
+        Controller output: permanent composer (set_external_force_and_torque); extras:
+        instantaneous composer, added by Isaac Lab and cleared after each physics step.
+        """
         root_state = torch.cat(
             [
                 self._robot.data.root_pos_w,      # [N, 3]
@@ -343,11 +365,28 @@ class QuadcopterEnv(DirectRLEnv):
         self._thrust[:, 0, 2] = thrust.squeeze(-1)
         self._moment[:, 0, :] = moment
         if self._hold_ids.numel():
-            # warm-up hold: exact m*g, no moment; controller reset so it starts fresh at step d (#80: skip wind/scaling)
+            # warm-up hold: exact m*g, no moment; controller reset so it starts fresh at step d
             self._thrust[self._hold_ids, 0, 2] = self._hold_force[self._hold_ids]
             self._moment[self._hold_ids] = 0.0
             self._ctrl.reset(self._hold_ids)
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
+
+        composer = self._robot.instantaneous_wrench_composer
+        # the hold must stay an exact m*g: no scaling and no wind on held envs (all False without latency)
+        active = (~self._hold_cmd).float().view(-1, 1, 1)
+        if self.randomize_actuation:
+            # the thrust T is already applied and the composers add up, so adding
+            # (scale - 1) x T makes the body feel scale x T in total (body frame, like T)
+            composer.add_forces_and_torques(
+                forces=active * (self.thrust_scale - 1.0).view(-1, 1, 1) * self._thrust,
+                torques=active * (self.torque_scale - 1.0).view(-1, 1, 1) * self._moment,
+                body_ids=self._body_id,
+            )
+        if self.cfg.wind_force_range[1] > 0.0:
+            # with is_global=True, Isaac Lab rotates the world-frame force into the body frame
+            composer.add_forces_and_torques(
+                forces=active * self.wind_force_world.unsqueeze(1), body_ids=self._body_id, is_global=True
+            )
 
     def _get_observations(self) -> dict:
         """18-D frame (+ noise) shifted into the K-frame window, then the M last commands appended.
@@ -360,7 +399,7 @@ class QuadcopterEnv(DirectRLEnv):
 
         rot_mat = matrix_from_quat(self._robot.data.root_quat_w).reshape(self.num_envs, 9)
 
-        obs = torch.cat(
+        self.true_state = torch.cat(
             [
                 self._robot.data.root_lin_vel_b,
                 desired_pos_b,
@@ -369,10 +408,12 @@ class QuadcopterEnv(DirectRLEnv):
             ],
             dim=-1,
         )
+        obs = self.true_state
 
         if self.cfg.add_noise:
-            noise = torch.randn_like(obs) * self.cfg.noise_std
-            obs += noise
+            rho = self.cfg.noise_corr  # AR(1) with unit stationary variance; 0 = plain white noise
+            self.obs_noise_state = rho * self.obs_noise_state + (1.0 - rho * rho) ** 0.5 * torch.randn_like(obs)
+            obs = self.true_state + self.cfg.noise_std * self.obs_noise_state + self.obs_noise_bias  # out of place
 
         new = obs.unsqueeze(1)
         window = torch.cat([self.obs_window[:, 1:], new], dim=1)
@@ -489,33 +530,26 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         self._ctrl.reset(env_ids)
-        self._ctrl.set_motor_tau(
-            torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.motor_tau_range), env_ids
-        )
+        n, dev = len(env_ids), self.device
+        self._ctrl.set_motor_tau(torch.empty(n, device=dev).uniform_(*self.cfg.motor_tau_range), env_ids)
 
         # history/latency: fill action slots, draw this episode's d, flag the obs window for refill
         self.cmd_history[env_ids] = self.cfg.history_fill_value
-        self.delay_steps[env_ids] = torch.randint(
-            self.delay_min_steps, self.delay_max_steps + 1, (len(env_ids),), device=self.device
-        )
+        self.delay_steps[env_ids] = torch.randint(self.delay_min_steps, self.delay_max_steps + 1, (n,), device=dev)
         self.obs_window_fresh[env_ids] = True
         self._hold_cmd[env_ids] = False
 
-        # Sample new domain-randomization values for the reset envs.
-        if self.cfg.domain_rand:
-            n = len(env_ids)
-            ts_lo, ts_hi = self.cfg.rand_thrust_scale_range
-            tb_lo, tb_hi = self.cfg.rand_thrust_bias_range
-            rs_lo, rs_hi = self.cfg.rand_rate_scale_range
-            self._dr_thrust_scale[env_ids] = torch.empty(n, device=self.device).uniform_(ts_lo, ts_hi)
-            self._dr_thrust_bias_n[env_ids] = (
-                torch.empty(n, device=self.device).uniform_(tb_lo, tb_hi) * self._hover_thrust
-            )
-            self._dr_rate_scale[env_ids] = torch.empty(n, device=self.device).uniform_(rs_lo, rs_hi)
-        else:
-            self._dr_thrust_scale[env_ids] = 1.0
-            self._dr_thrust_bias_n[env_ids] = 0.0
-            self._dr_rate_scale[env_ids] = 1.0
+        # sim-to-real randomisation; uniform_(a, a) gives exactly a
+        # noise state drawn from N(0, 1), not set to 0, so the noise is at full strength from the first step
+        self.obs_noise_state[env_ids] = torch.randn(n, BASE_OBS_DIM, device=dev)
+        self.obs_noise_bias[env_ids] = self.cfg.noise_bias_std * torch.randn(n, BASE_OBS_DIM, device=dev)
+        # wind: uniform strength in the range, uniform 3-D direction (normalised Gaussian vector)
+        direction = torch.randn(n, 3, device=dev)
+        direction = direction / direction.norm(dim=1, keepdim=True)
+        strength = torch.empty(n, 1, device=dev).uniform_(*self.cfg.wind_force_range)
+        self.wind_force_world[env_ids] = strength * direction
+        self.thrust_scale[env_ids] = torch.empty(n, device=dev).uniform_(*self.cfg.thrust_scale_range)
+        self.torque_scale[env_ids] = torch.empty(n, device=dev).uniform_(*self.cfg.torque_scale_range)
 
     def _log_step_response(self, env_ids: torch.Tensor): 
         length = self._traj_rollout_idx[env_ids]

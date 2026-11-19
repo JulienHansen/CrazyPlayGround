@@ -1,6 +1,7 @@
 """Checks for Rate-Hovering: config validation, the plain-task defaults, tensor logging, the
 distance reward shapes, the distance-length curriculum, the step-response metrics, and the
-observation/action history, action latency with its warm-up hold, and action-rate penalty.
+observation/action history, action latency with its warm-up hold, and action-rate penalty, and
+the sim-to-real randomisation: observation noise, wind, actuation scaling, setpoint bias and scale.
 
 Run (conda env DragonFly, from CrazyPlayGround/):
     python -m pytest source/CrazyPlayGround/test/test_rate_hovering.py -v
@@ -14,7 +15,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 import omni.usd  # noqa: E402
-from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms  # noqa: E402
+from isaaclab.utils.math import matrix_from_quat, quat_apply_inverse, subtract_frame_transforms  # noqa: E402
 
 from CrazyPlayGround.tasks.direct.hovering.rate_hovering import QuadcopterEnv, QuadcopterEnvCfg  # noqa: E402
 from CrazyPlayGround.tasks.direct.hovering.step_response import step_response  # noqa: E402
@@ -106,6 +107,13 @@ def step_terms(env, cmd):
         {"max_thrust_scale": 0.9},
         {"motor_tau_range": (0.09, 0.05)},
         {"motor_tau_range": (-0.01, 0.05)},
+        {"noise_corr": 1.0},
+        {"noise_corr": -0.1},
+        {"noise_bias_std": -0.1},
+        {"wind_force_range": (-0.01, 0.02)},
+        {"wind_force_range": (0.03, 0.02)},
+        {"thrust_scale_range": (0.0, 1.2)},
+        {"torque_scale_range": (1.2, 1.1)},
         {"obs_input_hist": 0},
         {"action_input_hist": -1},
         {"action_latency_steps": -1},
@@ -133,7 +141,9 @@ def test_invalid_knobs_raise(knobs):
 def test_defaults_are_plain_hovering():
     cfg = QuadcopterEnvCfg()
     assert not cfg.add_noise
-    assert not cfg.domain_rand
+    assert (cfg.noise_corr, cfg.noise_bias_std, tuple(cfg.wind_force_range)) == (0.0, 0.0, (0.0, 0.0))
+    assert (tuple(cfg.thrust_scale_range), tuple(cfg.torque_scale_range)) == ((1.0, 1.0), (1.0, 1.0))
+    assert not any(hasattr(cfg, k) for k in ("domain_rand", "rate_scale_range", "thrust_bias_range"))
     assert cfg.history_fill_value == -10.0
     assert cfg.distance_reward_shape == "tanh"
     assert cfg.distance_reward_length == 0.8
@@ -148,15 +158,17 @@ def test_defaults_are_plain_hovering():
         assert env.single_observation_space["policy"].shape == (18,)
         obs, _ = env.reset()
         torch.testing.assert_close(obs["policy"], frame(env))
+        torch.testing.assert_close(env.true_state, frame(env))
         cmd = torch.full((N, 4), -0.2, device=env.device)
         obs, *_ = env.step(cmd)
         torch.testing.assert_close(obs["policy"], frame(env))
+        torch.testing.assert_close(env.true_state, frame(env))
         # no latency, no hold: the controller gets the command of this very step
         assert not env.delay_steps.any() and not env._hold_cmd.any() and env._hold_ids.numel() == 0
         torch.testing.assert_close(env._actions, cmd)
-        assert torch.all(env._dr_thrust_scale == 1.0)
-        assert torch.all(env._dr_thrust_bias_n == 0.0)
-        assert torch.all(env._dr_rate_scale == 1.0)
+        assert not env.randomize_actuation and not env.wind_force_world.any()
+        env._apply_action()
+        assert not env._robot.instantaneous_wrench_composer.active  # no wind, no actuation scaling by default
     finally:
         env.close()
 
@@ -537,5 +549,186 @@ def test_action_rate_penalises_commanded_action(d):
             expected = 0.0 if s == 1 else (scale * (c[0] - prev[0]).square().sum() * env.step_dt).item()
             assert env._episode_sums["action_rate"][0].item() - before == pytest.approx(expected, abs=1e-7)
             prev = c
+    finally:
+        env.close()
+
+
+def near_hover(env) -> torch.Tensor:
+    """Zero rates and a thrust close to m*g (a = 0 is a 1.15 m*g climb)."""
+    return torch.tensor([0.0, 0.0, 0.0, -0.23], device=env.device).repeat(env.num_envs, 1)
+
+
+@pytest.mark.parametrize("rho", [0.0, 0.9])
+def test_noise_std_and_correlation(rho):
+    n_envs, std = 256, 0.1
+    env = make_env(num_envs=n_envs, add_noise=True, noise_std=std, noise_corr=rho)
+    try:
+        obs, _ = env.reset()
+        env.episode_length_buf[:] = 0
+        noise = [obs["policy"] - frame(env)]               # measured noise = obs - true state
+        torch.testing.assert_close(env.true_state, frame(env))  # the true state stays clean
+        hover = near_hover(env)
+        for _ in range(20):
+            obs, *_ = env.step(hover)
+            noise.append(obs["policy"] - frame(env))
+            torch.testing.assert_close(env.true_state, frame(env))
+        noise = torch.stack(noise) / std                   # [21 steps, envs, 18]; unit std if correct
+        assert abs(noise[0].std().item() - 1.0) < 0.1      # full strength right after reset
+        # regression of n_t+1 on n_t: slope = rho, residual = the fresh part, std sqrt(1 - rho^2).
+        # Residuals are independent, so ~100k samples give a standard error of ~0.003 on both.
+        rho_hat = ((noise[1:] * noise[:-1]).sum() / noise[:-1].square().sum()).item()
+        assert abs(rho_hat - rho) < 0.03
+        innovation = noise[1:] - rho * noise[:-1]
+        assert abs(innovation.std().item() - (1.0 - rho * rho) ** 0.5) < 0.03
+    finally:
+        env.close()
+
+
+def test_noise_bias_per_episode():
+    env = make_env(add_noise=True, noise_std=0.01, noise_bias_std=0.05)
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        bias = env.obs_noise_bias.clone()
+        assert bias.abs().max() > 0
+        for _ in range(5):
+            obs, *_ = env.step(near_hover(env))
+            # obs - true state = bias + white noise of std 0.01; 0.05 is 5 sigma
+            torch.testing.assert_close(obs["policy"] - frame(env), bias, atol=0.05, rtol=0)
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(near_hover(env))
+        assert not torch.equal(env.obs_noise_bias[0], bias[0])
+        torch.testing.assert_close(env.obs_noise_bias[1:], bias[1:])
+    finally:
+        env.close()
+
+
+def test_noise_knobs_need_add_noise(caplog):
+    env = make_env(noise_corr=0.5, noise_bias_std=0.1)
+    try:
+        assert "no effect without add_noise" in caplog.text
+        obs, _ = env.reset()
+        torch.testing.assert_close(obs["policy"], frame(env))
+    finally:
+        env.close()
+
+
+def test_wind_strength_direction_frame_and_reset():
+    n_envs, lo, hi = 256, 0.01, 0.03
+    env = make_env(num_envs=n_envs, wind_force_range=(lo, hi))
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        wind = env.wind_force_world.clone()
+        strength = wind.norm(dim=1)
+        assert ((strength >= lo - 1e-6) & (strength <= hi + 1e-6)).all()
+        direction = wind / strength[:, None]
+        # uniform over the sphere: mean direction ~ 0, and z (vertical) spread over [-1, 1]
+        assert direction.mean(0).abs().max() < 0.2
+        assert direction[:, 2].min() < -0.5 and direction[:, 2].max() > 0.5   # wind can push down and up
+        assert abs(direction[:, 2].abs().mean().item() - 0.5) < 0.1          # E|z| = 1/2 if uniform
+
+        cmd = torch.empty(n_envs, 4, device=env.device)
+        for _ in range(3):
+            env.step(cmd.uniform_(-1.0, 1.0))              # random rates tilt the drones
+        torch.testing.assert_close(env.wind_force_world, wind)   # constant within the episode
+
+        # what Isaac Lab will apply on the next physics step, in the body frame
+        env._apply_action()
+        wrench = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        expected_body = quat_apply_inverse(env._robot.data.body_link_quat_w[:, b], wind)
+        assert not torch.allclose(expected_body, wind)     # tilt makes the frame matter
+        torch.testing.assert_close(wrench.composed_force_as_torch[:, b], expected_body)
+        assert not wrench.composed_torque_as_torch.any()   # wind adds no torque
+        wrench.reset()                                     # undo the manual call
+
+        # env 0 resets: new wind; the others keep theirs
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(cmd.uniform_(-1.0, 1.0))
+        assert not torch.equal(env.wind_force_world[0], wind[0])
+        torch.testing.assert_close(env.wind_force_world[1:], wind[1:])
+    finally:
+        env.close()
+
+
+def test_thrust_torque_scaling():
+    lo, hi = 0.8, 1.2
+    env = make_env(thrust_scale_range=(lo, hi), torque_scale_range=(lo, hi))
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        for s in (env.thrust_scale, env.torque_scale):          # drawn in range, and really drawn
+            assert ((s >= lo) & (s <= hi)).all() and not torch.allclose(s, torch.ones_like(s))
+        env.step(rand_cmd(env))
+
+        # what the next physics step adds on top of the controller output T (permanent composer)
+        env._apply_action()
+        composer = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        thrust, moment = env._thrust[:, 0], env._moment[:, 0]
+        extra_force, extra_torque = composer.composed_force_as_torch[:, b], composer.composed_torque_as_torch[:, b]
+        torch.testing.assert_close(extra_force, (env.thrust_scale[:, None] - 1) * thrust)
+        torch.testing.assert_close(extra_torque, (env.torque_scale[:, None] - 1) * moment)
+        # so the body feels scale x T in total
+        torch.testing.assert_close(thrust + extra_force, env.thrust_scale[:, None] * thrust)
+        composer.reset()                                          # undo the manual call
+
+        # env 0 resets: new scales; the others keep theirs for the whole episode
+        thrust_scale, torque_scale = env.thrust_scale.clone(), env.torque_scale.clone()
+        env.episode_length_buf[0] = env.max_episode_length - 1
+        env.step(rand_cmd(env))
+        assert env.thrust_scale[0] != thrust_scale[0] and env.torque_scale[0] != torque_scale[0]
+        torch.testing.assert_close(env.thrust_scale[1:], thrust_scale[1:])
+        torch.testing.assert_close(env.torque_scale[1:], torque_scale[1:])
+    finally:
+        env.close()
+
+
+def test_setpoints_stay_nominal_under_actuation_scaling():
+    """The thrust scale acts on the body only: the rate and thrust setpoints are the nominal mapping."""
+    env = make_env(thrust_scale_range=(0.8, 1.2))
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        cmd = rand_cmd(env)
+        env.step(cmd)
+        torch.testing.assert_close(env._rate_ref, cmd[:, :3] * env.cfg.max_body_rate)
+        nominal = env._min_thrust + (cmd[:, 3] + 1) / 2 * (env._max_thrust - env._min_thrust)
+        torch.testing.assert_close(env._thrust_pwm[:, 0] * env._ctrl.thrust_cmd_scale, nominal)
+    finally:
+        env.close()
+
+
+def test_warmup_hold_ignores_wind_and_scaling():
+    """The hold stays an exact m*g: no wind, no actuation scaling; both come back at step d + 1."""
+    d = 3
+    # 0.1 N of wind on a ~0.027 kg drone is ~4 m/s^2: a leak would move it far beyond 1e-4 m in d steps
+    env = make_env(
+        action_latency_steps=d, wind_force_range=(0.1, 0.2), thrust_scale_range=(0.7, 0.8), torque_scale_range=(0.7, 0.8)
+    )
+    try:
+        env.reset()
+        env.episode_length_buf[:] = 0
+        spawn = env._robot.data.root_pos_w.clone()
+        composer = env._robot.instantaneous_wrench_composer
+        b = env._body_id[0]
+        for _ in range(d):
+            env.step(rand_cmd(env))
+            assert env._hold_cmd.all()
+            torch.testing.assert_close(env._robot.data.root_pos_w, spawn, atol=1e-4, rtol=0.0)
+            torch.testing.assert_close(env._thrust[:, 0, 2], env._hold_force)
+        env._apply_action()  # still held (step d's state): the composer adds nothing
+        assert not composer.composed_force_as_torch[:, b].any() and not composer.composed_torque_as_torch[:, b].any()
+        composer.reset()
+
+        env.step(rand_cmd(env))  # step d + 1: flying, so wind and scaling are back
+        assert not env._hold_cmd.any()
+        env._apply_action()
+        expected = quat_apply_inverse(env._robot.data.body_link_quat_w[:, b], env.wind_force_world)
+        expected = expected + (env.thrust_scale[:, None] - 1) * env._thrust[:, 0]
+        torch.testing.assert_close(composer.composed_force_as_torch[:, b], expected)
+        torch.testing.assert_close(composer.composed_torque_as_torch[:, b], (env.torque_scale[:, None] - 1) * env._moment[:, 0])
+        composer.reset()
     finally:
         env.close()
