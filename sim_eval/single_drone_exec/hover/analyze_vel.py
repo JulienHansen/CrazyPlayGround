@@ -6,10 +6,10 @@ Reads the Parquet file FlightRecorder writes (one row per control step) and repo
 
 Usage:
     # one flight
-    python sim2real/single_drone_exec/hover/analyze_vel.py flight.parquet
+    python sim_eval/single_drone_exec/hover/analyze_vel.py flight.parquet
 
     # many trials -> per-trial table + aggregate mean/spread, approach transient removed
-    python sim2real/single_drone_exec/hover/analyze_vel.py logs/*.parquet --skip-s 3 --json-out report.json
+    python sim_eval/single_drone_exec/hover/analyze_vel.py logs/*.parquet --skip-s 3 --json-out report.json
 
 Accepts Parquet files or directories holding exactly one. An optional metadata.json next
 to the file supplies the planned `duration_s`. numpy and pyarrow are required;

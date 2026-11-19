@@ -20,7 +20,8 @@ and experiment results are centralised in one W&B team, `crazyplayground`.
 | `source/CrazyPlayGround/CrazyPlayGround/wandb_tb_patch.py` | Forwards skrl's TensorBoard scalars to W&B; imported by the package |
 | `scripts/<trainer>/train.py`, `play.py` | Isaac Lab entry points; skrl is the trainer the team uses |
 | `execution/` | Deployment on real Crazyflies over radio (cflib); see **Real hardware** |
-| `sim2real/` | Sim-to-real tools: `system-identification/` (step excitation on the real drone and its Isaac twin, delay/noise estimation, step-response plots) and `single_drone_exec/`, laid out like `execution/single_drone_exec/` (e.g. `hover/analyze_vel.py`, metrics of recorded real flights) |
+| `sim2real/` | Sim-to-real tools: `system-identification/` (step excitation on the real drone and its Isaac twin, delay/noise estimation, step-response plots) |
+| `sim_eval/` | Offline policy evaluation, laid out like `execution/single_drone_exec/` (e.g. `hover/analyze_vel.py`, metrics of recorded flights). Nothing here flies a drone |
 | `experiments/config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
 | `experiments/parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
 | `tests/` | pytest. Hardware tests drive the real scripts against a fake Crazyflie |

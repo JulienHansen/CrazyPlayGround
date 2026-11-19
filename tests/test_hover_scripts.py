@@ -26,7 +26,7 @@ import torch
 HERE = os.path.dirname(__file__)
 sys.path.append(os.path.join(HERE, "..", "execution", "single_drone_exec"))
 sys.path.append(os.path.join(HERE, "..", "execution", "single_drone_exec", "hover"))
-sys.path.append(os.path.join(HERE, "..", "sim2real", "single_drone_exec", "hover"))
+sys.path.append(os.path.join(HERE, "..", "sim_eval", "single_drone_exec", "hover"))
 from analyze_vel import compute_metrics, load_flight  # noqa: E402
 from cflib.crazyflie.log import LogConfig  # noqa: E402
 

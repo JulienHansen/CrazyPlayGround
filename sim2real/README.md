@@ -12,15 +12,4 @@ Characterize plant dynamics, measurement noise, and communication delays:
 
 For full usage details, see [`system-identification/README.md`](system-identification/README.md).
 
-## 2. Flight analysis (`single_drone_exec/`)
-Metrics of real flights. The layout mirrors `execution/single_drone_exec/`, so each tool sits next
-to the flight script whose recordings it reads. Nothing here flies a drone.
-- **`hover/analyze_vel.py`**: Hover metrics of flights recorded by `execution/single_drone_exec/hover/exec_vel.py`
-  (position error, jitter, drift, settling time, command smoothness, motor PWM, crash/success).
-  Needs numpy and pyarrow; matplotlib only for `--plot`.
-
-```bash
-# Run from CrazyPlayGround/
-python sim2real/single_drone_exec/hover/analyze_vel.py flight.parquet
-python sim2real/single_drone_exec/hover/analyze_vel.py logs/*.parquet --skip-s 3 --json-out report.json
-```
+Policy evaluation (metrics of recorded flights, simulated rollouts) lives in [`../sim_eval/`](../sim_eval/README.md).

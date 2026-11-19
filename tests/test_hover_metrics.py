@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "sim2real", "single_drone_exec", "hover"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "sim_eval", "single_drone_exec", "hover"))
 from analyze_vel import ACT_COLS, CMD_COLS, MOTOR_COLS, aggregate, compute_metrics, load_flight, main  # noqa: E402
 
 
