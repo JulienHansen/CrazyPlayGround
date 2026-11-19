@@ -20,6 +20,7 @@ and experiment results are centralised in one W&B team, `crazyplayground`.
 | `source/CrazyPlayGround/CrazyPlayGround/wandb_tb_patch.py` | Forwards skrl's TensorBoard scalars to W&B; imported by the package |
 | `scripts/<trainer>/train.py`, `play.py` | Isaac Lab entry points; skrl is the trainer the team uses |
 | `execution/` | Deployment on real Crazyflies over radio (cflib); see **Real hardware** |
+| `sim2real/` | Sim-to-real tools: `system-identification/` (step excitation on the real drone and its Isaac twin, delay/noise estimation, step-response plots) and `single_drone_exec/`, laid out like `execution/single_drone_exec/` (e.g. `hover/analyze_vel.py`, metrics of recorded real flights) |
 | `experiments/config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
 | `experiments/parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
 | `tests/` | pytest. Hardware tests drive the real scripts against a fake Crazyflie |
@@ -173,7 +174,8 @@ are the rules a tool cannot check:
 
 ## Real hardware
 
-Scripts in `execution/` fly real drones. Never run them. Don't change control
+Scripts in `execution/` fly real drones, and so does
+`sim2real/system-identification/excite_hover.py`. Never run them. Don't change control
 loops, rates, limits or safety checks unless the user asks. Flag any change to
 frames, signs, units or quaternion order for bench verification before a flight.
 Test against the fake Crazyflie (`tests/test_hover_scripts.py`).

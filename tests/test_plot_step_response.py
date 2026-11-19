@@ -7,8 +7,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real", "system-identification"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "execution", "sim2real"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "sim2real", "system-identification"))
 import plot_step_response  # noqa: E402
 
 from test_delay_and_noise import write_flight
