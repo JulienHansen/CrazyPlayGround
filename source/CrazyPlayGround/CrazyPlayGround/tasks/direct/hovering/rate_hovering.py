@@ -4,6 +4,15 @@ Rates = a[:3] * max_body_rate; thrust = T_min + (a[3] + 1) / 2 * (T_max - T_min)
 T_min/T_max = min/max_thrust_scale * m*g. So a = 0 is a 1.15 * m*g climb, not hover, and
 empty action-history slots hold ``history_fill_value`` (-10), which the controller never sees.
 Defaults are the plain task: no noise, no DR; only the motor tau is drawn per episode.
+
+Distance reward shape: ``"tanh"`` (default, 1 - tanh(d / L), almost flat near the goal) or
+``"multiexp"``, mean_k exp(-d / (L * scale_k)): a coarse pull from afar plus a fine peak near
+the goal. A single exponential is ``"multiexp"`` with ``distance_reward_scales=(1.0,)``.
+
+Distance curriculum (``distance_reward_curriculum_ratio > 0``): L decays exponentially from
+``distance_reward_length`` to ``distance_reward_length_min`` over
+``distance_reward_curriculum_ratio * total_steps`` policy steps, then stays at the minimum.
+``total_steps`` is injected by ``scripts/skrl/train.py``.
 """
 
 from __future__ import annotations
@@ -97,6 +106,16 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     lin_vel_reward_scale = -0.1
     ang_vel_reward_scale = -0.05
     distance_to_goal_reward_scale = 20.0
+    # distance-to-goal reward shape; both are 1 at the goal, so the term's weight keeps its meaning:
+    # "tanh" = 1 - tanh(d / L), almost flat near the goal (94 % of max at 5 cm with L = 0.8);
+    # "multiexp" = mean_k exp(-d / (L * scale_k)), coarse + fine; scales=(1.0,) is a single exp
+    distance_reward_shape: str = "tanh"
+    distance_reward_length: float = 0.8  # L in metres, shared by both shapes
+    distance_reward_scales: tuple[float, ...] = (1.0, 0.1)  # "multiexp" only: multipliers of L
+    # curriculum on L: fraction in [0, 1] of total training steps (0.5 = first half); 0 = L fixed
+    distance_reward_curriculum_ratio: float = 0.0
+    distance_reward_length_min: float = 0.1  # final L in metres; only used with the curriculum on
+    total_steps: int = 0  # total training steps per env, injected by scripts/skrl/train.py
 
     add_noise = False
     noise_std = 0.01
@@ -128,6 +147,30 @@ def check_cfg(cfg: QuadcopterEnvCfg):
         (
             not -1.0 <= cfg.history_fill_value <= 1.0,
             f"history_fill_value must lie outside the action range [-1, 1], got {cfg.history_fill_value}",
+        ),
+        (
+            cfg.distance_reward_shape in ("tanh", "multiexp"),
+            "distance_reward_shape must be 'tanh' or 'multiexp' (a single exponential is 'multiexp' "
+            f"with distance_reward_scales=[1.0]), got {cfg.distance_reward_shape!r}",
+        ),
+        (cfg.distance_reward_length > 0.0, f"distance_reward_length must be > 0, got {cfg.distance_reward_length}"),
+        (
+            len(cfg.distance_reward_scales) > 0 and all(s > 0.0 for s in cfg.distance_reward_scales),
+            f"distance_reward_scales must be non-empty and all > 0, got {cfg.distance_reward_scales}",
+        ),
+        (
+            0.0 <= cfg.distance_reward_curriculum_ratio <= 1.0,
+            f"distance_reward_curriculum_ratio must be in [0, 1], got {cfg.distance_reward_curriculum_ratio}",
+        ),
+        (
+            cfg.distance_reward_curriculum_ratio == 0.0 or cfg.total_steps > 0,
+            f"distance_reward_curriculum_ratio > 0 requires total_steps > 0, got {cfg.total_steps}",
+        ),
+        (
+            not cfg.distance_reward_curriculum_ratio
+            or 0.0 < cfg.distance_reward_length_min <= cfg.distance_reward_length,
+            f"distance_reward_length_min must be in (0, distance_reward_length={cfg.distance_reward_length}], "
+            f"got {cfg.distance_reward_length_min}",
         ),
     ]
     for ok, msg in checks:
@@ -175,6 +218,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._dr_thrust_scale = torch.ones(self.num_envs, device=self.device)
         self._dr_thrust_bias_n = torch.zeros(self.num_envs, device=self.device)
         self._dr_rate_scale = torch.ones(self.num_envs, device=self.device)
+        self._distance_reward_scales = torch.tensor(self.cfg.distance_reward_scales, device=self.device)
         self.set_debug_vis(self.cfg.debug_vis)
 
     def _setup_scene(self):
@@ -258,7 +302,7 @@ class QuadcopterEnv(DirectRLEnv):
         lin_vel = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
         distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_pos_w, dim=1)
-        distance_to_goal_mapped = 1 - torch.tanh(distance_to_goal / 0.8)
+        distance_to_goal_mapped = self._distance_reward(distance_to_goal)
         rewards = {
             "lin_vel": lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
@@ -268,6 +312,29 @@ class QuadcopterEnv(DirectRLEnv):
         for key, value in rewards.items():
             self._episode_sums[key] += value
         return reward
+
+    def _distance_reward(self, distance: torch.Tensor) -> torch.Tensor:
+        """Distance-to-goal reward in [0, 1], 1 at the goal; shape set by distance_reward_shape."""
+        length = self._distance_reward_length()
+        if self.cfg.distance_reward_shape == "multiexp":
+            return torch.exp(-distance[:, None] / (length * self._distance_reward_scales)).mean(1)
+        return 1 - torch.tanh(distance / length)
+
+    def _curriculum_progress(self) -> float | None:
+        """Fraction in [0, 1] of the L curriculum done, or None when the curriculum is off."""
+        duration = int(round(self.cfg.distance_reward_curriculum_ratio * self.cfg.total_steps))
+        if duration <= 0:
+            return None
+        # shortcut: common_step_counter restarts at 0 on --checkpoint resume and in play, so the schedule does too
+        return min(self.common_step_counter / duration, 1.0)
+
+    def _distance_reward_length(self) -> float:
+        """Current L: L_0 * (L_min / L_0) ** progress, so L_0 at the start and L_min at the end; fixed when off."""
+        progress = self._curriculum_progress()
+        if progress is None:
+            return self.cfg.distance_reward_length
+        cfg = self.cfg
+        return cfg.distance_reward_length * (cfg.distance_reward_length_min / cfg.distance_reward_length) ** progress
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -293,6 +360,10 @@ class QuadcopterEnv(DirectRLEnv):
         extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids])
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
         extras["Metrics/final_distance_to_goal"] = final_distance_to_goal
+        extras["Curriculum/distance_reward_length"] = torch.tensor(self._distance_reward_length())
+        progress = self._curriculum_progress()
+        if progress is not None:
+            extras["Curriculum/progress"] = torch.tensor(progress)
         self.extras["log"].update(extras)
 
         self._robot.reset(env_ids)
