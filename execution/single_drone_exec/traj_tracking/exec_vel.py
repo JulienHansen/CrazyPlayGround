@@ -20,6 +20,7 @@ from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 # Make the `common` package importable; appended so it cannot shadow installed modules.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.trajectories import TRAJECTORIES, reference_w
 from common.utils import (ARENA_FENCE, emergency_land, fly_back_and_land, land_once, positive_int,
                           nonnegative_int, resolve_obs_hist)
 
@@ -33,8 +34,12 @@ POS_STALE_TIMEOUT_S    = 0.5   # max seconds without position callback
 POS_VARIANCE_THRESHOLD = 0.5   # kalman variance [m²]
 
 # ── Trajectory parameters (within VelTrackingEnvCfg's randomisation ranges) ───
-TRAJ_W         = 0.8             # speed multiplier
-TRAJ_SCALE     = [1.5, 1.5, 1.0] # [m] XY and Z scale
+TRAJ_TYPE      = "lemniscate"    # default shape; --trajectory overrides (keys of common.trajectories.TRAJECTORIES)
+TRAJ_W         = 0.5             # speed multiplier
+# Applied to every shape, as in training (traj_scale_range 1.5-3.0 m XY); --traj-scale overrides XY.
+# A unit circle is as wide in y as in x, so it fits ARENA_FENCE only up to --traj-scale 0.8.
+TRAJ_SCALE     = [1.5, 1.5, 1.0] # [m] X, Y and Z scale
+REF_FENCE_MARGIN = 0.2           # [m] the whole reference must stay this far inside ARENA_FENCE
 TRAJ_ORIGIN    = [0.0, 0.0, 1.0] # world-frame origin [m]; z = 1 m (TRAJ_C = 0: flat); policy sees only relative positions
 TRAJ_C         = 0.0             # lemniscate z-coupling parameter
 FUTURE_STEPS   = 4               # lookahead waypoints in observation
@@ -53,28 +58,43 @@ ACT_DIM      = 3                      # vx, vy, vz in [-1, 1]
 
 # ── Trajectory utilities ───────────────────────────────────────────────────────
 
-def _lemniscate(t: float, c: float = 0.0):
-    """Lemniscate of Bernoulli. Returns unnormalised (unit-amplitude) x, y, z."""
-    denom = 1.0 + math.sin(t) ** 2
-    x = math.cos(t) / denom                # in [-1, 1]: ±1 at t = 0, pi
-    y = math.sin(t) * math.cos(t) / denom  # in [-1/(2√2), 1/(2√2)] ≈ ±0.354, at sin²t = 1/3
-    z = 0.0
-    return x, y, z
+def _traj_point_world(t: torch.Tensor, traj_type: str, scale) -> torch.Tensor:
+    """Reference at trajectory time t (rad), as TrackingEnv._compute_traj: (..., 3) world frame, m."""
+    return reference_w(t, traj_type, scale, TRAJ_ORIGIN, c=TRAJ_C)
 
 
-def trajectory_start_world() -> torch.Tensor:
+def trajectory_limit_checks(traj_type: str, scale) -> Optional[str]:
+    """Pre-flight check: the whole reference path stays REF_FENCE_MARGIN inside ARENA_FENCE.
+
+    Args:
+        traj_type: a key of TRAJECTORIES.
+        scale: (x, y, z) scale, m.
+
+    Returns:
+        None when the whole path fits, otherwise a message giving the path's extent.
+    """
+    t = torch.linspace(0.0, 2.0 * math.pi, 3601, dtype=torch.float64)
+    ref = reference_w(t, traj_type, scale, TRAJ_ORIGIN, c=TRAJ_C)
+    lo = torch.tensor(ARENA_FENCE.lo, dtype=torch.float64) + REF_FENCE_MARGIN - 1e-9
+    hi = torch.tensor(ARENA_FENCE.hi, dtype=torch.float64) - REF_FENCE_MARGIN + 1e-9
+    if ((ref >= lo) & (ref <= hi)).all():
+        return None
+    ref_lo = [round(v, 2) for v in ref.min(dim=0).values.tolist()]
+    ref_hi = [round(v, 2) for v in ref.max(dim=0).values.tolist()]
+    return (f"{traj_type} at scale {list(scale)} spans {ref_lo}..{ref_hi} m, closer than "
+            f"{REF_FENCE_MARGIN} m to ARENA_FENCE {ARENA_FENCE.lo}..{ARENA_FENCE.hi}")
+
+
+def trajectory_start_world(traj_type: str = TRAJ_TYPE, scale=TRAJ_SCALE) -> torch.Tensor:
     """Reference position at step 0, where TrackingEnv spawns the drone (_compute_traj, step_size=0).
 
     Returns:
         (3,) world frame, m.
     """
-    x, y, z = _lemniscate(0.0, c=TRAJ_C)
-    return (torch.tensor([x, y, z], dtype=torch.float32, device=device)
-            * torch.tensor(TRAJ_SCALE, dtype=torch.float32, device=device)
-            + torch.tensor(TRAJ_ORIGIN, dtype=torch.float32, device=device))
+    return _traj_point_world(torch.tensor(0.0, device=device), traj_type, scale)
 
 
-def compute_waypoints_world(step: int) -> torch.Tensor:
+def compute_waypoints_world(step: int, traj_type: str = TRAJ_TYPE, scale=TRAJ_SCALE) -> torch.Tensor:
     """Compute FUTURE_STEPS lookahead waypoints in world frame.
 
     Uses the same formula as TrackingEnv._compute_traj (fixed params, no env offset).
@@ -82,15 +102,8 @@ def compute_waypoints_world(step: int) -> torch.Tensor:
     Returns:
         Tensor [FUTURE_STEPS, 3]
     """
-    scale  = torch.tensor(TRAJ_SCALE,  dtype=torch.float32, device=device)
-    origin = torch.tensor(TRAJ_ORIGIN, dtype=torch.float32, device=device)
-    pts = []
-    for k in range(1, FUTURE_STEPS + 1):
-        t_k = TRAJ_W * (step + k * TRAJ_STEP_SIZE) * CONTROL_DT
-        x, y, z = _lemniscate(t_k, c=TRAJ_C)
-        raw = torch.tensor([x, y, z], dtype=torch.float32, device=device)
-        pts.append(raw * scale + origin)
-    return torch.stack(pts, dim=0)  # [4, 3]
+    k = torch.arange(1, FUTURE_STEPS + 1, dtype=torch.float32, device=device)
+    return _traj_point_world(TRAJ_W * (step + k * TRAJ_STEP_SIZE) * CONTROL_DT, traj_type, scale)  # [4, 3]
 
 
 # ── Quaternion math ────────────────────────────────────────────────────────────
@@ -117,12 +130,13 @@ def quat_inv(q, eps=1e-9):
 # ── Observation builder ────────────────────────────────────────────────────────
 
 def build_observation(step: int, pos: torch.Tensor, vel_w: torch.Tensor,
-                      quat: torch.Tensor, ang_vel_b: torch.Tensor) -> torch.Tensor:
+                      quat: torch.Tensor, ang_vel_b: torch.Tensor,
+                      traj_type: str = TRAJ_TYPE, traj_scale=TRAJ_SCALE) -> torch.Tensor:
     """Build one 22-D frame (OBS_STEP_DIM) matching TrackingEnv._get_observations().
 
     Layout: rpos_1..4 (3×4=12) | lin_vel_b (3) | ang_vel_b (3) | quat (4) = 22
     """
-    waypoints_w = compute_waypoints_world(step)  # [4, 3]
+    waypoints_w = compute_waypoints_world(step, traj_type, traj_scale)  # [4, 3]
     rpos_list = []
     for i in range(FUTURE_STEPS):
         rpos_b = quat_apply(quat_inv(quat), waypoints_w[i] - pos)
@@ -163,8 +177,14 @@ class CrazyflieController:
     """Runs a trained trajectory-tracking velocity-control RL agent on the Crazyflie."""
 
     def __init__(self, uri: str, agent: PPO, obs_input_hist: int = 1, action_input_hist: int = 0,
-                 takeoff_height: Optional[float] = None):
+                 takeoff_height: Optional[float] = None, traj_type: str = TRAJ_TYPE,
+                 traj_scale=TRAJ_SCALE):
+        error = trajectory_limit_checks(traj_type, traj_scale)
+        if error:
+            raise ValueError(error)
         self.uri   = uri
+        self.traj_type = traj_type
+        self.traj_scale = list(traj_scale)  # (x, y, z), m
         self.cf    = Crazyflie()
         self.agent = agent
         self.k, self.m = obs_input_hist, action_input_hist  # frames K, past actions M (see resolve_obs_hist)
@@ -319,7 +339,7 @@ class CrazyflieController:
         # ── Phase 1b: HLC go_to the trajectory start ─────────────────────────
         # TrackingEnv spawns each episode within 0.3 m of the reference at t = 0 and ends it past
         # reset_thres (0.8 m): start the policy there, with the trajectory clock at step 0.
-        start_w = trajectory_start_world()
+        start_w = trajectory_start_world(self.traj_type, self.traj_scale)
         with self.lock:
             dist = (start_w - self.current_pos).norm().item()
         goto_duration = max(GOTO_MIN_DURATION_S, dist / GOTO_SPEED)
@@ -330,7 +350,7 @@ class CrazyflieController:
         logger.info(f"At trajectory start. Current pos: {self.current_pos}")
 
         # ── Phase 2: NN velocity control ──────────────────────────────────────
-        logger.info("NN velocity-control trajectory tracking active.")
+        logger.info(f"NN velocity-control tracking active ({self.traj_type}, scale {self.traj_scale} m).")
         # As TrackingEnv: last K frames (primed with copies of the first), then last M clamped actions (zeros first)
         window = None
         act_hist = torch.zeros(self.m, ACT_DIM, device=device)
@@ -363,7 +383,7 @@ class CrazyflieController:
                 fly_back_and_land(self, ARENA_FENCE, breach, pos, POS_STALE_TIMEOUT_S)
                 break
 
-            obs = build_observation(step, pos, vel, quat, ang)
+            obs = build_observation(step, pos, vel, quat, ang, self.traj_type, self.traj_scale)
             window = obs.expand(self.k, -1) if window is None else torch.cat([window[1:], obs[None]])
             policy_input = torch.cat([window.flatten(), act_hist.flatten()])
 
@@ -440,9 +460,21 @@ def main():
     parser.add_argument("--takeoff-height", type=float, default=None,
                         help=f"High-level-commander takeoff height in m, 0.2-2.0 (default: the trajectory's "
                              f"z, {TRAJ_ORIGIN[2]}). The policy then climbs or descends to the trajectory.")
+    parser.add_argument("--trajectory", choices=sorted(TRAJECTORIES), default=TRAJ_TYPE,
+                        help=f"Reference shape to track (default: {TRAJ_TYPE}).")
+    parser.add_argument("--traj-scale", type=float, default=TRAJ_SCALE[0], metavar="XY",
+                        help=f"XY scale of the shape in m, the circle's radius (default: {TRAJ_SCALE[0]}; "
+                             f"training sampled 1.5-3.0). The script refuses a reference that comes closer "
+                             f"than {REF_FENCE_MARGIN} m to the arena fence: the circle needs 0.8.")
     args = parser.parse_args()
     if args.takeoff_height is not None and not 0.2 <= args.takeoff_height <= 2.0:
         parser.error(f"--takeoff-height must be between 0.2 m and 2.0 m, got {args.takeoff_height}")
+    if args.traj_scale <= 0:
+        parser.error(f"--traj-scale must be positive, got {args.traj_scale}")
+    traj_scale = [args.traj_scale, args.traj_scale, TRAJ_SCALE[2]]
+    error = trajectory_limit_checks(args.trajectory, traj_scale)
+    if error:
+        parser.error(error)
 
     try:
         k, m = resolve_obs_hist(args.checkpoint, args.obs_input_hist, args.action_input_hist)
@@ -450,7 +482,8 @@ def main():
         parser.error(str(e))
     agent = load_agent(args.checkpoint, device, OBS_STEP_DIM * k + ACT_DIM * m)
     controller = CrazyflieController(uri=args.uri, agent=agent, obs_input_hist=k, action_input_hist=m,
-                                     takeoff_height=args.takeoff_height)
+                                     takeoff_height=args.takeoff_height, traj_type=args.trajectory,
+                                     traj_scale=traj_scale)
 
     try:
         controller.start()

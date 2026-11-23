@@ -98,7 +98,7 @@ class Fence:
 
 # Set inside the arena with a margin: the drone keeps moving while it brakes.
 # The tracking trajectory spans x ±1.5, y ±0.53, z 1.0 m.
-ARENA_FENCE = Fence(lo=(-2.0, -1.0, 0.3), hi=(2.0, 1.0, 1.8))
+ARENA_FENCE = Fence(lo=(-2.0, -1.0, 0.2), hi=(2.0, 1.0, 1.8))
 
 
 def hover_for(controller, duration: float, stale_timeout_s: float) -> bool:

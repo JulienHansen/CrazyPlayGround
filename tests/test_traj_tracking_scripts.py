@@ -218,18 +218,21 @@ def test_takeoff_height_flag(monkeypatch):
             mod.main()
 
 
-def test_goes_to_the_trajectory_start_before_the_policy(monkeypatch):
+@pytest.mark.parametrize("traj_type, xy", [("circle", 0.8), ("lemniscate", 1.5)])
+def test_goes_to_the_trajectory_start_before_the_policy(monkeypatch, traj_type, xy):
     """As TrackingEnv's spawn: the policy starts at the reference of step 0, not where it took off."""
     mod = load_script(monkeypatch)
     cf = TrajFakeCf(3, pos=lambda n: (0.0, 0.0, 0.5))
     mod.Crazyflie = lambda **kwargs: cf
-    controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3), takeoff_height=0.5)
+    scale = [xy, xy, mod.TRAJ_SCALE[2]]
+    controller = mod.CrazyflieController(uri="fake", agent=FakeAgent(3), takeoff_height=0.5,
+                                         traj_type=traj_type, traj_scale=scale)
     controller._start_logging()
     controller.control_loop()
     names = [name for name, _ in cf.sent]
     assert names.index("takeoff") < names.index("go_to") < names.index("send_velocity_world_setpoint")
     (go_to,) = cf.calls_to("go_to")
-    start = [mod.TRAJ_SCALE[0] + mod.TRAJ_ORIGIN[0], mod.TRAJ_ORIGIN[1], mod.TRAJ_ORIGIN[2]]  # lemniscate(0) = (1, 0, 0)
+    start = [scale[0] + mod.TRAJ_ORIGIN[0], mod.TRAJ_ORIGIN[1], mod.TRAJ_ORIGIN[2]]  # circle(0) = lemniscate(0) = (1, 0, 0)
     assert list(go_to[:4]) == pytest.approx(start + [0.0])
     dist = math.dist(start, (0.0, 0.0, 0.5))
     assert go_to[4] == pytest.approx(max(mod.GOTO_MIN_DURATION_S, dist / mod.GOTO_SPEED))
@@ -283,18 +286,73 @@ def test_ceiling_breach_flies_back_to_safe_hover(monkeypatch, caplog):
 
 
 def test_fast_descent_trips_before_the_floor(monkeypatch):
-    """At 1.5 m/s down, the lookahead trips at z = 0.4 m, still 0.1 m above ARENA_FENCE.lo z."""
+    """At 1.5 m/s down, the 0.1 s lookahead trips 0.1 m above ARENA_FENCE.lo z, before the drone gets there."""
     mod = load_script(monkeypatch)
-    cf = DivingFakeCf(500, vel_w=(0.0, 0.0, -1.5), pos=lambda n: (0.2, -0.1, 0.4))
+    z = mod.ARENA_FENCE.lo[2] + 0.1                       # 0.3 m: predicted z in 0.1 s = 0.15 m, below the floor
+    cf = DivingFakeCf(500, vel_w=(0.0, 0.0, -1.5), pos=lambda n: (0.2, -0.1, z))
     _fly_to_breach(mod, cf)
     assert cf.calls_to("send_velocity_world_setpoint") == []
-    _assert_flew_back(mod, cf, brake=[0.2, -0.1, 0.4])
+    _assert_flew_back(mod, cf, brake=[0.2, -0.1, z])
 
 
-def test_trajectory_lies_inside_the_fence(monkeypatch):
+@pytest.mark.parametrize("traj_type, xy", [("circle", 0.8), ("lemniscate", 1.5)])
+def test_trajectory_lies_inside_the_fence(monkeypatch, traj_type, xy):
+    """The scales the --traj-scale help names keep the flown waypoints REF_FENCE_MARGIN inside the fence."""
     mod = load_script(monkeypatch)
+    scale = [xy, xy, mod.TRAJ_SCALE[2]]
+    assert mod.trajectory_limit_checks(traj_type, scale) is None
     period = round(2 * math.pi / (mod.TRAJ_W * mod.CONTROL_DT))
-    pts = torch.cat([mod.compute_waypoints_world(step) for step in range(0, period, 10)])
-    fence = mod.ARENA_FENCE
-    assert (pts >= torch.tensor(fence.lo)).all() and (pts <= torch.tensor(fence.hi)).all()
+    pts = torch.cat([mod.compute_waypoints_world(step, traj_type, scale) for step in range(0, period, 10)])
+    fence, margin = mod.ARENA_FENCE, mod.REF_FENCE_MARGIN - 1e-6
+    assert (pts >= torch.tensor(fence.lo) + margin).all() and (pts <= torch.tensor(fence.hi) - margin).all()
     assert fence.breach(torch.tensor(fence.safe_hover_pos), torch.zeros(3)) is None
+
+
+def test_default_scale_is_refused_for_the_circle(monkeypatch):
+    """One TRAJ_SCALE for every shape: a 1.5 m circle would leave the y fence, so no flight starts."""
+    mod = load_script(monkeypatch)
+    error = mod.trajectory_limit_checks("circle", mod.TRAJ_SCALE)
+    assert error and "circle at scale [1.5, 1.5, 1.0] spans [-1.5, -1.5, 1.0]..[1.5, 1.5, 1.0] m" in error
+    with pytest.raises(ValueError, match="closer than 0.2 m to ARENA_FENCE"):
+        mod.CrazyflieController(uri="fake", agent=FakeAgent(3), traj_type="circle")
+
+
+def test_traj_scale_flag(tmp_path, monkeypatch, capsys):
+    """--traj-scale sets the XY scale of any shape; one the fence cannot hold stops before the radio."""
+    mod = load_script(monkeypatch)
+    ckpt = _run_dir(tmp_path, "run", ENV_YAML.format(k=1, m=0))
+    made = []
+    monkeypatch.setattr(mod, "load_agent", lambda path, dev, width: object())
+    monkeypatch.setattr(mod, "CrazyflieController",
+                        lambda **kw: made.append(kw) or (_ for _ in ()).throw(_StopBeforeFlight()))
+    for argv, expected in (([], ("lemniscate", mod.TRAJ_SCALE)),
+                           (["--trajectory", "circle", "--traj-scale", "0.8"], ("circle", [0.8, 0.8, 1.0]))):
+        monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt] + argv)
+        with pytest.raises(_StopBeforeFlight):
+            mod.main()
+        assert (made[-1]["traj_type"], made[-1]["traj_scale"]) == expected
+    for bad in (["--trajectory", "circle"], ["--traj-scale", "2.0"], ["--traj-scale", "0"]):
+        monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt] + bad)
+        with pytest.raises(SystemExit):
+            mod.main()
+    assert len(made) == 2
+    assert "closer than 0.2 m to ARENA_FENCE" in capsys.readouterr().err
+
+
+def test_shapes_match_training(monkeypatch):
+    """common/trajectories.py copies the training shapes, which cannot be imported without Isaac Lab."""
+    for name in ("isaaclab", "isaaclab.utils"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "isaaclab.utils.math", types.SimpleNamespace(quat_apply=None))
+    path = os.path.join(HERE, "..", "source", "CrazyPlayGround", "CrazyPlayGround", "tasks", "direct", "track",
+                        "trajectories.py")
+    spec = importlib.util.spec_from_file_location("training_trajectories", path)
+    training = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(training)
+    mod = load_script(monkeypatch)
+    deployed = sys.modules["common.trajectories"]
+    t = torch.linspace(0.0, 4.0 * math.pi, 101)
+    for name, fn in deployed.TRAJECTORIES.items():
+        assert torch.equal(fn(t), training.TRAJECTORIES[name](t)), name
+    assert torch.equal(deployed.lemniscate(t, c=0.3), training.lemniscate(t, c=0.3))
+    assert set(mod.TRAJECTORIES) == set(deployed.TRAJECTORIES)
