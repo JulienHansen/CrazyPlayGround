@@ -61,7 +61,10 @@ parser.add_argument(
     "--eval_csv",
     type=str,
     default=None,
-    help="Evaluate instead of playing: fly one full episode per env and write its step metrics to this CSV.",
+    help=(
+        "Evaluate instead of playing: fly one full episode per env and write its step metrics to this CSV."
+        " Envs with record_states (the tracking envs) also get every step in a .parquet next to it."
+    ),
 )
 
 # append AppLauncher cli args
@@ -81,6 +84,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import csv
+import json
 import gymnasium as gym
 import os
 import random
@@ -182,6 +186,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+    # evaluation records every step where the env can (record_states), next to the CSV
+    parquet_path = None
+    if args_cli.eval_csv and hasattr(env_cfg, "record_states"):
+        env_cfg.record_states = True
+        parquet_path = os.path.splitext(args_cli.eval_csv)[0] + ".parquet"
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -228,7 +237,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     obs, _ = env.reset()
     timestep = 0
     if args_cli.eval_csv:
-        evaluate(env, runner, obs, args_cli.eval_csv)
+        evaluate(env, runner, obs, args_cli.eval_csv, parquet_path, resume_path, args_cli.task)
         env.close()
         return
     # simulate environment
@@ -262,21 +271,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env.close()
 
 
-def evaluate(env, runner, obs, csv_path: str):
+def evaluate(env, runner, obs, csv_path: str, parquet_path: str | None = None, checkpoint: str = "",
+             task: str = ""):
     """Fly one full-length episode per env with mean actions and write its per-episode metrics to a CSV.
 
     Needs an env that fills ``extras["step_metrics"]`` at reset: Vel-Hovering (step response) or
     the tracking envs (tracking error, effort). The spawn, goal and trajectory draws follow
     ``--seed``, so two checkpoints evaluated with the same seed and ``--num_envs`` fly the same
     episodes.
+
+    With ``parquet_path``, the env must also fill ``extras["data_record"]`` every step
+    (``record_states``): each env's steps are kept until its first episode ends (the auto-reset then
+    starts episodes that are not recorded) and written by ``write_parquet``.
     """
     base_env = env.unwrapped
     base_env.episode_length_buf[:] = 0  # undo the randomised first reset: every episode lasts the full time
+    n_envs, n_steps, dev = base_env.num_envs, int(base_env.max_episode_length), base_env.device
     rows = {}
+    states = {}  # key -> (N, T, ...): env n's step t in [n, t - 1], until its first episode ends
+    length = torch.zeros(n_envs, dtype=torch.long, device=dev)  # steps of each env's first episode
+    died = torch.zeros(n_envs, dtype=torch.bool, device=dev)  # it ended by a crash, not a time-out
+    finished = torch.zeros(n_envs, dtype=torch.bool, device=dev)
     for _ in range(base_env.max_episode_length):
         with torch.inference_mode():
             outputs = runner.agent.act(obs, None, timestep=0, timesteps=0)
             obs, _, terminated, truncated, info = env.step(outputs[-1].get("mean_actions", outputs[0]))
+            if parquet_path:
+                record = info["data_record"]  # this step, taken before the auto-reset
+                active = torch.nonzero(~finished, as_tuple=True)[0]
+                slot = record["step"][active] - 1
+                for key, value in record.items():
+                    if key != "step":
+                        if key not in states:
+                            states[key] = torch.zeros((n_envs, n_steps, *value.shape[1:]), dtype=value.dtype,
+                                                      device=dev)
+                        states[key][active, slot] = value[active]
+                ended = (terminated | truncated).view(-1) & ~finished
+                length[ended] = record["step"][ended]
+                died[ended] = terminated.view(-1)[ended]
+                finished |= ended
         if not (terminated | truncated).any():
             continue
         metrics = {k: v.cpu() for k, v in info["step_metrics"].items()}
@@ -293,6 +326,8 @@ def evaluate(env, runner, obs, csv_path: str):
         if len(rows) == base_env.num_envs:
             break
 
+    if parquet_path:
+        write_parquet(parquet_path, base_env, states, length, died, checkpoint, task)
     rows = [rows[i] for i in sorted(rows)]
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
     with open(csv_path, "w", newline="") as f:
@@ -305,6 +340,49 @@ def evaluate(env, runner, obs, csv_path: str):
             values = torch.tensor([float(r[key]) for r in rows])
             print(f"  {key:>14}: mean {values.nanmean().item():.4f}  ({int(values.isnan().sum())} NaN)")
 
+
+def write_parquet(path: str, base_env, states: dict, length: torch.Tensor, died: torch.Tensor, checkpoint: str,
+                  task: str):
+    """One row per (episode, step), as the flight recordings; episode n = env n, ``length[n]`` steps.
+
+    Columns: ``pos_*``, ``target_*`` (reference), ``vel_*``, ``action_*`` and, in velocity mode, the
+    setpoint ``vx/vy/vz`` [m/s]; other recorded values (DR draws) under their own names. Footer:
+    ``source``, ``task``, ``checkpoint``, ``dt``, ``env_cfg`` and ``died`` (JSON).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    n_envs, n_steps = length.shape[0], next(iter(states.values())).shape[1]
+    valid = torch.arange(n_steps, device=length.device)[None, :] < length[:, None]  # each episode's steps
+    columns = {
+        "episode": torch.arange(n_envs, device=length.device)[:, None].expand(-1, n_steps)[valid],
+        "step": torch.arange(1, n_steps + 1, device=length.device)[None, :].expand(n_envs, -1)[valid],
+    }
+    names = {"pos": "pos", "ref": "target", "vel_w": "vel"}
+    velocity = getattr(base_env.cfg, "control_mode", "") == "velocity"
+    for key, value in states.items():
+        value = value[valid]  # (rows, ...)
+        if key == "action_cmd":
+            for k in range(value.shape[1]):
+                columns[f"action_{('vx', 'vy', 'vz')[k] if velocity else k}"] = value[:, k]
+        elif key == "action_sent":
+            for k in range(value.shape[1]):
+                if velocity:
+                    columns[("vx", "vy", "vz")[k]] = value[:, k] * base_env.cfg.max_velocity
+                else:
+                    columns[f"action_sent_{k}"] = value[:, k]
+        elif value.ndim == 2 and value.shape[1] == 3:
+            columns.update({f"{names.get(key, key)}_{axis}": value[:, k] for k, axis in enumerate("xyz")})
+        else:
+            columns[names.get(key, key)] = value
+    table = pa.table({name: value.cpu().numpy() for name, value in columns.items()})
+    footer = {
+        "source": "sim", "task": task, "checkpoint": checkpoint, "dt": repr(base_env.step_dt),
+        "env_cfg": json.dumps(base_env.cfg.to_dict(), default=repr), "died": json.dumps(died.tolist()),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    pq.write_table(table.replace_schema_metadata(footer), path, compression="zstd")
+    print(f"[INFO] Wrote {n_envs} episodes, {table.num_rows} steps to {path}")
 
 if __name__ == "__main__":
     # run the main function

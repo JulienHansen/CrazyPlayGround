@@ -21,7 +21,7 @@ and experiment results are centralised in one W&B team, `crazyplayground`.
 | `scripts/<trainer>/train.py`, `play.py` | Isaac Lab entry points; skrl is the trainer the team uses |
 | `execution/` | Deployment on real Crazyflies over radio (cflib); see **Real hardware** |
 | `sim2real/` | Sim-to-real tools: `system-identification/` (step excitation on the real drone and its Isaac twin, delay/noise estimation, step-response plots) |
-| `sim_eval/` | Offline policy evaluation, laid out like `execution/single_drone_exec/` (e.g. `hover/analyze_vel.py`, metrics of recorded flights). Nothing here flies a drone |
+| `sim_eval/` | Offline policy evaluation, laid out like `execution/single_drone_exec/`: `hover/analyze_vel.py` (metrics of recorded flights), `traj_tracking/plot_trajectory_eval.py` (path vs reference and error, from the `.parquet` of `play.py --eval_csv`). Nothing here flies a drone |
 | `experiments/config/sweep/<task>/*.json` | Experiment definitions; see **Running experiments** |
 | `experiments/parser.py`, `wandb_check.py` | Expand a sweep file into runs; check which runs are already done on W&B |
 | `tests/` | pytest. Hardware tests drive the real scripts against a fake Crazyflie |
@@ -51,6 +51,8 @@ to the PID: `Pos`, `Vel`, `Att` or `Rate` (e.g. `Vel-Hovering`). List them with
 python scripts/list_envs.py
 python scripts/skrl/train.py --task=Vel-Hovering --num_envs=4096 --headless
 python scripts/skrl/play.py --task=Vel-Hovering --checkpoint logs/skrl/<dir>/<run>/checkpoints/best_agent.pt
+python scripts/skrl/play.py --task=Vel-Tracking --headless --checkpoint <ckpt> --eval_csv out.csv [env.<field>=...]   # + out.parquet, every step
+python sim_eval/single_drone_exec/traj_tracking/plot_trajectory_eval.py out.parquet   # their figures; see sim_eval/README.md
 # inside Docker, prefix Isaac Lab scripts with: /workspace/isaaclab/isaaclab.sh -p
 
 python experiments/parser.py experiments/config/sweep/hovering/test_01.json        # add --runs or --json
