@@ -152,7 +152,7 @@ def test_defaults_are_plain_hovering():
         obs, *_ = env.step(cmd)
         torch.testing.assert_close(obs["policy"], frame(env))
         # no latency, no hold: the controller gets the command of this very step
-        assert not env.delay_steps.any() and not env._hold.any() and env._hold_ids.numel() == 0
+        assert not env.delay_steps.any() and not env._hold_cmd.any() and env._hold_ids.numel() == 0
         torch.testing.assert_close(env._actions, cmd)
         assert torch.all(env._dr_thrust_scale == 1.0)
         assert torch.all(env._dr_thrust_bias_n == 0.0)
@@ -449,7 +449,7 @@ def test_latency_randomised_per_episode():
             zero = torch.zeros(4, device=env.device)
             expected = torch.stack([zero if t <= delay[i] else A[t - delay[i]][i] for i in range(N)])
             torch.testing.assert_close(env._actions, expected)
-            assert env._hold.tolist() == [t <= delay[i] for i in range(N)]
+            assert env._hold_cmd.tolist() == [t <= delay[i] for i in range(N)]
     finally:
         env.close()
 
@@ -467,7 +467,7 @@ def test_warmup_hold():
             A.append(rand_cmd(env))
             before = {k: v.clone() for k, v in env._episode_sums.items()}
             _, reward, *_ = env.step(A[t])
-            assert env._hold.all()
+            assert env._hold_cmd.all()
             # frozen at spawn by an exact m*g, whatever the policy commands
             torch.testing.assert_close(env._robot.data.root_pos_w, spawn, atol=1e-4, rtol=0.0)
             torch.testing.assert_close(env._robot.data.root_lin_vel_w, torch.zeros(N, 3, device=env.device), atol=1e-3, rtol=0.0)
@@ -483,7 +483,7 @@ def test_warmup_hold():
         # step d + 1: the controller gets the first command, the drone flies and the reward is back
         A.append(rand_cmd(env))
         _, reward, *_ = env.step(A[d + 1])
-        assert not env._hold.any()
+        assert not env._hold_cmd.any()
         torch.testing.assert_close(env._actions, A[1])
         assert reward.all()
 
@@ -494,11 +494,11 @@ def test_warmup_hold():
         new_spawn = env._spawn_pos_w[0].clone()
         for _ in range(d):
             _, reward, *_ = env.step(rand_cmd(env))
-            assert env._hold.tolist() == [True] + [False] * (N - 1)
+            assert env._hold_cmd.tolist() == [True] + [False] * (N - 1)
             assert reward[0] == 0.0 and reward[1:].all()
             torch.testing.assert_close(env._robot.data.root_pos_w[0], new_spawn, atol=1e-4, rtol=0.0)
         env.step(rand_cmd(env))
-        assert not env._hold.any()
+        assert not env._hold_cmd.any()
     finally:
         env.close()
 
