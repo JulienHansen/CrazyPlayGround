@@ -44,11 +44,16 @@ POS, VEL, GYRO_DEG = (0.2, -0.1, 1.0), (0.05, 0.0, -0.02), (10.0, -20.0, 5.0)
 MOTOR = [30000, 30100, 30200, 30300]
 IMU = (10.0, -20.0, 5.0, 0.01, -0.02, 1.0)   # gyro deg/s, acc g
 FW_VEL = (0.3, -0.4, 0.05)                    # posCtl.targetV*: the firmware PID's velocity command
+FW_RATE = (12.0, -8.0, 3.0, 35000.0)          # controller.*Rate deg/s, cmd_thrust: the firmware PID's rate command
 VBAT = 3.9
+
+# Per script with a pid baseline: (policy setpoint, log block of the firmware command, first cmd column)
+PID_SCRIPTS = {"exec_vel": ("send_velocity_world_setpoint", "posCtl", "vx"),
+               "exec_rate": ("send_setpoint_manual", "controller", "roll_rate_deg_s")}
 
 
 class _Commands:
-    """Stands in for commander / high_level_commander / param: records every call."""
+    """Stands in for commander / high_level_commander / param / platform: records every call."""
 
     def __init__(self, cf):
         self._cf = cf
@@ -69,7 +74,7 @@ class _Caller:
 class FakeCf:
     def __init__(self, steps, pos=POS, telemetry_steps=None, close_link_error=None):
         self.connected = self.disconnected = self.connection_failed = self.connection_lost = _Caller()
-        self.commander = self.high_level_commander = self.param = _Commands(self)
+        self.commander = self.high_level_commander = self.param = self.platform = _Commands(self)
         self.log = types.SimpleNamespace(add_config=self._add_config)
         self.configs, self.sent, self.loop_done = {}, [], threading.Event()
         self.steps, self.pos, self.calls = steps, pos, 0
@@ -92,6 +97,8 @@ class FakeCf:
             "gyro": {"gyro.x": GYRO_DEG[0], "gyro.y": GYRO_DEG[1], "gyro.z": GYRO_DEG[2]},
             "imu": dict(zip(["gyro.x", "gyro.y", "gyro.z", "acc.x", "acc.y", "acc.z"], IMU)),
             "posCtl": dict(zip(["posCtl.targetVX", "posCtl.targetVY", "posCtl.targetVZ"], FW_VEL)),
+            "controller": dict(zip(["controller.rollRate", "controller.pitchRate", "controller.yawRate",
+                                    "controller.cmd_thrust"], FW_RATE)),
         }[name]
 
     def fire(self, logconf):
@@ -251,19 +258,35 @@ def test_exec_rate_uses_gyro_and_enables_rate_mode(tmp_path, monkeypatch):
     assert [rows[f"ang_vel_{c}"][0] for c in "xyz"] == pytest.approx([math.radians(g) for g in GYRO_DEG])
     assert [rows[f"rotmat_{i}"][0] for i in range(9)] == pytest.approx([1, 0, 0, 0, 1, 0, 0, 0, 1])
     assert ("flightmode.stabModeRoll", "0") in cf.calls_to("set_value")
+    # Armed, then HLC takeoff, then the policy's first rate setpoint: no thrust ramp in between
+    methods = [m for m, _ in cf.sent]
+    assert methods.index("send_arming_request") < methods.index("takeoff") < methods.index("send_setpoint_manual")
+    assert len(cf.calls_to("send_setpoint_manual")) == 5
 
 
-def test_exec_vel_feeds_window_and_action_history(tmp_path, monkeypatch):
+def test_exec_rate_thrust_mapping_is_measured_hover_and_uncapped_full_thrust(tmp_path, monkeypatch):
+    """The policy's hover action gives the measured hover thrust, and +1 is always cflib's 100 %."""
+    mod = load_script("exec_rate", monkeypatch)
+    controller, _, _, _ = fly(mod, tmp_path, steps=2)
+    hover_action = 2 * controller._hover_norm - 1          # ~ -0.23, as in rate_hovering.py
+    assert controller._thrust_pct_from_action(hover_action) == pytest.approx(mod.HOVER_THRUST_PCT) == 77.0
+    assert controller._thrust_pct_from_action(1.0) == 100.0
+    assert controller._thrust_pct_from_action(-1.0) == pytest.approx(25.0)   # --min-thrust-pct default
+
+
+@pytest.mark.parametrize("name", list(PID_SCRIPTS))
+def test_feeds_window_and_action_history(name, tmp_path, monkeypatch):
     """K=3, M=1, as vel_hovering._get_observations: frames oldest first, primed with copies
     of the first one, then the previous clamped command (zeros before the first)."""
-    controller, _, agent, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=20,
+    n_act = SCRIPTS[name][0]
+    controller, _, agent, rows = fly(load_script(name, monkeypatch), tmp_path, steps=20,
                                      pos=lambda n: (0.2, -0.1, 1.0 + 0.01 * n),   # every frame differs
                                      controller_kwargs=dict(obs_input_hist=3, action_input_hist=1))
     frames = list(zip(*(rows[f] for f in controller.recorder.obs_fields)))
     assert len(agent.seen) == len(frames) == 20 and frames[0] != frames[1]
     for i, seen in enumerate(agent.seen):
         window = [frames[max(j, 0)] for j in (i - 2, i - 1, i)]
-        assert seen == pytest.approx(_flat(window) + (ACTION[:3] if i else [0.0] * 3))
+        assert seen == pytest.approx(_flat(window) + (ACTION[:n_act] if i else [0.0] * n_act))
 
 
 def test_exec_vel_pid_flies_the_firmware_position_pid(tmp_path, monkeypatch):
@@ -280,8 +303,28 @@ def test_exec_vel_pid_flies_the_firmware_position_pid(tmp_path, monkeypatch):
     assert {b"stabilizer.controller", b"posCtlPid.xKp", b"posCtlPid.zVelMax"} <= set(meta)
 
 
-def test_exec_vel_records_telemetry_and_loop_timing(tmp_path, monkeypatch):
-    controller, cf, _, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=20)
+def test_exec_rate_pid_flies_the_firmware_position_pid(tmp_path, monkeypatch):
+    """After the same high-level takeoff as rl, the target goes to the onboard position PID,
+    and the recorded command is the rates and thrust that cascade asked for, in the rl columns'
+    units: pitch negated back (cflib negates it on the way in), thrust inverted from cflib's scale."""
+    mod = load_script("exec_rate", monkeypatch)
+    controller, cf, agent, rows = fly(mod, tmp_path, steps=20, controller_kwargs=dict(controller="pid"))
+    assert cf.calls_to("send_position_setpoint") == [(0.0, 0.0, 1.0, 0.0)] * 20
+    assert cf.calls_to("send_arming_request") == [(True,)] and cf.calls_to("takeoff") == [(0.5, 3.0)]
+    assert cf.calls_to("send_setpoint_manual") == [] and agent.seen == []   # no thrust ramp any more
+    roll, pitch, yaw, cmd_thrust = FW_RATE
+    thrust_pct = (cmd_thrust - 10001) * 100 / (60000 - 10001)
+    assert _columns(rows, controller.recorder.cmd_fields) == pytest.approx([roll, -pitch, yaw, thrust_pct] * 20)
+    assert mod.thrust_pct_from_cmd_thrust(10001 + 0.01 * 42.0 * (60000 - 10001)) == pytest.approx(42.0)
+    assert all(math.isnan(v) for f in controller.recorder.action_fields for v in rows[f])
+    meta = pq.read_schema(tmp_path / "flight.parquet").metadata
+    assert meta[b"controller"] == b"pid"
+    assert {b"stabilizer.controller", b"pid_rate.roll_kp", b"posCtlPid.xKp", b"hover_thrust_pct"} <= set(meta)
+
+
+@pytest.mark.parametrize("name", list(PID_SCRIPTS))
+def test_records_telemetry_and_loop_timing(name, tmp_path, monkeypatch):
+    controller, cf, _, rows = fly(load_script(name, monkeypatch), tmp_path, steps=20)
     imu = ["gyro_x", "gyro_y", "gyro_z", "acc_x", "acc_y", "acc_z"]
     assert _columns(rows, imu) == pytest.approx(list(IMU) * 20)
     assert rows["vbat"] == pytest.approx([VBAT] * 20) and rows["var_pz"] == pytest.approx([1e-3] * 20)
@@ -289,34 +332,38 @@ def test_exec_vel_records_telemetry_and_loop_timing(tmp_path, monkeypatch):
     assert all(ms >= 0.0 for ms in rows["dt_infer_ms"] + rows["dt_send_ms"])
     meta = pq.read_schema(tmp_path / "flight.parquet").metadata
     assert meta[b"controller"] == b"rl" and b"posCtlPid.xKp" not in meta
-    assert "posCtl" not in cf.configs   # the extra 100 Hz block is only paid for in pid mode
+    assert PID_SCRIPTS[name][1] not in cf.configs   # the extra 100 Hz block is only paid for in pid mode
 
 
-def test_exec_vel_lands_after_duration(tmp_path, monkeypatch):
-    controller, cf, _, rows = fly(load_script("exec_vel", monkeypatch), tmp_path, steps=1000,
+@pytest.mark.parametrize("name", list(PID_SCRIPTS))
+def test_lands_after_duration(name, tmp_path, monkeypatch):
+    controller, cf, _, rows = fly(load_script(name, monkeypatch), tmp_path, steps=1000,
                                  controller_kwargs=dict(duration=0.2))
     assert 15 <= len(rows["step"]) <= 25 and not controller.running
     # the hand-over follows the last policy setpoint directly: no gap without a setpoint
-    assert [m for m, _ in cf.sent[-3:]] == ["send_velocity_world_setpoint", "send_notify_setpoint_stop", "land"]
+    assert [m for m, _ in cf.sent[-3:]] == [PID_SCRIPTS[name][0], "send_notify_setpoint_stop", "land"]
 
 
-def test_exec_vel_missing_log_variable_leaves_nan(tmp_path, monkeypatch):
-    """A firmware without posCtl.* must still fly the baseline, with NaN commands, not abort."""
-    mod = load_script("exec_vel", monkeypatch)
+@pytest.mark.parametrize("name", list(PID_SCRIPTS))
+def test_missing_log_variable_leaves_nan(name, tmp_path, monkeypatch):
+    """A firmware without the logged-back command must still fly the baseline, with NaN commands, not abort."""
+    mod = load_script(name, monkeypatch)
+    _, block, first_cmd = PID_SCRIPTS[name]
     real_add = FakeCf._add_config
 
     def add_config(self, logconf):
-        if logconf.name == "posCtl":
-            raise KeyError("Variable posCtl.targetVX not in TOC")
+        if logconf.name == block:
+            raise KeyError(f"Variable {block}.x not in TOC")
         real_add(self, logconf)
     monkeypatch.setattr(FakeCf, "_add_config", add_config)
     controller, cf, _, rows = fly(mod, tmp_path, steps=5, controller_kwargs=dict(controller="pid"))
     assert len(cf.calls_to("send_position_setpoint")) == 5
-    assert all(math.isnan(v) for v in rows["vx"])
+    assert all(math.isnan(v) for v in rows[first_cmd])
 
 
-def test_run_metadata_names_the_checkpoint(tmp_path, monkeypatch):
-    mod = load_script("exec_vel", monkeypatch)
+@pytest.mark.parametrize("name", list(PID_SCRIPTS))
+def test_run_metadata_names_the_checkpoint(name, tmp_path, monkeypatch):
+    mod = load_script(name, monkeypatch)
     ckpt = tmp_path / "best_agent.pt"
     ckpt.write_bytes(b"weights")
     args = argparse.Namespace(uri="fake", target=[0.0, 0.0, 1.0], duration=0.0, checkpoint=str(ckpt))
@@ -324,6 +371,8 @@ def test_run_metadata_names_the_checkpoint(tmp_path, monkeypatch):
     assert meta["checkpoint_sha256"] == hashlib.sha256(b"weights").hexdigest()
     assert (meta["obs_input_hist"], meta["action_input_hist"]) == ("2", "1") and meta["git_commit"]
     assert all(isinstance(v, str) for v in meta.values())
+
+
 
 
 def test_default_quaternion_is_identity(script):
@@ -367,13 +416,13 @@ def test_cli_shared_flags(script, monkeypatch):
 
 # ── Policy input width: K frames + M past actions ────────────────────────────
 
-def _save_checkpoint(mod, path, obs_space):
+def _save_checkpoint(mod, path, obs_space, act_space=3):
     """A checkpoint saved the way training saves one, with a non-trivial observation scaler."""
-    policy = mod.Policy(observation_space=obs_space, action_space=3, device="cpu")
+    policy = mod.Policy(observation_space=obs_space, action_space=act_space, device="cpu")
     cfg = mod.PPO_CFG(observation_preprocessor=mod.RunningStandardScaler,
                       observation_preprocessor_kwargs={"size": obs_space, "device": "cpu"})
     agent = mod.PPO(models={"policy": policy}, memory=None, cfg=cfg,
-                    observation_space=obs_space, action_space=3, device="cpu")
+                    observation_space=obs_space, action_space=act_space, device="cpu")
     agent._observation_preprocessor.running_mean.fill_(0.3)
     agent.enable_training_mode(False)
     agent.save(str(path))
@@ -385,15 +434,17 @@ def _mean_action(agent, obs):
         return agent.act(obs, None, timestep=0, timesteps=1)[1]["mean_actions"]
 
 
-def test_load_agent_roundtrip_and_wrong_width_fails(tmp_path, monkeypatch):
-    mod = load_script("exec_vel", monkeypatch)
+@pytest.mark.parametrize("name, obs_dim, act_dim", [("exec_vel", 6, 3), ("exec_rate", 18, 4)])
+def test_load_agent_roundtrip_and_wrong_width_fails(name, obs_dim, act_dim, tmp_path, monkeypatch):
+    mod = load_script(name, monkeypatch)
     monkeypatch.setattr(mod, "device", torch.device("cpu"))
     path = tmp_path / "best_agent.pt"
-    saved = _save_checkpoint(mod, path, obs_space=6 * 8 + 3 * 1)
-    loaded = mod.load_agent(str(path), torch.device("cpu"), 6 * 8 + 3 * 1)
-    obs = torch.randn(4, 51)
+    width = obs_dim * 8 + act_dim * 1
+    saved = _save_checkpoint(mod, path, obs_space=width, act_space=act_dim)
+    loaded = mod.load_agent(str(path), torch.device("cpu"), width)
+    obs = torch.randn(4, width)
     assert torch.equal(_mean_action(loaded, obs), _mean_action(saved, obs))
-    for wrong in (6, 48, 54):
+    for wrong in (obs_dim, obs_dim * 8, width + act_dim - 1):
         with pytest.raises(RuntimeError, match="size mismatch"):
             mod.load_agent(str(path), torch.device("cpu"), wrong)
 
@@ -455,35 +506,37 @@ def test_obs_hist_comes_from_the_training_run(tmp_path, monkeypatch):
     assert mod.resolve_obs_hist(None, None, None) == (1, 0)
 
 
-def test_cli_sizes_the_policy_from_env_yaml_and_rejects_a_conflict(tmp_path, monkeypatch):
-    mod = load_script("exec_vel", monkeypatch)
+@pytest.mark.parametrize("name, obs_dim, act_dim", [("exec_vel", 6, 3), ("exec_rate", 18, 4)])
+def test_cli_sizes_the_policy_from_env_yaml_and_rejects_a_conflict(name, obs_dim, act_dim, tmp_path, monkeypatch):
+    mod = load_script(name, monkeypatch)
     ckpt = _run_dir(tmp_path, "run", ENV_YAML.format(k=8, m=1))
     seen = []
-    monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt])
+    monkeypatch.setattr(sys, "argv", [name, "--checkpoint", ckpt])
     monkeypatch.setattr(mod, "load_agent", lambda *a: seen.append(a) or (_ for _ in ()).throw(_StopBeforeFlight()))
     with pytest.raises(_StopBeforeFlight):
         mod.main()
-    assert seen[0][2] == 6 * 8 + 3 * 1
+    assert seen[0][2] == obs_dim * 8 + act_dim * 1
     for bad in (["--obs-input-hist", "4"], ["--obs-input-hist", "0"], ["--action-input-hist", "-1"]):
-        monkeypatch.setattr(sys, "argv", ["exec_vel", "--checkpoint", ckpt] + bad)
+        monkeypatch.setattr(sys, "argv", [name, "--checkpoint", ckpt] + bad)
         with pytest.raises(SystemExit):     # before load_agent, so before the radio
             mod.main()
     assert len(seen) == 1
 
 
-def test_cli_pid_needs_no_checkpoint_and_rejects_one(monkeypatch):
-    mod = load_script("exec_vel", monkeypatch)
+@pytest.mark.parametrize("name", list(PID_SCRIPTS))
+def test_cli_pid_needs_no_checkpoint_and_rejects_one(name, monkeypatch):
+    mod = load_script(name, monkeypatch)
     seen = []
     monkeypatch.setattr(mod, "load_agent", lambda *a: pytest.fail("pid must not load a policy"))
     monkeypatch.setattr(mod, "CrazyflieController",
                         lambda **kw: seen.append(kw) or (_ for _ in ()).throw(_StopBeforeFlight()))
-    monkeypatch.setattr(sys, "argv", ["exec_vel", "--controller", "pid", "--duration", "5", "--target", "0", "0", "1"])
+    monkeypatch.setattr(sys, "argv", [name, "--controller", "pid", "--duration", "5", "--target", "0", "0", "1"])
     with pytest.raises(_StopBeforeFlight):
         mod.main()
     assert (seen[0]["controller"], seen[0]["agent"], seen[0]["duration"]) == ("pid", None, 5.0)
     assert "checkpoint" not in seen[0]["metadata"]
     for bad in ([], ["--controller", "pid", "--checkpoint", "x.pt"], ["--duration", "-1"], ["--controller", "lqr"]):
-        monkeypatch.setattr(sys, "argv", ["exec_vel"] + bad)
+        monkeypatch.setattr(sys, "argv", [name] + bad)
         with pytest.raises(SystemExit):
             mod.main()
     assert len(seen) == 1
