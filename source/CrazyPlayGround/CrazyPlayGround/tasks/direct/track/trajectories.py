@@ -22,10 +22,11 @@ from isaaclab.utils.math import quat_apply
 # Trajectory functions
 # ---------------------------------------------------------------------------
 
-def lemniscate(t: Tensor, c: float = 0.0) -> Tensor:
+def lemniscate(t: Tensor, c: float | Tensor = 0.0) -> Tensor:
     """Figure-8 (lemniscate of Bernoulli) in the XY plane.
 
-    ``c`` adds a Z coupling so the figure-8 gains a vertical component.
+    ``c`` adds a Z coupling so the figure-8 gains a vertical component. It is a float, or a
+    tensor that broadcasts to ``t`` (e.g. ``[N, 1]`` for one value per env).
     """
     denom = 1.0 + torch.sin(t) ** 2
     x = torch.cos(t) / denom
@@ -47,19 +48,6 @@ def vertical_circle(t: Tensor) -> Tensor:
     x = torch.cos(t)
     y = torch.zeros_like(t)
     z = torch.sin(t)
-    return torch.stack([x, y, z], dim=-1)
-
-
-def helix(t: Tensor, pitch: float = 0.3) -> Tensor:
-    """Circle in XY with a linear Z rise per revolution.
-
-    Z rises by ``pitch`` per full revolution (2π in t).
-    """
-    x = torch.cos(t)
-    y = torch.sin(t)
-    z = pitch * t / (2.0 * torch.pi)
-    # Centre z around zero so the trajectory starts near the origin
-    z = z - z.mean(dim=-1, keepdim=True)
     return torch.stack([x, y, z], dim=-1)
 
 
@@ -118,7 +106,6 @@ TRAJECTORIES: dict[str, callable] = {
     "lemniscate": lemniscate,
     "circle": circle,
     "vertical_circle": vertical_circle,
-    "helix": helix,
     "sine_wave": sine_wave,
     "epitrochoid": epitrochoid,
     "trefoil": trefoil,
@@ -162,3 +149,61 @@ def apply_traj_transform(
     pos_world = pos_rot + offset.unsqueeze(1)  # [N, 1, 3] → [N, steps, 3]
 
     return pos_world
+
+
+# ---------------------------------------------------------------------------
+# Arc-length resampling
+# ---------------------------------------------------------------------------
+
+def resample_by_arc_length(points: Tensor, k: int) -> tuple[Tensor, Tensor]:
+    """Resample a densely sampled lap into ``k`` segments of equal length.
+
+    Args:
+        points: [N, M+1, 3] dense samples of one lap, first to last, m (already scaled).
+        k:      number of equal segments.
+
+    Returns:
+        waypoints: [N, k+1, 3] points at arc lengths 0, L/k, ..., L, m. The first and last are
+                   the first and last dense samples.
+        length:    [N] lap length L, m.
+    """
+    m = points.shape[1] - 1
+    seg_norm = torch.linalg.norm(points[:, 1:] - points[:, :-1], dim=-1)                  # [N, M]
+    cum_norm = torch.cat([torch.zeros_like(seg_norm[:, :1]), torch.cumsum(seg_norm, dim=1)], dim=1)  # [N, M+1]
+    length = cum_norm[:, -1]
+    targets = torch.linspace(0.0, 1.0, k + 1, device=points.device) * length.unsqueeze(1)  # [N, k+1]
+    # dense segment holding each target; the last target (= L) falls in the last segment
+    idx = (torch.searchsorted(cum_norm, targets.contiguous(), right=True) - 1).clamp(0, m - 1)
+    c0, c1 = cum_norm.gather(1, idx), cum_norm.gather(1, idx + 1)
+    frac = ((targets - c0) / (c1 - c0).clamp_min(1e-12)).clamp(0.0, 1.0).unsqueeze(-1)  # [N, k+1, 1]
+    gather_idx = idx.unsqueeze(-1).expand(-1, -1, 3)
+    p0 = points.gather(1, gather_idx)
+    p1 = points.gather(1, gather_idx + 1)
+    return p0 + frac * (p1 - p0), length
+
+
+def interp_waypoints(waypoints: Tensor, length: Tensor, distance: Tensor) -> Tensor:
+    """Point at a given distance along a closed lap of equally spaced waypoints, lap after lap.
+
+    The point is the linear interpolation of the two waypoints around ``distance``, so it moves
+    at a constant speed when ``distance`` grows linearly in time.
+
+    Args:
+        waypoints: [N, k+1, 3] waypoints spaced ``length / k`` apart along the curve, m
+                   (closed: the last one equals the first).
+        length:    [N] lap length, m.
+        distance:  [N, S] distance travelled from waypoint 0, m (>= 0).
+
+    Returns:
+        [N, S, 3] positions, m.
+    """
+    k = waypoints.shape[1] - 1
+    length = length.unsqueeze(1)                     # [N, 1]
+    lap = torch.floor(distance / length)             # [N, S] completed laps
+    u = (distance - lap * length) * (k / length)     # [N, S] position in segments
+    idx = torch.floor(u).long().clamp(0, k - 1)
+    frac = (u - idx).clamp(0.0, 1.0).unsqueeze(-1)   # [N, S, 1]
+    gather_idx = idx.unsqueeze(-1).expand(-1, -1, 3)
+    p0 = waypoints.gather(1, gather_idx)
+    p1 = waypoints.gather(1, gather_idx + 1)
+    return p0 + frac * (p1 - p0)
