@@ -52,6 +52,8 @@ python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/
 python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/2M/E7E7E7E7E8 
 ```
 
+`hover/exec_rate.py` flies a `Rate-Hovering` policy (body rates + thrust). It takes the same `--controller rl|pid`, `--duration`, `--obs-input-hist` / `--action-input-hist` and recording flags as `hover/exec_vel.py`, plus the thrust mapping: `--hover-thrust-pct` (default 77 %, measured on our drone) and `--min-thrust-pct`; the policy's full-thrust action is always cflib's 100 % (60000 PWM), with no cap. Both controllers take off with the high-level commander (0.5 m in 3 s, then 1 s to settle), so takeoff does not depend on `--hover-thrust-pct`. With `--controller pid`, the firmware position PID then flies to `--target`. Its rate and thrust commands are logged back into the same `cmd` columns as an RL flight.
+
 <!-- execution/single_drone_exec/: hover, traj_tracking -->
 
 ### Trajectory tracking (single drone)
