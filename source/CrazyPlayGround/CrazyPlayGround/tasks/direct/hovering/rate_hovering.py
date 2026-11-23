@@ -273,8 +273,8 @@ class QuadcopterEnv(DirectRLEnv):
         buf_len = max(cfg.action_input_hist, self.delay_max_steps + 1, 2)
         self.cmd_history = torch.full((n, buf_len, ACTION_DIM), cfg.history_fill_value, device=dev)
         self.delay_steps = torch.full((n,), self.delay_min_steps, dtype=torch.long, device=dev)
-        # warm-up hold: True while the episode is younger than its latency (no command arrived yet)
-        self._hold = torch.zeros(n, dtype=torch.bool, device=dev)
+        # True: default command until the delayed action reaches the env
+        self._hold_cmd = torch.zeros(n, dtype=torch.bool, device=dev)
         self._hold_ids = torch.zeros(0, dtype=torch.long, device=dev)
         # exact weight from the simulated masses (all links), so the hold cancels gravity exactly
         gravity = torch.tensor(self.sim.cfg.gravity).norm().item()
@@ -301,13 +301,13 @@ class QuadcopterEnv(DirectRLEnv):
         or 0 during the warm-up hold (overridden by the hold force in _apply_action)."""
         commanded = actions.clamp(-1.0, 1.0)
         self.cmd_history = torch.cat([self.cmd_history[:, 1:], commanded.unsqueeze(1)], dim=1)
-        slot = self.cmd_history.shape[1] - 1 - self.delay_steps  # [N]
-        delayed = self.cmd_history[self._env_idx, slot]          # [N, 4]: env i, slot[i]
+        slot = self.cmd_history.shape[1] - 1 - self.delay_steps  # [N], N = num_envs
+        delayed = self.cmd_history[self._env_idx, slot]          # [N, A], A = ACTION_DIM: env i, slot[i]
         # _traj_rollout_idx = steps already taken this episode: steps 0..d-1 hold, step d gets c_0
-        self._hold = self._traj_rollout_idx < self.delay_steps
+        self._hold_cmd = self._traj_rollout_idx < self.delay_steps  # True: default command until the delayed action reaches the env
         if self.delay_max_steps > 0:
-            self._hold_ids = self._hold.nonzero().squeeze(-1)  # once per policy step, not per physics step
-        self._actions = torch.where(self._hold.unsqueeze(-1), 0.0, delayed)
+            self._hold_ids = self._hold_cmd.nonzero().squeeze(-1)  # once per policy step, not per physics step
+        self._actions = torch.where(self._hold_cmd.unsqueeze(-1), 0.0, delayed)
 
         # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s,
         # with per-env DR multiplier on the rate setpoint.
@@ -399,7 +399,7 @@ class QuadcopterEnv(DirectRLEnv):
             "action_rate": action_rate_sq * self.cfg.action_rate_reward_scale * self.step_dt,
         }
         # warm-up hold: the drone is frozen whatever the policy does, so nothing is rewarded
-        active = (~self._hold).float()
+        active = (~self._hold_cmd).float()
         rewards = {key: value * active for key, value in rewards.items()}
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         for key, value in rewards.items():
@@ -498,7 +498,7 @@ class QuadcopterEnv(DirectRLEnv):
             self.delay_min_steps, self.delay_max_steps + 1, (len(env_ids),), device=self.device
         )
         self.obs_window_fresh[env_ids] = True
-        self._hold[env_ids] = False
+        self._hold_cmd[env_ids] = False
 
         # Sample new domain-randomization values for the reset envs.
         if self.cfg.domain_rand:
