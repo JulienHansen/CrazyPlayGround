@@ -265,7 +265,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 def evaluate(env, runner, obs, csv_path: str):
     """Fly one full-length episode per env with mean actions and write its per-episode metrics to a CSV.
 
-    Needs an env that fills ``extras["step_metrics"]`` at reset: Vel-Hovering (step response) or
+    Needs an env that fills ``extras["step_metrics"]`` at reset: Vel- or Rate-Hovering (step response) or
     the tracking envs (tracking error, effort). The spawn, goal and trajectory draws follow
     ``--seed``, so two checkpoints evaluated with the same seed and ``--num_envs`` fly the same
     episodes.
