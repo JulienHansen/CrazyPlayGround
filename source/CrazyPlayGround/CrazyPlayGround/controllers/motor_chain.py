@@ -7,13 +7,14 @@ Turns the rate-PID output into the body wrench the way the drone does:
 2. legacy mixer, ``collective ± roll/2 ± pitch/2 ± yaw`` per motor;
 3. thrust cap: the excess over 65535 is taken from all four motors, then negatives clip to 0;
 4. command → thrust, ``F = cmd · THRUST_MAX / 65535`` per motor, off below THRUST_MIN;
-5. first-order lag per motor (time constant tau, per env);
+5. first-order lag per motor on the thrust, ``tau_up`` when it rises and ``tau_down`` when it falls (per env);
 6. motor thrusts → body wrench (total thrust along +z, roll/pitch from the arms, yaw from drag).
 
 All parameters are passed in from ``crazyflie.yaml`` (``drone.max_thrust``, ``drone.motor``,
 ``drone.firmware``); this file holds no parameter values. They are the CF2.1 brushed with 2.1+
 propellers values of the Crazyflie firmware 2026.08: ``src/platform/interface/platform_defaults_cf2.h``
-(``CONFIG_CRAZYFLIE_21_PLUS``), used in ``power_distribution_quadrotor.c`` and ``motors.c``.
+(``CONFIG_CRAZYFLIE_21_PLUS``), used in ``power_distribution_quadrotor.c`` and ``motors.c``; the motor
+time constants and the thrust curve (``thrust_to_omega``) are Crazyflow ``cf2x_P250``'s.
 Body frame is FLU (x forward, y left, z up), as in Isaac Lab.
 """
 
@@ -22,6 +23,26 @@ from __future__ import annotations
 import math
 
 import torch
+
+
+def thrust_to_omega(force: torch.Tensor, rpm2thrust: tuple[float, float, float]) -> torch.Tensor:
+    """Rotor speed from per-motor thrust, the inverse of ``F = c0 + c1·rpm + c2·rpm²``.
+
+    Static map: the motor lag sits on the thrust in ``CrazyflieMotorChain``, so this gives the speed
+    of a rotor that produces ``force`` now.
+
+    Args:
+        force: Per-motor thrust [N], any shape (e.g. ``(num_envs, 4)``).
+        rpm2thrust: ``(c0, c1, c2)`` of the thrust curve (``drone.motor.rpm2thrust``), rpm in rev/min.
+
+    Returns:
+        Rotor speed [rad/s], same shape as ``force``; 0 where ``force <= 0`` (motor off).
+    """
+    c0, c1, c2 = rpm2thrust
+    disc = torch.clamp(c1 * c1 + 4.0 * c2 * (force - c0), min=0.0)
+    rpm = (-c1 + torch.sqrt(disc)) / (2.0 * c2)
+    # with c1 < 0 the positive root at F = 0 is -c1/c2 (~2254 rpm), not 0: a motor with no thrust is off
+    return torch.where(force > 0.0, rpm * (2.0 * math.pi / 60.0), torch.zeros_like(force))
 
 
 class CrazyflieMotorChain:
@@ -37,7 +58,8 @@ class CrazyflieMotorChain:
         thrust_min: Per-motor thrust below which the firmware switches the motor off [N].
         arm_length: Centre-to-motor distance [m].
         thrust2torque: Yaw drag torque per newton of thrust [m] (firmware THRUST2TORQUE).
-        tau: Motor time constant [s]; 0 means no lag.
+        tau_up: Motor time constant when the thrust rises [s]; 0 means no lag.
+        tau_down: Motor time constant when the thrust falls [s]; 0 means no lag.
         motor_cmd_max: Motor command full scale (firmware uint16, 65535).
         control_cmd_max: Saturation of the roll/pitch/yaw control outputs (firmware int16, 32767).
     """
@@ -52,7 +74,8 @@ class CrazyflieMotorChain:
         thrust_min: float,
         arm_length: float,
         thrust2torque: float,
-        tau: float,
+        tau_up: float,
+        tau_down: float,
         motor_cmd_max: float,
         control_cmd_max: float,
     ) -> None:
@@ -69,24 +92,35 @@ class CrazyflieMotorChain:
         self.motor_y = torch.tensor([-arm_xy, -arm_xy, arm_xy, arm_xy], device=self.device)
         # yaw reaction: M1/M3 spin CCW (react -z), M2/M4 spin CW (react +z)
         self.spin = torch.tensor([-1.0, 1.0, -1.0, 1.0], device=self.device)
-        self.blend = torch.ones(self.num_envs, 1, device=self.device)
-        self.set_tau(tau)
+        # per-step blend factors 1 - exp(-dt / tau), (num_envs, 1)
+        self.blend_up = torch.ones(self.num_envs, 1, device=self.device)
+        self.blend_down = torch.ones(self.num_envs, 1, device=self.device)
+        self.set_tau(tau_up, tau_down)
         self.motor_forces = torch.zeros(self.num_envs, 4, device=self.device)
 
-    def set_tau(self, tau: float | torch.Tensor, env_ids: torch.Tensor | None = None) -> None:
-        """Set the motor time constant.
+    def set_tau(
+        self,
+        tau_up: float | torch.Tensor,
+        tau_down: float | torch.Tensor,
+        env_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Set the spin-up and spin-down time constants.
 
         Args:
-            tau: Time constant [s], a float or a ``(len(env_ids),)`` tensor; 0 means no lag.
+            tau_up: Time constant when the thrust rises [s], a float or a ``(len(env_ids),)`` tensor;
+                0 means no lag.
+            tau_down: Time constant when the thrust falls [s], same form as ``tau_up``.
             env_ids: Envs to update; None updates all.
         """
-        tau = torch.as_tensor(tau, device=self.device, dtype=torch.float32)
-        blend = torch.where(tau > 0.0, -torch.expm1(-self.dt / tau.clamp(min=1e-9)), torch.ones_like(tau))
-        if env_ids is None:
-            self.blend[:] = blend.reshape(-1, 1) if blend.dim() else blend
-        else:
-            ids = env_ids.to(dtype=torch.long, device=self.device)
-            self.blend[ids] = blend.reshape(-1, 1) if blend.dim() else blend
+        ids = None if env_ids is None else env_ids.to(dtype=torch.long, device=self.device)
+        for blend_buf, tau in ((self.blend_up, tau_up), (self.blend_down, tau_down)):
+            tau = torch.as_tensor(tau, device=self.device, dtype=torch.float32)
+            blend = torch.where(tau > 0.0, -torch.expm1(-self.dt / tau.clamp(min=1e-9)), torch.ones_like(tau))
+            blend = blend.reshape(-1, 1) if blend.dim() else blend
+            if ids is None:
+                blend_buf[:] = blend
+            else:
+                blend_buf[ids] = blend
 
     def reset(self, env_ids: torch.Tensor | None, motor_force: float) -> None:
         """Set the motors' thrust, e.g. to hover (``mass · g / 4``), so episodes start without a drop.
@@ -148,7 +182,8 @@ class CrazyflieMotorChain:
         # per-motor thrust the command asks for [N], before the motor lag
         force_target = self.motor_commands(thrust_cmd, alpha_ref) * self.newton_per_cmd
         force_target = torch.where(force_target < self.thrust_min, torch.zeros_like(force_target), force_target)
-        self.motor_forces = self.motor_forces + self.blend * (force_target - self.motor_forces)
+        blend = torch.where(force_target > self.motor_forces, self.blend_up, self.blend_down)
+        self.motor_forces = self.motor_forces + blend * (force_target - self.motor_forces)
         force = self.motor_forces
         thrust = force.sum(dim=-1, keepdim=True)
         torque_b = torch.stack(

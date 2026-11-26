@@ -1,7 +1,8 @@
 """Firmware motor chain (mixer, cap, thrust map, motor lag) and its use in CascadePIDController.
 
 Expected values come from the Crazyflie firmware constants (CF2.1 brushed, 2.1+ props):
-THRUST_MAX 0.12 N per motor at command 65535, ARM_LENGTH 0.046 m, THRUST2TORQUE 0.00699 m.
+THRUST_MAX 0.12 N per motor at command 65535, ARM_LENGTH 0.046 m, THRUST2TORQUE 0.00699 m;
+and from Crazyflow cf2x_P250: 31.8 g, hover at 23 192 rpm = 2429 rad/s per motor.
 """
 
 import math
@@ -14,7 +15,8 @@ import torch
 PKG = os.path.join(os.path.dirname(__file__), "..", "source", "CrazyPlayGround", "CrazyPlayGround")
 sys.path.append(PKG)
 from controllers import CascadePIDController, load_config  # noqa: E402
-from controllers.motor_chain import CrazyflieMotorChain  # noqa: E402
+from controllers.config import resolve_max_thrust_scale, rpm_to_thrust  # noqa: E402
+from controllers.motor_chain import CrazyflieMotorChain, thrust_to_omega  # noqa: E402
 
 DT = 1.0 / 500.0
 K = 0.12 / 65535.0                 # N per command unit, per motor
@@ -22,9 +24,10 @@ D = 0.046 * math.sqrt(0.5)         # lever arm about x and y [m]
 YAML = os.path.join(PKG, "controllers", "crazyflie.yaml")
 
 
-def chain(n=1, tau=0.0):
+def chain(n=1, tau=0.0, tau_down=None):
     """Motor chain with the parameters of crazyflie.yaml; the expected values above stay
-    hardcoded on purpose, as an independent check of those parameters."""
+    hardcoded on purpose, as an independent check of those parameters. ``tau_down`` defaults
+    to ``tau`` (symmetric lag)."""
     phys = load_config(YAML).physics
     return CrazyflieMotorChain(
         num_envs=n,
@@ -34,7 +37,8 @@ def chain(n=1, tau=0.0):
         thrust_min=phys.motor.thrust_min,
         arm_length=phys.motor.arm_length,
         thrust2torque=phys.motor.thrust2torque,
-        tau=tau,
+        tau_up=tau,
+        tau_down=tau if tau_down is None else tau_down,
         motor_cmd_max=phys.firmware.motor_cmd_max,
         control_cmd_max=phys.firmware.control_cmd_max,
     )
@@ -116,13 +120,75 @@ def test_lag_reaches_63_percent_after_one_time_constant():
 
 def test_tau_per_env_and_zero_tau():
     c = chain(n=3, tau=0.072)
-    c.set_tau(torch.tensor([0.0, 0.03, 0.09]), torch.tensor([0, 1, 2]))
+    taus = torch.tensor([0.0, 0.03, 0.09])
+    c.set_tau(taus, taus, torch.tensor([0, 1, 2]))
     c.reset(None, 0.0)
     thrust, _ = wrench(c, 36000, torch.zeros(3, 3))
     target = 4 * 36000 * K
     assert thrust[0].item() == pytest.approx(target, rel=1e-6)                      # no lag
     assert thrust[1].item() == pytest.approx(target * (1 - math.exp(-DT / 0.03)), rel=1e-4)
     assert thrust[2].item() == pytest.approx(target * (1 - math.exp(-DT / 0.09)), rel=1e-4)
+
+
+def test_lag_uses_tau_up_on_rise_and_tau_down_on_fall():
+    tau_up, tau_down = 0.1117, 0.1029
+    c = chain(tau=tau_up, tau_down=tau_down)
+    target = 4 * 36000 * K
+    # spin-up from 0: 63 % of the step after tau_up
+    c.reset(None, 0.0)
+    steps = round(tau_up / DT)
+    for _ in range(steps):
+        thrust, _ = wrench(c, 36000, torch.zeros(1, 3))
+    assert thrust.item() / target == pytest.approx(1 - math.exp(-steps * DT / tau_up), rel=1e-4)
+    # spin-down from the target to 0 (command below THRUST_MIN): 63 % of the drop after tau_down
+    c.reset(None, target / 4)
+    steps = round(tau_down / DT)
+    for _ in range(steps):
+        thrust, _ = wrench(c, 0, torch.zeros(1, 3))
+    assert 1 - thrust.item() / target == pytest.approx(1 - math.exp(-steps * DT / tau_down), rel=1e-4)
+
+
+def test_thrust_curve_inverse_at_hover_and_zero():
+    motor = load_config(YAML).physics.motor
+    hover_force = 0.0318 * 9.81 / 4  # 0.07799 N per motor
+    omega = thrust_to_omega(torch.tensor([hover_force, 0.0, -0.01]), motor.rpm2thrust)
+    assert omega[0].item() == pytest.approx(2429.0, rel=1e-3)  # 23 192 rpm (Crazyflow cf2x_P250)
+    assert omega[1].item() == 0.0 and omega[2].item() == 0.0   # motor off, not the 2254 rpm root
+    # round trip through the curve
+    rpm = omega[0].item() * 60.0 / (2.0 * math.pi)
+    assert rpm_to_thrust(rpm, motor.rpm2thrust) == pytest.approx(hover_force, rel=1e-5)
+
+
+def test_speed_max_gives_thrust_max():
+    motor = load_config(YAML).physics.motor
+    rpm = motor.speed_max * 60.0 / (2.0 * math.pi)
+    assert rpm_to_thrust(rpm, motor.rpm2thrust) == pytest.approx(0.12, rel=1e-3)
+    assert thrust_to_omega(torch.tensor([0.12]), motor.rpm2thrust).item() == pytest.approx(motor.speed_max, rel=1e-3)
+
+
+def test_bad_speed_max_is_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    with open(YAML, encoding="utf-8") as f:
+        bad.write_text(f.read().replace("speed_max:  2983.0", "speed_max:  2618.0"))
+    with pytest.raises(ValueError, match="speed_max"):
+        load_config(bad)
+
+
+def test_max_thrust_scale_derived_from_cap():
+    phys = load_config(YAML).physics
+    assert resolve_max_thrust_scale(None, phys.mass, phys.max_thrust) == pytest.approx(1.5387, abs=1e-4)
+    assert resolve_max_thrust_scale(1.2, phys.mass, phys.max_thrust) == 1.2
+    with pytest.raises(ValueError, match="max_thrust_scale"):
+        resolve_max_thrust_scale(1.8, phys.mass, phys.max_thrust)
+
+
+def test_set_motor_tau_down_defaults_to_up():
+    ctrl = controller(n=2)
+    tau = torch.tensor([0.1, 0.12])
+    ctrl.set_motor_tau(tau, torch.tensor([0, 1]))
+    expected = -torch.expm1(-DT / tau)
+    assert torch.allclose(ctrl.motor_chain.blend_down.view(-1), expected, rtol=1e-5)
+    assert torch.allclose(ctrl.motor_chain.blend_up.view(-1), expected, rtol=1e-5)
 
 
 def test_reset_puts_motors_at_value_for_given_envs():
@@ -147,7 +213,7 @@ def root_state(ang_vel_b):
 
 def test_controller_units_and_hover_reset():
     ctrl = controller(n=2)
-    mg = 0.027 * 9.81
+    mg = load_config(YAML).physics.mass * 9.81
     assert ctrl.thrust_cmd_scale == pytest.approx(4 * K)
     assert ctrl.thrust_base_cmd == 36000.0
     ctrl.reset()
@@ -171,7 +237,7 @@ def roll_step(tau, rate_sp=1.0, duration=0.5, substeps=20):
     ctrl.reset()
     ixx = load_config(YAML).physics.inertia.ixx
     w = torch.zeros(1, 3)
-    hover_cmd = 0.027 * 9.81 / ctrl.thrust_cmd_scale
+    hover_cmd = load_config(YAML).physics.mass * 9.81 / ctrl.thrust_cmd_scale
     out = []
     for _ in range(round(duration / DT)):
         _, moment = ctrl(
