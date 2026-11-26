@@ -54,6 +54,18 @@ python exec_vel.py --checkpoint ../checkpoints/best_agent.pt --uri radio://0/80/
 
 <!-- execution/single_drone_exec/: hover, traj_tracking -->
 
+### Trajectory tracking (single drone)
+
+`execution/single_drone_exec/traj_tracking/exec_vel.py` flies a `Vel-Tracking` policy along the lemniscate:
+
+```bash
+python exec_vel.py --checkpoint logs/skrl/<dir>/<run>/checkpoints/best_agent.pt --uri radio://0/40/2M/E7E7E7E7E8
+```
+
+- A policy trained with history (`obs_input_hist` K frames, `action_input_hist` M past actions) gets the same input as in the env: the last K 22-D frames, oldest first and primed with copies of the first, then the last M commanded actions. K and M are read from the run's `params/env.yaml`, next to `checkpoints/`.
+- `--obs-input-hist K` / `--action-input-hist M` are only needed for a checkpoint copied out of its run; a flag that disagrees with `env.yaml` is an error.
+- The two-drone script (`execution/multi_drones_exec/traj_tracking/exec_vel.py`) still takes only policies trained without history (22-D input).
+
 ## Multi-drone execution
 
 <!-- execution/multi_drones_exec/ -->

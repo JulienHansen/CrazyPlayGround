@@ -405,6 +405,13 @@ def _run_dir(tmp_path, name, env_yaml):
     return str(run / "checkpoints" / "best_agent.pt")
 
 
+def _export_dir(tmp_path, name, env_yaml):
+    """An exported checkpoint: <name>.pt with its run's env.yaml in <name>_params/ beside it."""
+    (tmp_path / f"{name}_params").mkdir(parents=True)
+    (tmp_path / f"{name}_params" / "env.yaml").write_text(env_yaml)
+    return str(tmp_path / f"{name}.pt")
+
+
 ENV_YAML = """viewer:
   eye: !!python/tuple
   - 7.5
@@ -428,6 +435,18 @@ def test_obs_hist_comes_from_the_training_run(tmp_path, monkeypatch):
         mod.resolve_obs_hist(k2m0, 1, None)
     with pytest.raises(ValueError, match="--action-input-hist 2 disagrees"):
         mod.resolve_obs_hist(k2m0, None, 2)
+    # an exported checkpoint reads <name>_params/env.yaml, the same two ways apart
+    assert mod.resolve_obs_hist(_export_dir(tmp_path, "best_k1m2", ENV_YAML.format(k=1, m=2)), None, None) == (1, 2)
+    exported = _export_dir(tmp_path, "best_k2m0", ENV_YAML.format(k=2, m=0))
+    assert mod.resolve_obs_hist(exported, None, None) == (2, 0)
+    with pytest.raises(ValueError, match="--obs-input-hist 1 disagrees"):
+        mod.resolve_obs_hist(exported, 1, None)
+    # an export kept inside a run's checkpoints/: its own <name>_params/ wins over the run's params/
+    inside = _run_dir(tmp_path, "both", ENV_YAML.format(k=1, m=2))
+    os.makedirs(inside[:-len(".pt")] + "_params")
+    with open(os.path.join(inside[:-len(".pt")] + "_params", "env.yaml"), "w") as f:
+        f.write(ENV_YAML.format(k=4, m=1))
+    assert mod.resolve_obs_hist(inside, None, None) == (4, 1)
     # no env.yaml, or one written before WP1 (no knobs): the flags, then K=1, M=0
     pre_wp1 = _run_dir(tmp_path, "pre_wp1", "observation_space: 6\nhistory_len: 8\n")
     loose = str(tmp_path / "loose.pt")

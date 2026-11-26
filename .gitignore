@@ -25,6 +25,7 @@ logs/
 outputs/
 runs/
 flights/
+checkpoints/
 *.parquet
 
 # Weights & Biases
