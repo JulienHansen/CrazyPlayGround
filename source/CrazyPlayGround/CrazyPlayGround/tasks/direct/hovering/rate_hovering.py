@@ -15,6 +15,15 @@ Distance curriculum (``distance_reward_curriculum_ratio > 0``): L decays exponen
 ``total_steps`` is injected by ``scripts/skrl/train.py``.
 
 Metrics: step response spawn -> goal (``step_response.py``) in ``Metrics/*`` and ``extras["step_metrics"]``; effort = mean ||c||^2 from 0.
+
+History and latency (all off by default). Observation, oldest first:
+    [obs_input_hist x 18-D frame, action_input_hist x 4 last commanded actions]
+At reset the frame window is refilled with copies of the first frame and the action slots
+hold ``history_fill_value``. The command sent at step t reaches the controller at t + d, with
+d drawn per episode from [action_latency_steps, action_latency_max_steps]. Warm-up hold: for
+the first d steps there is no command to fly, so the drone is frozen at spawn by an exact m*g
+force (controller bypassed, reward 0); at step d the controller gets c_0. The action-rate
+penalty ||c_t - c_{t-1}||^2 is on the commanded actions and is 0 at step 0.
 """
 
 from __future__ import annotations
@@ -47,6 +56,8 @@ _DEFAULT_DRONE_CONFIG = str(
 )
 
 logger = logging.getLogger(__name__)
+BASE_OBS_DIM = 18  # [lin_vel_b(3), desired_pos_b(3), rot_mat(9), ang_vel_b(3)]
+ACTION_DIM = 4     # [p, q, r, T]
 
 class QuadcopterEnvWindow(BaseEnvWindow):
     """Window manager for the Quadcopter environment."""
@@ -124,6 +135,14 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     add_noise = False
     noise_std = 0.01
 
+    # ── sim-to-real knobs; every default reproduces the plain task ──
+    obs_input_hist: int = 1     # observation frames in the policy input; 1 = no stacking
+    action_input_hist: int = 0  # past commands in the policy input; 0 = none
+    # delay in policy steps between sending a command and the controller using it
+    action_latency_steps: int = 0
+    action_latency_max_steps: int = 0      # > action_latency_steps: drawn per episode; 0 = fixed
+    action_rate_reward_scale: float = 0.0  # weight on ||c_t - c_{t-1}||^2; negative = penalty
+
     # ── Domain randomization ──────────────────────────────────────
     domain_rand = False
     # max-thrust variability (battery / propellers / motor wear).
@@ -148,6 +167,14 @@ def check_cfg(cfg: QuadcopterEnvCfg):
             f"got ({cfg.min_thrust_scale}, {cfg.max_thrust_scale})",
         ),
         (0.0 <= tau_lo <= tau_hi, f"motor_tau_range must satisfy 0 <= min <= max, got {cfg.motor_tau_range}"),
+        (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
+        (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
+        (cfg.action_latency_steps >= 0, f"action_latency_steps must be >= 0, got {cfg.action_latency_steps}"),
+        (
+            not cfg.action_latency_max_steps or cfg.action_latency_max_steps >= cfg.action_latency_steps,
+            f"action_latency_max_steps must be 0 or >= action_latency_steps ({cfg.action_latency_steps}), "
+            f"got {cfg.action_latency_max_steps}",
+        ),
         (
             not -1.0 <= cfg.history_fill_value <= 1.0,
             f"history_fill_value must lie outside the action range [-1, 1], got {cfg.history_fill_value}",
@@ -185,8 +212,10 @@ class QuadcopterEnv(DirectRLEnv):
     cfg: QuadcopterEnvCfg
 
     def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
-        # Hydra applies CLI overrides after the cfg is built, so validate here, not in the cfg
+        # Hydra applies CLI overrides after the cfg is built, so validate and size the
+        # spaces here; a wrong size makes skrl silently reshape [N, D] into [N*x, D/x].
         check_cfg(cfg)
+        cfg.observation_space = BASE_OBS_DIM * cfg.obs_input_hist + ACTION_DIM * cfg.action_input_hist
         super().__init__(cfg, render_mode, **kwargs)
 
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
@@ -200,6 +229,7 @@ class QuadcopterEnv(DirectRLEnv):
                 "lin_vel",
                 "ang_vel",
                 "distance_to_goal",
+                "action_rate",
             ]
         }
         self._body_id = self._robot.find_bodies("body")[0]
@@ -231,6 +261,25 @@ class QuadcopterEnv(DirectRLEnv):
         self._dr_thrust_bias_n = torch.zeros(self.num_envs, device=self.device)
         self._dr_rate_scale = torch.ones(self.num_envs, device=self.device)
         self._distance_reward_scales = torch.tensor(self.cfg.distance_reward_scales, device=self.device)
+
+        self.delay_min_steps = cfg.action_latency_steps
+        self.delay_max_steps = max(cfg.action_latency_steps, cfg.action_latency_max_steps)
+        self.obs_window = torch.zeros(n, cfg.obs_input_hist, BASE_OBS_DIM, device=dev)
+        # True for envs just reset: _get_observations refills their window (see its docstring)
+        self.obs_window_fresh = torch.ones(n, dtype=torch.bool, device=dev)
+        # last commanded actions, newest last; feeds the action history, the latency and the
+        # action-rate penalty. Length >= 2 so the penalty always has a previous command.
+        # Empty slots hold history_fill_value (-10), never sent to the controller: a = 0 is a climb.
+        buf_len = max(cfg.action_input_hist, self.delay_max_steps + 1, 2)
+        self.cmd_history = torch.full((n, buf_len, ACTION_DIM), cfg.history_fill_value, device=dev)
+        self.delay_steps = torch.full((n,), self.delay_min_steps, dtype=torch.long, device=dev)
+        # True: default command until the delayed action reaches the env
+        self._hold_cmd = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._hold_ids = torch.zeros(0, dtype=torch.long, device=dev)
+        # exact weight from the simulated masses (all links), so the hold cancels gravity exactly
+        gravity = torch.tensor(self.sim.cfg.gravity).norm().item()
+        self._hold_force = self._robot.root_physx_view.get_masses().sum(dim=1).to(dev) * gravity  # [N], N
+
         self.set_debug_vis(self.cfg.debug_vis)
 
     def _setup_scene(self):
@@ -248,7 +297,17 @@ class QuadcopterEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self._actions = actions.clone().clamp(-1.0, 1.0)
+        """Record the command; the controller gets the one sent ``delay_steps`` ago,
+        or 0 during the warm-up hold (overridden by the hold force in _apply_action)."""
+        commanded = actions.clamp(-1.0, 1.0)
+        self.cmd_history = torch.cat([self.cmd_history[:, 1:], commanded.unsqueeze(1)], dim=1)
+        slot = self.cmd_history.shape[1] - 1 - self.delay_steps  # [N], N = num_envs
+        delayed = self.cmd_history[self._env_idx, slot]          # [N, A], A = ACTION_DIM: env i, slot[i]
+        # _traj_rollout_idx = steps already taken this episode: steps 0..d-1 hold, step d gets c_0
+        self._hold_cmd = self._traj_rollout_idx < self.delay_steps  # True: default command until the delayed action reaches the env
+        if self.delay_max_steps > 0:
+            self._hold_ids = self._hold_cmd.nonzero().squeeze(-1)  # once per policy step, not per physics step
+        self._actions = torch.where(self._hold_cmd.unsqueeze(-1), 0.0, delayed)
 
         # Body rates: scale [-1, 1] to [-max_body_rate, max_body_rate] rad/s,
         # with per-env DR multiplier on the rate setpoint.
@@ -283,9 +342,16 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._thrust[:, 0, 2] = thrust.squeeze(-1)
         self._moment[:, 0, :] = moment
+        if self._hold_ids.numel():
+            # warm-up hold: exact m*g, no moment; controller reset so it starts fresh at step d (#80: skip wind/scaling)
+            self._thrust[self._hold_ids, 0, 2] = self._hold_force[self._hold_ids]
+            self._moment[self._hold_ids] = 0.0
+            self._ctrl.reset(self._hold_ids)
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
+        """18-D frame (+ noise) shifted into the K-frame window, then the M last commands appended.
+        Just-reset envs get K copies of their first frame (done here: step() resets before observing)."""
         desired_pos_b, _ = subtract_frame_transforms(
             self._robot.data.root_pos_w,
             self._robot.data.root_quat_w,
@@ -308,24 +374,41 @@ class QuadcopterEnv(DirectRLEnv):
             noise = torch.randn_like(obs) * self.cfg.noise_std
             obs += noise
 
-        return {"policy": obs}
+        new = obs.unsqueeze(1)
+        window = torch.cat([self.obs_window[:, 1:], new], dim=1)
+        self.obs_window = torch.where(self.obs_window_fresh[:, None, None], new.expand_as(window), window)
+        self.obs_window_fresh[:] = False
+        # the M newest commands: M slots starting at slot L - M (M = 0 -> empty, adds nothing)
+        m = self.cfg.action_input_hist
+        act_hist = self.cmd_history.narrow(1, self.cmd_history.shape[1] - m, m)
+        return {"policy": torch.cat([self.obs_window.flatten(1), act_hist.flatten(1)], dim=-1)}
 
     def _get_rewards(self) -> torch.Tensor:
         lin_vel = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
         distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_pos_w, dim=1)
         distance_to_goal_mapped = self._distance_reward(distance_to_goal)
+        # on the *commanded* actions: the delayed ones the controller gets would credit each change d steps late;
+        # 0 at the episode's first step, whose previous slot is the -10 fill, not a command
+        action_rate_sq = torch.sum(torch.square(self.cmd_history[:, -1] - self.cmd_history[:, -2]), dim=1)
+        action_rate_sq = torch.where(self._traj_rollout_idx == 0, 0.0, action_rate_sq)
         rewards = {
             "lin_vel": lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
             "distance_to_goal": distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
+            "action_rate": action_rate_sq * self.cfg.action_rate_reward_scale * self.step_dt,
         }
+        # warm-up hold: the drone is frozen whatever the policy does,
+        # so nothing is rewarded except the action-rate term
+        active = (~self._hold_cmd).float()
+        rewards = {key: (value if key == "action_rate" else value * active) for key, value in rewards.items()}
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         for key, value in rewards.items():
             self._episode_sums[key] += value
+        # held steps stay in the trajectory and the effort: the metrics include the latency dead time
         self._traj_pos_w[self._env_idx, self._traj_rollout_idx] = self._robot.data.root_pos_w
         self._traj_rollout_idx += 1
-        self._effort_sum += torch.sum(torch.square(self._actions), dim=1)
+        self._effort_sum += torch.sum(torch.square(self.cmd_history[:, -1]), dim=1)
         return reward
 
     def _distance_reward(self, distance: torch.Tensor) -> torch.Tensor:
@@ -409,6 +492,14 @@ class QuadcopterEnv(DirectRLEnv):
         self._ctrl.set_motor_tau(
             torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.motor_tau_range), env_ids
         )
+
+        # history/latency: fill action slots, draw this episode's d, flag the obs window for refill
+        self.cmd_history[env_ids] = self.cfg.history_fill_value
+        self.delay_steps[env_ids] = torch.randint(
+            self.delay_min_steps, self.delay_max_steps + 1, (len(env_ids),), device=self.device
+        )
+        self.obs_window_fresh[env_ids] = True
+        self._hold_cmd[env_ids] = False
 
         # Sample new domain-randomization values for the reset envs.
         if self.cfg.domain_rand:
