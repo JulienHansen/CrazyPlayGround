@@ -96,9 +96,9 @@ class CascadePIDController:
         Override any gain or limit.  See ``DEFAULT_GAINS`` / ``DEFAULT_LIMITS``
         for available keys.  Values from a YAML ``cascade_pid`` section can
         be passed directly.
-    max_thrust, arm_length, motor_tau, motor_thrust_min, motor_thrust2torque, motor_cmd_max, control_cmd_max : float
+    max_thrust, arm_length, motor_tau_up, motor_tau_down, motor_thrust_min, motor_thrust2torque, motor_cmd_max, control_cmd_max : float
         Keyword-only, no defaults: ``drone.max_thrust`` [N, all 4 motors],
-        ``drone.motor.{arm_length [m], tau [s], thrust_min [N], thrust2torque [m]}`` and
+        ``drone.motor.{arm_length [m], tau_up [s], tau_down [s], thrust_min [N], thrust2torque [m]}`` and
         ``drone.firmware.{motor_cmd_max, control_cmd_max}`` from crazyflie.yaml.
         ``from_drone_config`` passes them.
     """
@@ -115,7 +115,8 @@ class CascadePIDController:
         # drone and motor parameters, from crazyflie.yaml (drone.max_thrust, drone.motor)
         max_thrust: float,
         arm_length: float,
-        motor_tau: float,
+        motor_tau_up: float,
+        motor_tau_down: float,
         motor_thrust_min: float,
         motor_thrust2torque: float,
         motor_cmd_max: float,
@@ -227,7 +228,8 @@ class CascadePIDController:
             thrust_min=motor_thrust_min,
             arm_length=arm_length,
             thrust2torque=motor_thrust2torque,
-            tau=motor_tau,
+            tau_up=motor_tau_up,
+            tau_down=motor_tau_down,
             motor_cmd_max=motor_cmd_max,
             control_cmd_max=control_cmd_max,
         )
@@ -285,7 +287,9 @@ class CascadePIDController:
         params = getattr(drone_config, "cascade_pid", None) or {}
         phys   = drone_config.physics
         if phys.motor is None:
-            raise ValueError("drone.motor (arm_length, tau, thrust_min, thrust2torque) is required by the motor chain")
+            raise ValueError(
+                "drone.motor (arm_length, tau_up, tau_down, thrust_min, thrust2torque) is required by the motor chain"
+            )
         if phys.firmware is None:
             raise ValueError("drone.firmware (motor_cmd_max, control_cmd_max) is required by the motor chain")
 
@@ -297,7 +301,8 @@ class CascadePIDController:
             mass=phys.mass,
             max_thrust=phys.max_thrust,
             arm_length=phys.motor.arm_length,
-            motor_tau=phys.motor.tau,
+            motor_tau_up=phys.motor.tau_up,
+            motor_tau_down=phys.motor.tau_down,
             motor_thrust_min=phys.motor.thrust_min,
             motor_thrust2torque=phys.motor.thrust2torque,
             motor_cmd_max=phys.firmware.motor_cmd_max,
@@ -349,9 +354,17 @@ class CascadePIDController:
 
     # ── Reset ────────────────────────────────────────────────────────────────
 
-    def set_motor_tau(self, tau, env_ids: Optional[torch.Tensor] = None) -> None:
-        """Set the motor time constant [s], a float or one value per env in ``env_ids``."""
-        self.motor_chain.set_tau(tau, env_ids)
+    def set_motor_tau(self, tau_up, env_ids: Optional[torch.Tensor] = None, tau_down=None) -> None:
+        """Set the motor time constants.
+
+        Args:
+            tau_up: Spin-up time constant [s], a float or one value per env in ``env_ids``.
+            env_ids: Envs to update; None updates all.
+            tau_down: Spin-down time constant [s], same form; None uses ``tau_up`` (symmetric motor).
+        """
+        if tau_down is None:
+            tau_down = tau_up
+        self.motor_chain.set_tau(tau_up, tau_down, env_ids)
 
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> None:
         """Reset all integrators and put the motors at hover thrust.
