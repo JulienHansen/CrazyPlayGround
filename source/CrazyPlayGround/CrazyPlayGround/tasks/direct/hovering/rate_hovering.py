@@ -398,9 +398,10 @@ class QuadcopterEnv(DirectRLEnv):
             "distance_to_goal": distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
             "action_rate": action_rate_sq * self.cfg.action_rate_reward_scale * self.step_dt,
         }
-        # warm-up hold: the drone is frozen whatever the policy does, so nothing is rewarded
+        # warm-up hold: the drone is frozen whatever the policy does,
+        # so nothing is rewarded except the action-rate term
         active = (~self._hold_cmd).float()
-        rewards = {key: value * active for key, value in rewards.items()}
+        rewards = {key: (value if key == "action_rate" else value * active) for key, value in rewards.items()}
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         for key, value in rewards.items():
             self._episode_sums[key] += value

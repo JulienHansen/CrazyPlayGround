@@ -515,14 +515,16 @@ def test_action_rate_penalises_commanded_action(d):
             A.append(rand_cmd(env))
             before = env._episode_sums["action_rate"].clone()
             env.step(A[t])
-            # 0 at step 1 (the previous slot is the fill) and during the hold; then on the commanded actions
-            if t == 1 or t <= d:
+            # 0 at step 1 (the previous slot is the fill); then on the commanded actions, hold included
+            if t == 1:
                 penalty = torch.zeros(N, device=env.device)
             else:
                 penalty = scale * (A[t] - A[t - 1]).square().sum(1) * env.step_dt
             torch.testing.assert_close(env._episode_sums["action_rate"] - before, penalty)
+            if 1 < t <= d:  # during the hold: penalised, while the state terms stay 0
+                assert env._hold_cmd.all() and env._episode_sums["action_rate"].ne(before).all()
 
-        # env 0 resets at step 7; its first steps of the new episode see no jump from the fill
+        # env 0 resets at step 7; its first step of the new episode sees no jump from the fill
         env.episode_length_buf[0] = env.max_episode_length - 1
         env.step(rand_cmd(env))
         assert env.reset_buf[0]
@@ -532,7 +534,7 @@ def test_action_rate_penalises_commanded_action(d):
             c = rand_cmd(env)
             before = env._episode_sums["action_rate"][0].item()
             env.step(c)
-            expected = 0.0 if s == 1 or s <= d else (scale * (c[0] - prev[0]).square().sum() * env.step_dt).item()
+            expected = 0.0 if s == 1 else (scale * (c[0] - prev[0]).square().sum() * env.step_dt).item()
             assert env._episode_sums["action_rate"][0].item() - before == pytest.approx(expected, abs=1e-7)
             prev = c
     finally:
