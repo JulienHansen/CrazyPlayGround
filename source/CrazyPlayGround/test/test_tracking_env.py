@@ -11,6 +11,8 @@ from isaaclab.app import AppLauncher
 
 simulation_app = AppLauncher(headless=True).app
 
+import math  # noqa: E402
+
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
@@ -570,5 +572,38 @@ def test_reference_ignores_episode_length_buf():
         ref = env._current_ref_w(ids)
         env.episode_length_buf[:] = 0
         torch.testing.assert_close(env._current_ref_w(ids), ref)
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("cfg_cls", MODES)
+def test_record_states_match_the_scored_error(cfg_cls):
+    env = make_env(cfg_cls, episode_length_s=0.1, record_states=True)
+    try:
+        start(env)
+        ids = env._robot._ALL_INDICES
+        T = int(env.max_episode_length) - 1  # steps until the time-out
+        for t in range(1, T + 1):
+            a = rand_cmd(env)
+            a[:, 0] = 3.0  # out of range: the commanded action is the clamped one
+            env.step(a)
+            s = env.extras["data_record"]
+            assert s["step"].tolist() == [t] * N
+            # the same distance the reward, the termination and the metrics use (slot t - 1)
+            torch.testing.assert_close(torch.linalg.norm(s["pos"] - s["ref"], dim=1), env._error[:, t - 1])
+            torch.testing.assert_close(s["action_cmd"], a.clamp(-1.0, 1.0))
+            if t < T:  # before the time-out reset moves the drones and redraws the DR knobs
+                torch.testing.assert_close(s["pos"] + env._terrain.env_origins, env._robot.data.root_pos_w)
+                torch.testing.assert_close(s["vel_w"], env._robot.data.root_lin_vel_w)
+                for key, attr in (("delay_steps", "delay_steps"), ("wind_force_w", "wind_force_world"),
+                                  ("thrust_scale", "thrust_scale"), ("torque_scale", "torque_scale")):
+                    torch.testing.assert_close(s[key], getattr(env, attr))  # this episode's draws
+    finally:
+        env.close()
+    env = make_env(VelTrackingEnvCfg)  # off by default: nothing extra
+    try:
+        start(env)
+        env.step(hover(env))
+        assert "data_record" not in env.extras
     finally:
         env.close()

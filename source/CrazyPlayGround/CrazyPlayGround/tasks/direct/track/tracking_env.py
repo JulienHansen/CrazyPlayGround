@@ -48,6 +48,10 @@ Metrics: per episode, from the distance e between the drone and the reference us
 and the termination (``_current_ref_w``): ``tracking_rmse``, ``tracking_mean_error``,
 ``tracking_max_error`` (m), ``effort`` (mean ||commanded action||^2), ``length`` (policy steps)
 and ``died``. See ``TrackingEnv._log_tracking_metrics``.
+
+Recording (``record_states``, off in training, on with ``play.py --eval_csv``): each step before the
+auto-reset, ``extras["data_record"]`` holds the drone state, the scored reference, the actions and
+the episode's DR draws.
 """
 
 from __future__ import annotations
@@ -146,6 +150,14 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     traj_scale_range: tuple = (1.5, 3.0)    # x/y scale [m]
     traj_z_scale_range: tuple = (0.8, 1.5)  # z scale [m]
     traj_c_range: tuple = (-0.6, 0.6)       # lemniscate c param
+    traj_yaw_range: tuple = (-math.pi, math.pi)     # rotation of the trajectory about z [rad]
+    traj_phase_range: tuple = (0.0, 2.0 * math.pi)  # start phase _traj_t0 [rad]
+    # spawn offset from the reference's start point, drawn uniformly per episode in [-v, v] [m];
+    # 0.0 for both = every episode starts on the reference (evaluation)
+    spawn_xy_offset: float = 0.3    # on x and on y
+    spawn_z_offset: float = 0.2     # on z (the spawn height is then clamped to >= 0.2 m)
+
+    record_states: bool = False  # extras["data_record"] every step (play.py --eval_csv records it)
 
     reset_thres: float = 0.8    # tracking error [m] that kills episode
 
@@ -225,6 +237,13 @@ def check_cfg(cfg: TrackingEnvCfg):
         (
             len(cfg.distance_reward_scales) > 0 and all(s > 0.0 for s in cfg.distance_reward_scales),
             f"distance_reward_scales must be non-empty and all > 0, got {cfg.distance_reward_scales}",
+        ),
+        (cfg.traj_yaw_range[0] <= cfg.traj_yaw_range[1], f"traj_yaw_range must satisfy min <= max, got {cfg.traj_yaw_range}"),
+        (cfg.spawn_xy_offset >= 0.0, f"spawn_xy_offset must be >= 0, got {cfg.spawn_xy_offset}"),
+        (cfg.spawn_z_offset >= 0.0, f"spawn_z_offset must be >= 0, got {cfg.spawn_z_offset}"),
+        (
+            cfg.traj_phase_range[0] <= cfg.traj_phase_range[1],
+            f"traj_phase_range must satisfy min <= max, got {cfg.traj_phase_range}",
         ),
     ]
     if getattr(cfg, "control_mode", None) == "attitude":
@@ -417,14 +436,14 @@ class TrackingEnv(DirectRLEnv):
             z_scale = torch.empty(N, device=dev).uniform_(lo_z, hi_z)
             self._traj_scale[env_ids] = torch.stack([xy_scale, xy_scale, z_scale], dim=-1)
 
-            yaw = torch.empty(N, device=dev).uniform_(-math.pi, math.pi)
+            yaw = torch.empty(N, device=dev).uniform_(*self.cfg.traj_yaw_range)
             zeros = torch.zeros(N, device=dev)
             self._traj_rot[env_ids] = quat_from_euler_xyz(zeros, zeros, yaw)
 
             lo, hi = self.cfg.traj_c_range
             self._traj_c[env_ids] = torch.empty(N, device=dev).uniform_(lo, hi)
 
-            self._traj_t0[env_ids] = torch.empty(N, device=dev).uniform_(0.0, 2.0 * math.pi)
+            self._traj_t0[env_ids] = torch.empty(N, device=dev).uniform_(*self.cfg.traj_phase_range)
         else:
             self._traj_w[env_ids] = 1.0
             self._traj_scale[env_ids, :] = torch.tensor([2.0, 2.0, 1.0], device=dev)
@@ -592,6 +611,21 @@ class TrackingEnv(DirectRLEnv):
         slot = (self.episode_step - 1).clamp(0, self._error.shape[1] - 1)
         self._error[self.env_idx, slot] = distance
         self._effort_sum += torch.sum(torch.square(self.cmd_history[:, -1]), dim=1)  # commanded, before latency
+        if self.cfg.record_states:  # copies: the reset that follows moves the drones and their buffers
+            origin = self._terrain.env_origins
+            self.extras["data_record"] = {
+                "step": self.episode_step.clone(),                     # (N,) step t, slot t - 1
+                "pos": self._robot.data.root_pos_w - origin,           # (N, 3) relative to the env origin, m
+                "ref": current_wp - origin,                            # (N, 3) the scored reference, m
+                "vel_w": self._robot.data.root_lin_vel_w.clone(),      # (N, 3) m/s
+                "action_cmd": self.cmd_history[:, -1].clone(),         # (N, A) commanded, in [-1, 1]
+                "action_sent": self._actions.clone(),                  # (N, A) what the controller got
+                # this episode's DR draws, constant until the env's next reset
+                "delay_steps": self.delay_steps.clone(),               # (N,) policy steps
+                "wind_force_w": self.wind_force_world.clone(),         # (N, 3) N
+                "thrust_scale": self.thrust_scale.clone(),             # (N,)
+                "torque_scale": self.torque_scale.clone(),             # (N,)
+            }
 
         lin_vel_sq = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel_sq = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
@@ -680,8 +714,9 @@ class TrackingEnv(DirectRLEnv):
         default_root_state[:, :3] = traj_start
 
         spawn = default_root_state.clone()
-        spawn[:, :2] += torch.zeros_like(spawn[:, :2]).uniform_(-0.3, 0.3)
-        spawn[:, 2]  += torch.zeros_like(spawn[:, 2]).uniform_(-0.2, 0.2)
+        xy, z = self.cfg.spawn_xy_offset, self.cfg.spawn_z_offset
+        spawn[:, :2] += torch.zeros_like(spawn[:, :2]).uniform_(-xy, xy)
+        spawn[:, 2]  += torch.zeros_like(spawn[:, 2]).uniform_(-z, z)
         spawn[:, 2]   = spawn[:, 2].clamp(min=0.2)
 
         self._robot.write_root_pose_to_sim(spawn[:, :7], env_ids)
