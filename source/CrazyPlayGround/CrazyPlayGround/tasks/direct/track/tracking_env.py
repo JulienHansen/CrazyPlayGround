@@ -44,6 +44,10 @@ Clock: the trajectory follows ``episode_step``, the policy steps since the env's
 the first one included, starts on the trajectory at its phase ``_traj_t0``, and zeroing
 ``episode_length_buf`` (``play.py --eval_csv``) does not move the reference.
 
+Speed: at each reset the lap starting at ``_traj_t0`` is resampled into ``TRAJ_NUM_WAYPOINTS``
+segments of equal length, and the reference moves along it at a constant linear speed drawn from
+``traj_speed_range`` (m/s), lap after lap.
+
 Metrics: per episode, from the distance e between the drone and the reference used by the reward
 and the termination (``_current_ref_w``): ``tracking_rmse``, ``tracking_mean_error``,
 ``tracking_max_error`` (m), ``effort`` (mean ||commanded action||^2), ``length`` (policy steps)
@@ -71,13 +75,15 @@ from isaaclab.utils.math import subtract_frame_transforms, quat_from_euler_xyz
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
 
-from .trajectories import TRAJECTORIES, apply_traj_transform
+from .trajectories import TRAJECTORIES, apply_traj_transform, interp_waypoints, resample_by_arc_length
 
 _DEFAULT_DRONE_CONFIG = str(
     _pathlib.Path(__file__).resolve().parents[3] / "controllers" / "crazyflie.yaml"
 )
 
 logger = logging.getLogger(__name__)
+
+TRAJ_NUM_WAYPOINTS = 256  # equal-length segments per lap of the reference (see the module docstring)
 
 class TrackingEnvWindow(BaseEnvWindow):
     def __init__(self, env: TrackingEnv, window_name: str = "IsaacLab"):
@@ -142,7 +148,7 @@ class TrackingEnvCfg(DirectRLEnvCfg):
 
     randomize_trajectory: bool = True
 
-    traj_speed_range: tuple = (0.8, 1.1)    # angular speed multiplier
+    traj_speed_range: tuple = (1.0, 2.0)    # constant linear speed along the curve [m/s]; midpoint without randomize_trajectory
     traj_scale_range: tuple = (1.5, 3.0)    # x/y scale [m]
     traj_z_scale_range: tuple = (0.8, 1.5)  # z scale [m]
     traj_c_range: tuple = (-0.6, 0.6)       # lemniscate c param
@@ -201,7 +207,9 @@ def check_cfg(cfg: TrackingEnvCfg):
     wind_lo, wind_hi = cfg.wind_force_range
     thrust_lo, thrust_hi = cfg.thrust_scale_range
     torque_lo, torque_hi = cfg.torque_scale_range
+    speed_lo, speed_hi = cfg.traj_speed_range
     checks = [
+        (0.0 < speed_lo <= speed_hi, f"traj_speed_range must satisfy 0 < min <= max, got {cfg.traj_speed_range}"),
         (cfg.future_traj_steps >= 1, f"future_traj_steps must be >= 1, got {cfg.future_traj_steps}"),
         (cfg.obs_input_hist >= 1, f"obs_input_hist must be >= 1, got {cfg.obs_input_hist}"),
         (cfg.action_input_hist >= 0, f"action_input_hist must be >= 0, got {cfg.action_input_hist}"),
@@ -290,12 +298,15 @@ class TrackingEnv(DirectRLEnv):
         if self.cfg.control_mode == "velocity":
             self._ref_vel = torch.zeros(self.num_envs, 3, device=self.device)
 
-        self._traj_w     = torch.ones(self.num_envs, device=self.device)     # angular speed
+        self._traj_speed = torch.ones(self.num_envs, device=self.device)     # linear speed, m/s
         self._traj_scale = torch.ones(self.num_envs, 3, device=self.device)  # [N, 3]
         self._traj_rot   = torch.zeros(self.num_envs, 4, device=self.device) # quaternion wxyz
         self._traj_rot[:, 0] = 1.0  # identity
         self._traj_c     = torch.zeros(self.num_envs, device=self.device)    # lemniscate c
         self._traj_t0    = torch.zeros(self.num_envs, device=self.device)    # phase offset
+        # one lap per env, resampled into equal segments at each reset (_build_traj_waypoints)
+        self._traj_waypoints_w  = torch.zeros(n, TRAJ_NUM_WAYPOINTS + 1, 3, device=dev)  # world frame, m
+        self._traj_length       = torch.ones(n, device=dev)       # lap length, m
 
         origin = self.cfg.traj_origin
         self._traj_origin = torch.tensor(origin, dtype=torch.float, device=self.device)
@@ -362,34 +373,36 @@ class TrackingEnv(DirectRLEnv):
         """Compute `steps` consecutive waypoints for the given environments.
 
         Time is ``episode_step`` (policy steps since reset) plus ``step_size`` sim steps per waypoint.
+        The reference has covered ``_traj_speed * time`` metres along the resampled lap.
 
         Returns:
             [len(env_ids), steps, 3] world-frame positions.
         """
-        N = len(env_ids)
         dt = self.cfg.sim.dt * self.cfg.decimation  # policy dt
 
         offsets = step_size * torch.arange(1, steps + 1, device=self.device).float()  # [steps]
         t_base = self.episode_step[env_ids].float().unsqueeze(1)                       # [N, 1] steps since reset
-        t_idx = t_base + offsets.unsqueeze(0)                                           # [N, steps]
+        time = (t_base + offsets.unsqueeze(0)) * dt                                     # [N, steps] s
+        distance = self._traj_speed[env_ids].unsqueeze(1) * time                        # [N, steps] m
+        return interp_waypoints(self._traj_waypoints_w[env_ids], self._traj_length[env_ids], distance)
 
-        t = self._traj_t0[env_ids].unsqueeze(1) + self._traj_w[env_ids].unsqueeze(1) * t_idx * dt
+    def _build_traj_waypoints(self, env_ids: torch.Tensor):
+        """Resample the world-frame lap from ``_traj_t0`` into ``TRAJ_NUM_WAYPOINTS`` equal-length segments."""
+        k = TRAJ_NUM_WAYPOINTS
+        u = torch.linspace(0.0, 2.0 * math.pi, 4 * k + 1, device=self.device)  # one lap
+        t = self._traj_t0[env_ids].unsqueeze(1) + u.unsqueeze(0)               # [N, 4k+1] rad
 
         traj_fn = TRAJECTORIES[self.cfg.trajectory_type]
         if self.cfg.trajectory_type == "lemniscate":
-            c = self._traj_c[env_ids]  # [N]
-            raw = traj_fn(t, c=0.0)    # [N, steps, 3]
-            z_extra = c.unsqueeze(1) * torch.sin(2.0 * t)  # [N, steps]
-            raw = raw + torch.stack([
-                torch.zeros_like(z_extra),
-                torch.zeros_like(z_extra),
-                z_extra,
-            ], dim=-1)
+            raw = traj_fn(t, c=self._traj_c[env_ids].unsqueeze(1))  # [N, 4k+1, 3]
         else:
-            raw = traj_fn(t)  # [N, steps, 3]
-
+            raw = traj_fn(t)  # [N, 4k+1, 3]
         origin = self._traj_origin.unsqueeze(0) + self._terrain.env_origins[env_ids]  # [N, 3]
-        return apply_traj_transform(raw, self._traj_scale[env_ids], self._traj_rot[env_ids], origin)
+        dense_w = apply_traj_transform(raw, self._traj_scale[env_ids], self._traj_rot[env_ids], origin)
+
+        waypoints_w, length = resample_by_arc_length(dense_w, k)
+        self._traj_waypoints_w[env_ids] = waypoints_w
+        self._traj_length[env_ids] = length
 
     def _current_ref_w(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Reference the drone is scored against (reward, termination, metrics).
@@ -409,7 +422,7 @@ class TrackingEnv(DirectRLEnv):
 
         if self.cfg.randomize_trajectory:
             lo, hi = self.cfg.traj_speed_range
-            self._traj_w[env_ids] = torch.empty(N, device=dev).uniform_(lo, hi)
+            self._traj_speed[env_ids] = torch.empty(N, device=dev).uniform_(lo, hi)
 
             lo, hi = self.cfg.traj_scale_range
             xy_scale = torch.empty(N, device=dev).uniform_(lo, hi)
@@ -426,11 +439,13 @@ class TrackingEnv(DirectRLEnv):
 
             self._traj_t0[env_ids] = torch.empty(N, device=dev).uniform_(0.0, 2.0 * math.pi)
         else:
-            self._traj_w[env_ids] = 1.0
+            self._traj_speed[env_ids] = 0.5 * sum(self.cfg.traj_speed_range)
             self._traj_scale[env_ids, :] = torch.tensor([2.0, 2.0, 1.0], device=dev)
             self._traj_rot[env_ids] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=dev)
             self._traj_c[env_ids] = 0.0
             self._traj_t0[env_ids] = 0.0
+
+        self._build_traj_waypoints(env_ids)
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Record the commanded (clamped) action, then hand the controller the one sent
