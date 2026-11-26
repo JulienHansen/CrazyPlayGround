@@ -49,7 +49,9 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
+
+from ..crazyflie_events import CrazyflieEventCfg
 
 _DEFAULT_DRONE_CONFIG = str(
     _pathlib.Path(__file__).resolve().parents[3] / "controllers" / "crazyflie.yaml"
@@ -118,6 +120,8 @@ class FormationEnvCfg(DirectMARLEnvCfg):
     )
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
 @configclass
 class VelFormationEnvCfg(FormationEnvCfg):
@@ -136,7 +140,7 @@ class AttFormationEnvCfg(FormationEnvCfg):
     max_roll_pitch: float = 30.0 * math.pi / 180.0   # rad
     max_yaw_rate: float = 90.0 * math.pi / 180.0     # rad/s
     min_thrust_scale: float = 0.5
-    max_thrust_scale: float = 1.8
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
 
 class FormationEnv(DirectMARLEnv):
     cfg: FormationEnvCfg
@@ -175,7 +179,10 @@ class FormationEnv(DirectMARLEnv):
         elif self.cfg.control_mode == "attitude":
             hover_thrust = drone_cfg.physics.mass * 9.81
             self._min_thrust = self.cfg.min_thrust_scale * hover_thrust
-            self._max_thrust = self.cfg.max_thrust_scale * hover_thrust
+            self._max_thrust_scale = resolve_max_thrust_scale(
+                self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+            )
+            self._max_thrust = self._max_thrust_scale * hover_thrust
             self._att_refs = [
                 torch.zeros(self.num_envs, 3, device=self.device) for _ in range(N)
             ]

@@ -65,6 +65,7 @@ from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
 
+from ..crazyflie_events import CrazyflieEventCfg
 from .step_response import step_response
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ui_window_class_type = QuadcopterEnvWindow
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 500,
@@ -149,15 +152,16 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     noise_corr: float = 0.0      # AR(1) correlation from one policy step to the next, in [0, 1); 0 = white
     noise_bias_std: float = 0.0  # std of a constant offset per channel, drawn per episode
     # wind: strength [N] drawn uniformly from this range at each reset, direction uniform in 3-D,
-    # constant in the world frame for the whole episode. (0, 0) = no wind; weight is ~0.265 N.
+    # constant in the world frame for the whole episode. (0, 0) = no wind; weight is ~0.312 N.
     wind_force_range: tuple[float, float] = (0.0, 0.0)
     # actuation effectiveness, drawn uniformly per episode; (1, 1) = off. The body gets
     # scale x the controller output (battery sag, worn props, build differences).
     thrust_scale_range: tuple[float, float] = (1.0, 1.0)
     torque_scale_range: tuple[float, float] = (1.0, 1.0)
-    # motor time constant [s] of the firmware motor chain, drawn uniformly per episode;
-    # (0.072, 0.072) fixes it (e.g. for evaluation)
-    motor_tau_range: tuple[float, float] = (0.055, 0.090)
+    # motor spin-up time constant tau_up [s] of the firmware motor chain, drawn uniformly per episode,
+    # ±20 % around the yaml 0.1117; tau_down is set equal to tau_up.
+    # (0.1117, 0.1117) fixes it (e.g. for evaluation)
+    motor_tau_range: tuple[float, float] = (0.090, 0.134)
     # distance-to-goal reward shape; all are 1 at the goal, so the term's weight keeps its meaning:
     # "tanh" = 1 - tanh(d / L), almost flat near the goal (94 % of max at 5 cm with L = 0.8);
     # "exp"  = exp(-d / L), steeper near the goal (slope 1 / L at d = 0)

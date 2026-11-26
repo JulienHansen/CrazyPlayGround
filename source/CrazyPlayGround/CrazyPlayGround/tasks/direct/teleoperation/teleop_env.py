@@ -31,7 +31,9 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
+
+from ..crazyflie_events import CrazyflieEventCfg
 
 _DEFAULT_DRONE_CONFIG = str(
     _pathlib.Path(__file__).resolve().parents[3] / "controllers" / "crazyflie.yaml"
@@ -64,7 +66,7 @@ class TeleoperationEnvCfg(DirectRLEnvCfg):
     max_position_delta = 0.5  # m per step
     max_roll_pitch = 30.0 * math.pi / 180.0  # 30 deg max tilt (angle mode)
     max_yaw_rate = 90.0 * math.pi / 180.0  # 90 deg/s max yaw rate (angle mode)
-    max_thrust_scale = 1.8  # fraction of hover thrust
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
 
     min_altitude = 0.1
     max_altitude = 3.0
@@ -73,6 +75,8 @@ class TeleoperationEnvCfg(DirectRLEnvCfg):
 
     ui_window_class_type = TeleoperationEnvWindow
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 500,
@@ -130,7 +134,10 @@ class TeleoperationEnv(DirectRLEnv):
         )
 
         self._hover_thrust = drone_cfg.physics.mass * 9.81
-        self._max_thrust = self.cfg.max_thrust_scale * self._hover_thrust
+        self._max_thrust_scale = resolve_max_thrust_scale(
+            self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+        )
+        self._max_thrust = self._max_thrust_scale * self._hover_thrust
 
         self._rate_profile_fn: Optional[Callable] = self._build_rate_profile_fn(cfg.rate_profile)
         if self._rate_profile_fn is not None:

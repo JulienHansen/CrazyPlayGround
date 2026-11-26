@@ -73,8 +73,9 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import subtract_frame_transforms, quat_from_euler_xyz
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
 
+from ..crazyflie_events import CrazyflieEventCfg
 from .trajectories import TRAJECTORIES, apply_traj_transform, interp_waypoints, resample_by_arc_length
 
 _DEFAULT_DRONE_CONFIG = str(
@@ -171,7 +172,7 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     noise_corr: float = 0.0       # AR(1) correlation from one policy step to the next, in [0, 1); 0 = white
     noise_bias_std: float = 0.0   # std of a constant offset per channel, drawn per episode
     # wind: strength [N] drawn uniformly from this range at each reset, direction uniform in 3-D,
-    # constant in the world frame for the whole episode. (0, 0) = no wind; weight is ~0.265 N.
+    # constant in the world frame for the whole episode. (0, 0) = no wind; weight is ~0.312 N.
     wind_force_range: tuple[float, float] = (0.0, 0.0)
     # actuation effectiveness, drawn uniformly per episode; (1, 1) = off. The body gets
     # scale x the controller output (battery sag, worn props, build differences).
@@ -179,6 +180,8 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     torque_scale_range: tuple[float, float] = (1.0, 1.0)
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
 @configclass
 class PosTrackingEnvCfg(TrackingEnvCfg):
@@ -199,7 +202,7 @@ class AttTrackingEnvCfg(TrackingEnvCfg):
     max_roll_pitch: float = 30.0 * math.pi / 180.0   # rad
     max_yaw_rate: float = 90.0 * math.pi / 180.0     # rad/s
     min_thrust_scale: float = 0.5
-    max_thrust_scale: float = 1.8
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
 
 def check_cfg(cfg: TrackingEnvCfg):
     """Reject knob values that can't work. Called by the env constructor, after Hydra overrides.
@@ -236,10 +239,11 @@ def check_cfg(cfg: TrackingEnvCfg):
         ),
     ]
     if getattr(cfg, "control_mode", None) == "attitude":
-        # the hover command (history reset value) must be a reachable thrust in [0, 1]
+        # the hover command (history reset value) must be a reachable thrust in [0, 1];
+        # max None is derived from the yaml cap (> 1) and checked against it in __init__
         lo, hi = cfg.min_thrust_scale, cfg.max_thrust_scale
         checks.append(
-            (0.0 < lo <= 1.0 <= hi and lo < hi,
+            (0.0 < lo <= 1.0 and (hi is None or (1.0 <= hi and lo < hi)),
              f"min/max_thrust_scale must satisfy 0 < min <= 1 <= max and min < max, got {lo} / {hi}")
         )
     for ok, msg in checks:
@@ -281,10 +285,11 @@ class TrackingEnv(DirectRLEnv):
             self._att_ref      = torch.zeros(self.num_envs, 3, device=self.device)
             self._yaw_rate_ref = torch.zeros(self.num_envs, 1, device=self.device)
             self._thrust_pwm   = torch.zeros(self.num_envs, 1, device=self.device)
-            min_s = self.cfg.min_thrust_scale
-            max_s = self.cfg.max_thrust_scale
-            self._min_thrust = min_s * self._hover_thrust
-            self._max_thrust = max_s * self._hover_thrust
+            self._max_thrust_scale = resolve_max_thrust_scale(
+                self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+            )
+            self._min_thrust = self.cfg.min_thrust_scale * self._hover_thrust
+            self._max_thrust = self._max_thrust_scale * self._hover_thrust
 
         # command that holds the drone in place, used to fill the command history at reset:
         # zero position delta / velocity, and for Att zero attitude and yaw rate with hover thrust

@@ -24,6 +24,8 @@ from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 from CrazyPlayGround.controllers import CascadePIDController, load_config
 
+from ..crazyflie_events import CrazyflieEventCfg
+
 _DEFAULT_DRONE_CONFIG = str(
     _pathlib.Path(__file__).resolve().parents[3] / "controllers" / "crazyflie.yaml"
 )
@@ -57,6 +59,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ui_window_class_type = QuadcopterEnvWindow
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 500,
