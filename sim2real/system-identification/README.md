@@ -20,12 +20,12 @@ Run from `CrazyPlayGround/`:
 
 ```bash
 # 1. Record
-python execution/sim2real/system-identification/excite_hover.py --record-path flights/excite_x.parquet \
+python sim2real/system-identification/excite_hover.py --record-path flights/excite_x.parquet \
     --exc-axis x --exc-amp 0.2 --exc-step 1.0 --exc-recover 4 --duration 90
 # 2. Delay, dead time, tau, noise (prints the env.* values)
-python execution/sim2real/system-identification/measure_delay_noise.py flights/excite_x.parquet [more.parquet ...]
+python sim2real/system-identification/measure_delay_noise.py flights/excite_x.parquet [more.parquet ...]
 # 3. Mean step response and one flight cycle, every recording (real or sim) overlaid: IQM over the steps, 10-90 % band
-python execution/sim2real/system-identification/plot_step_response.py flights/excite_x.parquet [more.parquet ...] --out flights/excite_x.png
+python sim2real/system-identification/plot_step_response.py flights/excite_x.parquet [more.parquet ...] --out flights/excite_x.png
 ```
 
 | `excite_hover.py` option | Default                       | Limit / note                                |
@@ -52,11 +52,11 @@ python execution/sim2real/system-identification/plot_step_response.py flights/ex
 
 ```bash
 # On a machine with Isaac Lab (local: conda activate DragonFly; in Docker: /workspace/isaaclab/isaaclab.sh -p ... --headless)
-python execution/sim2real/system-identification/excite_hover_sim.py --record-path flights/sim_excite_x.parquet \
+python sim2real/system-identification/excite_hover_sim.py --record-path flights/sim_excite_x.parquet \
     --exc-axis x --exc-amp 0.2 --exc-step 1.0 --exc-recover 4 --duration 90 --headless \
     [env.action_latency_steps=4 ...]
-python execution/sim2real/system-identification/measure_delay_noise.py flights/excite_x.parquet flights/sim_excite_x.parquet
-python execution/sim2real/system-identification/plot_step_response.py flights/excite_x.parquet flights/sim_excite_x.parquet --out flights/real_vs_sim_x.png
+python sim2real/system-identification/measure_delay_noise.py flights/excite_x.parquet flights/sim_excite_x.parquet
+python sim2real/system-identification/plot_step_response.py flights/excite_x.parquet flights/sim_excite_x.parquet --out flights/real_vs_sim_x.png
 ```
 
 | `excite_hover_sim.py` option | Default         | Limit / note                                    |
@@ -85,7 +85,7 @@ Compare against flights recorded with the current `excite_hover.py` and the same
 `plot_step_response.py` takes any mix of real and sim `.parquet` recordings (not the `.png` figures) and overlays them, one color each, labelled `real` or `sim` from the footer:
 
 ```bash
-python execution/sim2real/system-identification/plot_step_response.py flights/excite_x2sA1.parquet flights/sim_excite_x2sA1.parquet \
+python sim2real/system-identification/plot_step_response.py flights/excite_x2sA1.parquet flights/sim_excite_x2sA1.parquet \
     --out flights/com_excite_x2sA1.png
 ```
 
