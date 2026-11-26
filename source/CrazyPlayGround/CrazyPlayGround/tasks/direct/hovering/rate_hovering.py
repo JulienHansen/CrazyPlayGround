@@ -1,7 +1,8 @@
 """Body-rate-controlled hovering: action [p, q, r, T] in [-1, 1]^4 into the rate loop of the cascade PID.
 
 Rates = a[:3] * max_body_rate; thrust = T_min + (a[3] + 1) / 2 * (T_max - T_min), with
-T_min/T_max = min/max_thrust_scale * m*g. So a = 0 is a 1.15 * m*g climb, not hover, and
+T_min/T_max = min/max_thrust_scale * m*g, max_thrust_scale defaulting to the firmware cap
+drone.max_thrust / (m*g) = 1.5387. So a = 0 is a 1.02 * m*g climb, not hover, and
 empty action-history slots hold ``history_fill_value`` (-10), which the controller never sees.
 Defaults are the plain task: no noise, no DR; only the motor tau is drawn per episode.
 
@@ -25,7 +26,7 @@ wind or actuation scaling; reward 0). Action rate: ||c_t - c_{t-1}||^2 on comman
 Sim-to-real randomisation (off by default), drawn per episode:
 - Noise (``add_noise``): o~ = o + noise_std * n_t + b, n_t = rho * n_{t-1} + sqrt(1 - rho^2) * eps_t,
   b ~ N(0, noise_bias_std^2); ``true_state`` stays clean.
-- Wind: constant world-frame force, |F| ~ U(wind_force_range), uniform direction (m*g ~ 0.265 N).
+- Wind: constant world-frame force, |F| ~ U(wind_force_range), uniform direction (m*g ~ 0.312 N).
 - Actuation: body gets k_T * T, k_tau * tau, k ~ U(thrust/torque_scale_range); PID assumes nominal.
 """
 
@@ -50,8 +51,9 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
 
+from ..crazyflie_events import CrazyflieEventCfg
 from .step_response import step_response
 
 _DEFAULT_DRONE_CONFIG = str(
@@ -84,12 +86,14 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     max_body_rate = math.pi  # rad/s (~180 deg/s) max angular rate per axis
     min_thrust_scale = 0.5   # fraction of hover thrust
-    max_thrust_scale = 1.8   # fraction of hover thrust
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
     history_fill_value: float = -10.0  # "no command" in empty action slots; outside [-1, 1], never sent to the controller
 
     ui_window_class_type = QuadcopterEnvWindow
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 500,
@@ -150,13 +154,14 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     noise_bias_std: float = 0.0  # std of a constant offset per channel, drawn per episode
 
     # domain randomization: every *_range below is drawn uniformly per episode
-    # wind [N], constant world-frame force, uniform direction; (0, 0) = off; weight ~0.265 N
+    # wind [N], constant world-frame force, uniform direction; (0, 0) = off; weight ~0.312 N
     wind_force_range: tuple[float, float] = (0.0, 0.0)
     # scale the controller's thrust and torque
     thrust_scale_range: tuple[float, float] = (1.0, 1.0) # fraction of hover thrust
     torque_scale_range: tuple[float, float] = (1.0, 1.0) # fraction of hover torque
-    # motor time constant [s] of the firmware motor chain
-    motor_tau_range: tuple[float, float] = (0.055, 0.090)
+    # motor spin-up time constant tau_up [s] of the firmware motor chain, ±20 % around the yaml 0.1117;
+    # tau_down is set equal to tau_up
+    motor_tau_range: tuple[float, float] = (0.090, 0.134)
 
 
 def check_cfg(cfg: QuadcopterEnvCfg):
@@ -168,7 +173,9 @@ def check_cfg(cfg: QuadcopterEnvCfg):
     checks = [
         (cfg.max_body_rate > 0.0, f"max_body_rate must be > 0, got {cfg.max_body_rate}"),
         (
-            0.0 < cfg.min_thrust_scale <= 1.0 <= cfg.max_thrust_scale,
+            # max None is derived from the yaml cap (> 1) and checked against it in __init__
+            0.0 < cfg.min_thrust_scale <= 1.0
+            and (cfg.max_thrust_scale is None or 1.0 <= cfg.max_thrust_scale),
             "thrust scales must satisfy 0 < min_thrust_scale <= 1 <= max_thrust_scale, "
             f"got ({cfg.min_thrust_scale}, {cfg.max_thrust_scale})",
         ),
@@ -265,7 +272,10 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._hover_thrust = drone_cfg.physics.mass * 9.81
         self._min_thrust = self.cfg.min_thrust_scale * self._hover_thrust
-        self._max_thrust = self.cfg.max_thrust_scale * self._hover_thrust
+        self._max_thrust_scale = resolve_max_thrust_scale(
+            self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+        )
+        self._max_thrust = self._max_thrust_scale * self._hover_thrust
 
         self._rate_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._thrust_pwm = torch.zeros(self.num_envs, 1, device=self.device)

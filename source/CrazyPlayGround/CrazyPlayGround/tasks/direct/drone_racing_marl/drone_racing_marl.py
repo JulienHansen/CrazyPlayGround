@@ -65,8 +65,9 @@ from isaaclab.utils.math import (
     subtract_frame_transforms,
 )
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
 
+from ..crazyflie_events import CrazyflieEventCfg
 from ..drone_racing.track_generator import spawn_track
 
 _DEFAULT_DRONE_CONFIG = str(
@@ -154,7 +155,7 @@ class DroneRacingMARLEnvCfg(DirectMARLEnvCfg):
     max_roll_pitch: float = 30.0 * math.pi / 180.0
     max_yaw_rate: float = 90.0 * math.pi / 180.0
     min_thrust_scale: float = 0.5
-    max_thrust_scale: float = 1.8
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
 
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 500.0,
@@ -173,6 +174,8 @@ class DroneRacingMARLEnvCfg(DirectMARLEnvCfg):
     )
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
 @configclass
 class VelDroneRacingMARLEnvCfg(DroneRacingMARLEnvCfg):
@@ -212,7 +215,10 @@ class DroneRacingMARLEnv(DirectMARLEnv):
 
         hover_thrust = drone_cfg.physics.mass * 9.81
         self._min_thrust = self.cfg.min_thrust_scale * hover_thrust
-        self._max_thrust = self.cfg.max_thrust_scale * hover_thrust
+        self._max_thrust_scale = resolve_max_thrust_scale(
+            self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+        )
+        self._max_thrust = self._max_thrust_scale * hover_thrust
 
         if self.cfg.control_mode == "velocity":
             self._ref_vels = [

@@ -470,6 +470,10 @@ def test_warmup_hold():
     d = 3
     env = make_env(action_latency_steps=d)
     try:
+        # PhysX integrates the first physics step after the startup mass event with the USD mass
+        # (28.2 g, +2.5 mm/s at 31.8 g): take that step, then start from a fresh reset
+        env.reset()
+        env.step(fill(env))
         env.reset()
         env.episode_length_buf[:] = 0
         spawn = env._robot.data.root_pos_w.clone()
@@ -554,8 +558,9 @@ def test_action_rate_penalises_commanded_action(d):
 
 
 def near_hover(env) -> torch.Tensor:
-    """Zero rates and a thrust close to m*g (a = 0 is a 1.15 m*g climb)."""
-    return torch.tensor([0.0, 0.0, 0.0, -0.23], device=env.device).repeat(env.num_envs, 1)
+    """Zero rates and the thrust action of m*g (a = 0 is a 1.02 m*g climb)."""
+    a_hover = 2.0 * (env._hover_thrust - env._min_thrust) / (env._max_thrust - env._min_thrust) - 1.0  # ~-0.037
+    return torch.tensor([0.0, 0.0, 0.0, a_hover], device=env.device).repeat(env.num_envs, 1)
 
 
 @pytest.mark.parametrize("rho", [0.0, 0.9])
@@ -703,7 +708,7 @@ def test_setpoints_stay_nominal_under_actuation_scaling():
 def test_warmup_hold_ignores_wind_and_scaling():
     """The hold stays an exact m*g: no wind, no actuation scaling; both come back at step d + 1."""
     d = 3
-    # 0.1 N of wind on a ~0.027 kg drone is ~4 m/s^2: a leak would move it far beyond 1e-4 m in d steps
+    # 0.1 N of wind on a ~0.032 kg drone is ~4 m/s^2: a leak would move it far beyond 1e-4 m in d steps
     env = make_env(
         action_latency_steps=d, wind_force_range=(0.1, 0.2), thrust_scale_range=(0.7, 0.8), torque_scale_range=(0.7, 0.8)
     )

@@ -295,7 +295,7 @@ def test_att_history_resets_to_hover():
     env = make_env(AttTrackingEnvCfg, action_latency_steps=d)
     try:
         cfg = env.cfg
-        expected = (1.0 - cfg.min_thrust_scale) / (cfg.max_thrust_scale - cfg.min_thrust_scale)
+        expected = (1.0 - cfg.min_thrust_scale) / (env._max_thrust_scale - cfg.min_thrust_scale)
         start(env)
         torch.testing.assert_close(env.cmd_history[..., 3], torch.full_like(env.cmd_history[..., 3], expected))
         assert not env.cmd_history[..., :3].any()

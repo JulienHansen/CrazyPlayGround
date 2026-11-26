@@ -40,7 +40,9 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
+
+from ..crazyflie_events import CrazyflieEventCfg
 
 _DEFAULT_DRONE_CONFIG = str(
     _pathlib.Path(__file__).resolve().parents[3] / "controllers" / "crazyflie.yaml"
@@ -69,11 +71,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     max_roll_pitch = 30.0 * math.pi / 180.0   # 30 deg max tilt
     max_yaw_rate   = 90.0 * math.pi / 180.0   # 90 deg/s max yaw rate
     min_thrust_scale = 0.5   # fraction of hover thrust
-    max_thrust_scale = 1.8   # fraction of hover thrust
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
 
     ui_window_class_type = QuadcopterEnvWindow
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 500,
@@ -143,7 +147,10 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._hover_thrust = drone_cfg.physics.mass * 9.81
         self._min_thrust = self.cfg.min_thrust_scale * self._hover_thrust
-        self._max_thrust = self.cfg.max_thrust_scale * self._hover_thrust
+        self._max_thrust_scale = resolve_max_thrust_scale(
+            self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+        )
+        self._max_thrust = self._max_thrust_scale * self._hover_thrust
 
         self._att_ref = torch.zeros(self.num_envs, 3, device=self.device)
         self._yaw_rate_ref = torch.zeros(self.num_envs, 1, device=self.device)

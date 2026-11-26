@@ -67,8 +67,9 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz, subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from CrazyPlayGround.controllers import CascadePIDController, load_config
+from CrazyPlayGround.controllers import CascadePIDController, load_config, resolve_max_thrust_scale
 
+from ..crazyflie_events import CrazyflieEventCfg
 from .track_generator import spawn_track
 
 _DEFAULT_DRONE_CONFIG = str(
@@ -141,7 +142,7 @@ class DroneRacingEnvCfg(DirectRLEnvCfg):
     max_roll_pitch: float = 30.0 * math.pi / 180.0    # attitude mode [rad]
     max_yaw_rate: float = 90.0 * math.pi / 180.0      # attitude mode [rad/s]
     min_thrust_scale: float = 0.5                      # attitude mode
-    max_thrust_scale: float = 1.8                      # attitude mode
+    max_thrust_scale: float | None = None  # fraction of hover thrust; None = drone.max_thrust / (m·g), the firmware cap (1.5387)
 
     state_space: int = 0
 
@@ -162,6 +163,8 @@ class DroneRacingEnvCfg(DirectRLEnvCfg):
     )
 
     drone_config_path: str = _DEFAULT_DRONE_CONFIG
+    # startup event: PhysX body mass = drone.mass of this yaml (see crazyflie_events.py)
+    events: CrazyflieEventCfg = CrazyflieEventCfg()
 
 @configclass
 class VelDroneRacingEnvCfg(DroneRacingEnvCfg):
@@ -197,7 +200,10 @@ class DroneRacingEnv(DirectRLEnv):
 
         hover_thrust = drone_cfg.physics.mass * 9.81
         self._min_thrust = self.cfg.min_thrust_scale * hover_thrust
-        self._max_thrust = self.cfg.max_thrust_scale * hover_thrust
+        self._max_thrust_scale = resolve_max_thrust_scale(
+            self.cfg.max_thrust_scale, drone_cfg.physics.mass, drone_cfg.physics.max_thrust
+        )
+        self._max_thrust = self._max_thrust_scale * hover_thrust
 
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._thrust_buf = torch.zeros(self.num_envs, 1, 3, device=self.device)
