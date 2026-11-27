@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "wandb": { "project": "track" },
+  "defaults": {
+    "trainer": "skrl",
+    "env_name": "Vel-Tracking",
+    "algo": "PPO",
+    "num_envs": 8192,
+    "total_timesteps": 500e6,
+    "rollout_length": 64,
+    "lr": 2.5e-4,
+    "lambda_coef": 0.99,
+    "entropy_coef": 0.0,
+    "env_kwargs": {
+      "obs_input_hist": 4,
+      "action_input_hist": 0,
+      "add_noise": true,
+      "noise_std": 0.03,
+      "noise_corr": 0.9,
+      "noise_bias_std": 0.015,
+      "wind_force_range": [0.0, 0.05],
+      "thrust_scale_range": [1.0, 1.0],
+      "torque_scale_range": [1.0, 1.0],
+      "action_latency_steps": 2,
+      "action_latency_max_steps": 6,
+      "distance_reward_shape": "multiexp",
+      "distance_reward_length": 0.8,
+      "distance_reward_scales": [1.0, 0.25, 0.0625],
+      "lin_vel_reward_scale": 0.0,
+      "ang_vel_reward_scale": 0.0,
+      "trajectory_type": "circle",
+      "randomize_trajectory": true,
+      "traj_speed_range": [0.3, 0.5],
+      "traj_scale_range": [1.0, 2.0]
+    },
+    "seed": [42, 123, 7, 29, 11]
+  },
+  "experiments": [
+    {
+      "name": "circle-multiexp-hist-8",
+      "env_kwargs": { "obs_input_hist": 8, "action_input_hist": 8 },
+      "sweep": {
+        "lr": [2.5e-4],
+        "lambda_coef": [0.99],
+        "entropy_coef": [1e-4],
+        "env_kwargs.ang_vel_reward_scale": [0.00, -0.05],
+        "env_kwargs.action_rate_reward_scale": [0.00, -0.1]
+      }
+    }
+  ]
+}
