@@ -27,6 +27,17 @@ def hand_over_and_go_to(cf, pos_w: Sequence[float], duration: float) -> None:
     cf.high_level_commander.go_to(*[float(v) for v in pos_w], 0.0, duration)
 
 
+def _before_hand_over(controller) -> None:
+    """Run the controller's `before_hand_over` hook, if it has one.
+
+    The attitude and rate modes use it to send one level, hover-thrust setpoint: if a
+    high-level packet is lost, the firmware then holds that, not the policy's last command.
+    """
+    hook = getattr(controller, "before_hand_over", None)
+    if hook is not None:
+        hook()
+
+
 def land_once(controller, duration: float = 2.0) -> None:
     """hand_over_and_land, unless this flight is already landing.
 
@@ -38,6 +49,7 @@ def land_once(controller, duration: float = 2.0) -> None:
         if controller.landing:
             return
         controller.landing = True
+    _before_hand_over(controller)
     hand_over_and_land(controller.cf, duration)
 
 
@@ -132,6 +144,7 @@ def fly_back_and_land(controller, fence: Fence, reason: str, pos: torch.Tensor, 
     controller.running = False
     try:
         brake = fence.clamp(pos)
+        _before_hand_over(controller)
         hand_over_and_go_to(controller.cf, brake.tolist(), fence.brake_s)
         if not hover_for(controller, fence.brake_s, stale_timeout_s):
             return
@@ -193,6 +206,91 @@ def nonnegative_int(text: str) -> int:
 logger = logging.getLogger("CrazyflieRL")
 
 
+def env_yaml_path(checkpoint_path: Optional[str]) -> Optional[str]:
+    """The training run's env.yaml: <name>_params/env.yaml beside an exported <name>.pt, else
+    <run>/params/env.yaml. None when neither exists."""
+    if not checkpoint_path:
+        return None
+    ckpt = os.path.abspath(checkpoint_path)
+    candidates = (os.path.join(os.path.splitext(ckpt)[0] + "_params", "env.yaml"),
+                  os.path.join(os.path.dirname(os.path.dirname(ckpt)), "params", "env.yaml"))
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def _yaml_scalar(text: str):
+    """A plain YAML scalar as Python: bool, None, int, float, else the unquoted string."""
+    text = text.strip()
+    if text in ("true", "false"):
+        return text == "true"
+    if text in ("null", "~", ""):
+        return None
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
+    return text.strip("'\"")
+
+
+def read_env_cfg(checkpoint_path: Optional[str]) -> dict:
+    """Top-level settings of the training run's env.yaml (see env_yaml_path), or {} without one.
+
+    yaml.safe_load rejects the file's !!python/tuple tags, so this reads it line by line:
+    `key: scalar` at column 0, a list of `- scalar` lines under `key:` (tuples included), and
+    the scalars one level down as "parent.child" (e.g. "sim.dt"). Deeper levels are skipped.
+
+    Returns:
+        name -> bool, None, int, float, str or list of those; "_path" holds the file read.
+    """
+    path = env_yaml_path(checkpoint_path)
+    if path is None:
+        return {}
+    cfg, parent = {"_path": path}, None
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if line.startswith("- "):              # list item of the last top-level key
+                if parent is not None:
+                    if not isinstance(cfg.get(parent), list):
+                        cfg[parent] = []
+                    cfg[parent].append(_yaml_scalar(line[2:]))
+                continue
+            top = re.match(r"^([A-Za-z_]\w*):\s*(.*)$", line)
+            if top:
+                parent, value = top.group(1), top.group(2)
+                cfg[parent] = None if value in ("", "!!python/tuple") else _yaml_scalar(value)
+                continue
+            child = re.match(r"^  ([A-Za-z_]\w*):\s*(.*)$", line)
+            if child and parent is not None and child.group(2) not in ("", "!!python/tuple"):
+                cfg[f"{parent}.{child.group(1)}"] = _yaml_scalar(child.group(2))
+    return cfg
+
+
+def check_env_contract(env_cfg: dict, control_mode: str, policy_dt: float = 0.01) -> None:
+    """Refuse a checkpoint whose training env the tracking scripts cannot reproduce.
+
+    Only settings that env.yaml holds are checked, so an older run without one of them passes.
+
+    Args:
+        env_cfg: from read_env_cfg.
+        control_mode: the TrackingEnvCfg.control_mode this script flies ("velocity", "body_rate").
+        policy_dt: the script's control period, s.
+
+    Raises:
+        ValueError: naming the first setting that differs.
+    """
+    expected = {"control_mode": control_mode, "future_traj_steps": 4, "traj_step_size": 5.0}
+    for name, value in expected.items():
+        if env_cfg.get(name) is not None and env_cfg[name] != value:
+            raise ValueError(f"the training run's {name} is {env_cfg[name]!r}; this script flies {value!r}")
+    dt, decimation = env_cfg.get("sim.dt"), env_cfg.get("decimation")
+    if dt is not None and decimation is not None and abs(dt * decimation - policy_dt) > 1e-9:
+        raise ValueError(f"the training run's policy step is sim.dt {dt} x decimation {decimation} "
+                         f"= {dt * decimation:g} s; this script steps every {policy_dt:g} s")
+
+
 def read_obs_hist(checkpoint_path: Optional[str]) -> Optional[Tuple[int, int]]:
     """(obs_input_hist, action_input_hist) from the training run's env.yaml, or None.
 
@@ -200,12 +298,7 @@ def read_obs_hist(checkpoint_path: Optional[str]) -> Optional[Tuple[int, int]]:
     the two knobs, not the stale `observation_space`, by regex: yaml.safe_load rejects the
     file's !!python/tuple tags.
     """
-    if not checkpoint_path:
-        return None
-    ckpt = os.path.abspath(checkpoint_path)
-    candidates = (os.path.join(os.path.splitext(ckpt)[0] + "_params", "env.yaml"),
-                  os.path.join(os.path.dirname(os.path.dirname(ckpt)), "params", "env.yaml"))
-    path = next((p for p in candidates if os.path.exists(p)), None)
+    path = env_yaml_path(checkpoint_path)
     if path is None:
         return None
     with open(path) as f:

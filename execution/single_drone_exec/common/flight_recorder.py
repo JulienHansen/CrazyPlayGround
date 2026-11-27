@@ -224,7 +224,7 @@ class StateSnapshot(NamedTuple):
 
 
 class CrazyflieStateBase:
-    """Telemetry state shared by every hover controller.
+    """Telemetry state shared by the hover and trajectory-tracking controllers.
 
     Declares the fields the log callbacks write, next to the callbacks, so they
     exist under one name only: a controller cannot declare its own copy under a
@@ -269,6 +269,31 @@ class CrazyflieStateBase:
             return StateSnapshot(self.current_pos.clone(), self.current_vel.clone(),
                                  self.current_quat.clone(), self._last_pos_time,
                                  list(self.current_motor_pwm))
+
+    def add_log_block(self, name: str, variables: Sequence[str], attr: str, period_ms: int = 10) -> bool:
+        """Log float `variables` every `period_ms` into the list self.<attr>, in their order.
+
+        The names come from the firmware, not from a TOC on disk, so a block this firmware lacks
+        leaves self.<attr> as it was (NaN, as the caller initialises it) instead of aborting.
+
+        Returns:
+            False when the firmware refused the block.
+        """
+        logconf = LogConfig(name=name, period_in_ms=period_ms)
+        for var in variables:
+            logconf.add_variable(var, "float")
+        try:
+            self.cf.log.add_config(logconf)
+        except (KeyError, AttributeError) as e:
+            logging.getLogger("CrazyflieRL").warning(f"Log block {name} unavailable ({e}); its columns stay NaN")
+            return False
+
+        def _callback(timestamp, data, logconf):
+            with self.lock:
+                setattr(self, attr, [data[var] for var in variables])
+        logconf.data_received_cb.add_callback(_callback)
+        logconf.start()
+        return True
 
     def setup_state_logging(self, log_frequency_ms: int = 10) -> None:
         """Register the telemetry LogConfig blocks (position/velocity, quaternion,
